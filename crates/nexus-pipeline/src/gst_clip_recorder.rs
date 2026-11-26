@@ -932,7 +932,9 @@ fn row_gone(e: &nexus_store::StoreError, clip_id: ClipId, camera_id: CameraId) -
 
 impl Writers {
     /// Keep `step`'s failure for the camera's later drains, and retry it on
-    /// its own until it is finalized.
+    /// its own until it is finalized. Recording health reports the clip from
+    /// here until then, not from its close's failure guard, which the caller
+    /// completes: the retry that finalizes the clip clears what it caused.
     fn unfinalized(
         &self,
         handle: ClipHandle,
@@ -1161,6 +1163,7 @@ impl Writers {
             }
             if let Err(e) = self.store.discard_clip_metadata(handle.clip_id).await {
                 if !row_gone(&e, handle.clip_id, handle.camera_id) {
+                    failure.complete();
                     return Err(self.unfinalized(handle, FinalStep::Discard, e));
                 }
             }
@@ -1283,6 +1286,16 @@ impl Writers {
             None
         };
 
+        // Before the row step, which a retry may complete in its stead.
+        let verified = hash_succeeded
+            && inspected_head.is_ok()
+            && size_bytes >= MIN_PLAYABLE_CLIP_BYTES as i64;
+        if !verified {
+            state
+                .health
+                .fail("finalized recording could not be verified");
+        }
+
         let close = ClipClose {
             ended_at: args.ended_at,
             duration_ms,
@@ -1294,7 +1307,10 @@ impl Writers {
         let gone = match step.run(&self.store, handle.clip_id).await {
             Ok(()) => false,
             Err(e) if row_gone(&e, handle.clip_id, handle.camera_id) => true,
-            Err(e) => return Err(self.unfinalized(handle, step, e)),
+            Err(e) => {
+                failure.complete();
+                return Err(self.unfinalized(handle, step, e));
+            }
         };
 
         debug!(
@@ -1329,12 +1345,7 @@ impl Writers {
             }
         }
 
-        if !hash_succeeded || inspected_head.is_err() || size_bytes < MIN_PLAYABLE_CLIP_BYTES as i64
-        {
-            state
-                .health
-                .fail("finalized recording could not be verified");
-        } else if pump_stats.dropped == 0 && layout_fault.is_none() {
+        if verified && pump_stats.dropped == 0 && layout_fault.is_none() {
             state.health.succeed();
         }
         failure.complete();
@@ -6858,7 +6869,8 @@ mod epoch_tests {
 
     /// SPEC-088 review 10: a close the supervisor runs while its camera keeps
     /// recording (a rotation) is never followed by a drain; its failure
-    /// retries on its own once the store recovers.
+    /// retries on its own once the store recovers. Review 13: recording
+    /// health reports the clip until then, and not after.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failed_close_of_a_recording_camera_retries_on_its_own() {
         assert!(
@@ -6881,14 +6893,26 @@ mod epoch_tests {
                 },
             )
             .await;
+        let reported = rec.recording_degradations();
         restore_clip_writes(&store).await;
         let settled = wait_for(Duration::from_secs(10), || attempts(&rec, clip).is_none()).await;
 
         assert!(closed.is_err(), "precondition: the close failed");
+        assert!(
+            reported
+                .iter()
+                .any(|d| d.camera_id == 1 && d.reason == UNFINALIZED),
+            "the unfinalized clip is missing from recording health: {reported:?}"
+        );
         assert!(settled, "no retry finalized the clip");
         assert!(
             finalized_playable(&store, &clips_dir, clip.clip_id).await,
             "the retry did not stamp the row with the close's final file"
+        );
+        assert!(
+            rec.recording_degradations().is_empty(),
+            "a recovered clip is still reported: {:?}",
+            rec.recording_degradations()
         );
     }
 
@@ -6949,6 +6973,16 @@ mod epoch_tests {
         assert!(
             pending.is_empty(),
             "damaged footage is upload-eligible: {pending:?}"
+        );
+        // The retry clears the clip's finalization failure, not its damage.
+        let reasons: Vec<String> = rec
+            .recording_degradations()
+            .into_iter()
+            .map(|d| d.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            ["recording has missing samples or a damaged media layout"]
         );
     }
 
