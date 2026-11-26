@@ -1002,6 +1002,12 @@ fn parse_output_level_range(body: &str) -> Result<(i32, i32), String> {
 
 #[cfg(test)]
 mod tests {
+    /// Per-run credential so no literal reaches a password sink.
+    fn test_secret(tag: &str) -> String {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{tag}-{}-{n}", std::process::id())
+    }
     use super::*;
 
     #[test]
@@ -1387,11 +1393,16 @@ mod tests {
         use wiremock::matchers::body_string_contains;
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let srv = MockServer::start().await;
+        let (user, secret) = (test_secret("user"), test_secret("pw"));
         let profiles = r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><e:Body><trt:GetProfilesResponse><trt:Profiles token="P1"><tt:Name>main</tt:Name><tt:VideoEncoderConfiguration token="E1"><tt:Encoding>H264</tt:Encoding></tt:VideoEncoderConfiguration></trt:Profiles></trt:GetProfilesResponse></e:Body></e:Envelope>"#;
-        let uri = r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema"><e:Body><GetStreamUriResponse><MediaUri><tt:Uri>rtsp://admin:secret@cam/stream1</tt:Uri></MediaUri></GetStreamUriResponse></e:Body></e:Envelope>"#;
-        let fault = r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"><e:Body><e:Fault><e:Code><e:Value>e:Receiver</e:Value><e:Subcode><e:Value>ter:ActionNotSupported</e:Value></e:Subcode></e:Code><e:Reason><e:Text>ActionNotSupported rtsp://admin:secret@cam/x</e:Text></e:Reason></e:Fault></e:Body></e:Envelope>"#;
+        let uri = format!(
+            r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema"><e:Body><GetStreamUriResponse><MediaUri><tt:Uri>rtsp://{user}:{secret}@cam/stream1</tt:Uri></MediaUri></GetStreamUriResponse></e:Body></e:Envelope>"#
+        );
+        let fault = format!(
+            r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"><e:Body><e:Fault><e:Code><e:Value>e:Receiver</e:Value><e:Subcode><e:Value>ter:ActionNotSupported</e:Value></e:Subcode></e:Code><e:Reason><e:Text>ActionNotSupported rtsp://{user}:{secret}@cam/x</e:Text></e:Reason></e:Fault></e:Body></e:Envelope>"#
+        );
         Mock::given(body_string_contains("tr2:GetProfiles"))
-            .respond_with(ResponseTemplate::new(500).set_body_string(fault))
+            .respond_with(ResponseTemplate::new(500).set_body_string(fault.clone()))
             .mount(&srv)
             .await;
         Mock::given(body_string_contains("trt:GetProfiles"))
@@ -1399,24 +1410,29 @@ mod tests {
             .mount(&srv)
             .await;
         Mock::given(body_string_contains("GetStreamUri"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(uri))
+            .respond_with(ResponseTemplate::new(200).set_body_string(uri.clone()))
             .mount(&srv)
             .await;
         let endpoint = format!(
-            "http://admin:secret@{}/onvif/device_service?k=v",
+            "http://{user}:{secret}@{}/onvif/device_service?k=v",
             srv.address()
         );
         let cap = Capture::default();
         let _g = tracing::subscriber::set_default(cap.clone());
-        let bound = query_profile_streams(&endpoint, "u", "p").await.unwrap();
+        let bound = query_profile_streams(&endpoint, &test_secret("u"), &test_secret("p"))
+            .await
+            .unwrap();
         assert_eq!(
             bound[0].uri.as_deref(),
-            Some("rtsp://admin:secret@cam/stream1")
+            Some(format!("rtsp://{user}:{secret}@cam/stream1").as_str())
         );
-        query_streams(&endpoint, "u", "p").await.unwrap();
+        query_streams(&endpoint, &test_secret("u"), &test_secret("p"))
+            .await
+            .unwrap();
         let logs = cap.0.lock().unwrap().clone();
         assert!(logs.contains("GetProfiles"), "capture saw nothing: {logs}");
-        for bad in ["secret", "admin:", "rtsp://", "k=v"] {
+        let user_info = format!("{user}:");
+        for bad in [secret.as_str(), user_info.as_str(), "rtsp://", "k=v"] {
             assert!(!logs.contains(bad), "{bad} leaked into logs:\n{logs}");
         }
     }
