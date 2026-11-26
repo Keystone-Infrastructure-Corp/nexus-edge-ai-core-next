@@ -1374,6 +1374,7 @@ mod tests {
         APPLICATION_TIMEOUT,
     };
     use nexus_pipeline::{ClipFinal, ClipHandle, ClipMeta, OpenClip, RecorderError};
+    use nexus_tracker::static_object::{ALERT_EPOCH_ATTRIBUTE_KEY, STATIC_FRAMES_ATTRIBUTE_KEY};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use url::Url;
 
@@ -3298,12 +3299,15 @@ mod tests {
 
         let dir = tempfile::tempdir().expect("tempdir");
         let recorder = Arc::new(ClipLogRecorder::default());
-        let args = reconciler_args(
+        let mut args = reconciler_args(
             recorder.clone(),
             dir.path(),
             &[camera.clone(), cam_with_id(8)],
         )
         .await;
+        // The static filter classifies the person too, so its output shows
+        // which policy a generation runs.
+        args.static_object.anchor_persons = true;
         reconcile(&args).await.expect("initial pass");
         // The mock detector's person opens a clip, which each restart must
         // finalize before the replacement opens the next one.
@@ -3355,6 +3359,35 @@ mod tests {
                  then one start"
             );
             assert_eq!(recorder.sources_built(7), sources + 1, "{what}: one start");
+            // The replacement processed a frame under the digest of the config
+            // it froze, which covers every policy field: the saved thresholds.
+            let saved = parking_revision(&camera);
+            wait_until(
+                &format!("{what}: the replacement applied the saved policy"),
+                || {
+                    let p = parking(&args, &saved);
+                    p.state == ZoneApplicationState::Applied
+                        && p.applied_generation == Some(now.parking_generation)
+                },
+            )
+            .await;
+            // And classified with it: legacy stamps its per-frame diagnostics
+            // on the person, v2 only the alert epoch. No threshold edit changes
+            // a verdict here: the mock person drifts 60 px, too far for any
+            // plan policy to hide, and stands outside the parking corner.
+            let legacy = camera.behavior.parking_policy_v2.is_none();
+            wait_until(
+                &format!("{what}: the replacement classifies with it"),
+                || {
+                    args.cache.get(7).is_some_and(|e| {
+                        e.objects.iter().any(|o| {
+                            o.attributes.contains_key(ALERT_EPOCH_ATTRIBUTE_KEY)
+                                && o.attributes.contains_key(STATIC_FRAMES_ATTRIBUTE_KEY) == legacy
+                        })
+                    })
+                },
+            )
+            .await;
         }
 
         // Saving the same policy again is not an edit.
