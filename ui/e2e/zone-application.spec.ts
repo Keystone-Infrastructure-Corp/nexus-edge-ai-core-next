@@ -132,6 +132,9 @@ async function zonesRevision(page: Page, id: number): Promise<string> {
     .zones_revision;
 }
 
+/** Camera `id`'s own URL, whatever its query: a save can carry `expected_zones_revision`. */
+const cameraPath = (id: number) => (url: URL) => url.pathname === `/api/v1/cameras/${id}`;
+
 /**
  * Serve this camera's stats from the engine with `zones_runtime` rewritten.
  * `holdNext` parks the next request before it reaches the engine and
@@ -226,6 +229,8 @@ test.describe("zone application", () => {
   });
 
   test.afterEach(async ({ page }) => {
+    // A stats poll in flight past the delete finds no zones_runtime: its route must not fail the test.
+    await page.unrouteAll({ behavior: "ignoreErrors" });
     if (cameraId !== null) await engine(page, "DELETE", `/cameras/${cameraId}`);
     cameraId = null;
   });
@@ -317,7 +322,7 @@ test.describe("zone application", () => {
     // Hold the PUT: nothing is applied while the save is pending.
     let releasePut = () => {};
     const putHeld = new Promise<void>((resolve) => (releasePut = resolve));
-    await page.route(`**/api/v1/cameras/${cameraId}`, async (route) => {
+    await page.route(cameraPath(cameraId), async (route) => {
       if (route.request().method() === "PUT") await putHeld;
       await route.continue();
     });
@@ -359,7 +364,7 @@ test.describe("zone application", () => {
     await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
     let releasePut = () => {};
     const putHeld = new Promise<void>((resolve) => (releasePut = resolve));
-    await page.route(`**/api/v1/cameras/${cameraId}`, async (route) => {
+    await page.route(cameraPath(cameraId), async (route) => {
       if (route.request().method() === "PUT") await putHeld;
       await route.continue();
     });
@@ -529,7 +534,7 @@ test.describe("zone application", () => {
     let release = () => {};
     const parked = new Promise<void>((resolve) => (seen = resolve));
     const opened = new Promise<void>((resolve) => (release = resolve));
-    await page.route(`**/api/v1/cameras/${id}`, async (route) => {
+    await page.route(cameraPath(id), async (route) => {
       if (route.request().method() !== "PUT") return route.fallback();
       seen();
       await opened;
@@ -1001,27 +1006,6 @@ test.describe("zone application", () => {
     expect(await zonesRevision(page, id)).toBe(theirs);
   });
 
-  test("a zone edit saved over another operator's zone save is sent as edited", async ({ page }) => {
-    cameraId = await createCamera(page, [DOOR]);
-    const id = cameraId;
-    const receipt = await controlReceipt(page, id);
-    receipt.set(applied(1));
-    await page.goto(`/cameras/${id}`);
-    const status = page.getByTestId("zone-application");
-    await expect(status).toContainText("Applied to camera");
-
-    await zoneRow(page, "Door").getByRole("textbox").fill("Mine");
-    await expect(status).toContainText("Unsaved changes");
-    await saveZonesElsewhere(page, id, [DOCK]);
-    receipt.set(applied(2));
-    const put = page.waitForRequest(isPut(id));
-    await page.getByRole("button", { name: /^save$/i }).click();
-
-    expect(((await put).postDataJSON() as { zones: Zone[] }).zones).toEqual([{ ...DOOR, name: "Mine" }]);
-    await expect(status).toContainText("Applied to camera", POLL);
-    await expect(zoneRow(page, "Mine")).toBeVisible();
-  });
-
   /**
    * Park the editor's next save of camera `id` until `release`, then land
    * another operator's save of `zones` first: after the editor re-read the
@@ -1034,7 +1018,7 @@ test.describe("zone application", () => {
     const opened = new Promise<void>((resolve) => (release = resolve));
     let raced = false;
     await page.route(
-      (url) => url.pathname === `/api/v1/cameras/${id}`,
+      cameraPath(id),
       async (route) => {
         // The other operator's save, and every later request, go straight through.
         if (route.request().method() !== "PUT" || raced) return route.fallback();
@@ -1049,7 +1033,51 @@ test.describe("zone application", () => {
   }
 
   const expectedRevision = (r: Request) => new URL(r.url()).searchParams.get("expected_zones_revision");
-  const conflict = /^Not saved: someone saved this camera's zones while this save was on its way/;
+  const conflict = /^Not saved: someone else saved this camera's zones since they were last read here/;
+
+  test("a zone edit saved over another operator's unread zone save is refused, then sent as edited", async ({
+    page,
+  }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+    const mine = await zonesRevision(page, id);
+
+    await zoneRow(page, "Door").getByRole("textbox").fill("Mine");
+    await expect(status).toContainText("Unsaved changes");
+    const race = await raceSave(page, id, [DOCK]);
+    race.release();
+    receipt.set(applied(2));
+    const put = page.waitForRequest(isPut(id));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    const sent = await put;
+    expect(expectedRevision(sent)).toBe(mine);
+    expect((sent.postDataJSON() as { zones: Zone[] }).zones).toEqual([{ ...DOOR, name: "Mine" }]);
+    expect((await sent.response())?.status()).toBe(409);
+
+    // Their zones stay saved; the edit stays, shown as over their save.
+    const cams = await engine<Array<{ id: number; zones: Zone[] }>>(page, "GET", "/cameras");
+    expect(cams.find((c) => c.id === id)?.zones).toEqual([DOCK]);
+    await expect(page.getByText(conflict)).toBeVisible();
+    await expect(status).toContainText("Unsaved changes; zones changed elsewhere", POLL);
+    await expect(zoneRow(page, "Mine")).toBeVisible();
+
+    // Saved again, knowingly over their zones: the edit replaces them.
+    const theirs = await zonesRevision(page, id);
+    receipt.set(applied(3));
+    const again = page.waitForRequest(isPut(id));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    const resent = await again;
+    expect(expectedRevision(resent)).toBe(theirs);
+    expect((resent.postDataJSON() as { zones: Zone[] }).zones).toEqual([{ ...DOOR, name: "Mine" }]);
+    expect((await resent.response())?.ok()).toBe(true);
+    await expect(status).toContainText("Applied to camera", POLL);
+    await expect(zoneRow(page, "Mine")).toBeVisible();
+  });
 
   test("a save overtaken by another operator's zone save after its re-read is refused, then rebased", async ({
     page,

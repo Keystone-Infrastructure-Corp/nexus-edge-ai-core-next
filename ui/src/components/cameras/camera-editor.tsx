@@ -462,7 +462,7 @@ export function CameraEditor({
     onError: (e: unknown) =>
       setError(
         isZonesRevisionConflict(e)
-          ? "Not saved: someone saved this camera's zones while this save was on its way, so nothing was changed. Check the zones and save again."
+          ? "Not saved: someone else saved this camera's zones since they were last read here, so nothing was changed. Check the zones and save again."
           : e instanceof Error
             ? e.message
             : String(e),
@@ -648,15 +648,20 @@ export function CameraEditor({
       setError("URL is required.");
       return;
     }
-    // The save replaces the camera's zones whole. Unedited zones go out as
-    // saved now, not as last read here, so an unrelated edit never reverts
-    // another operator's newer zones. Edited zones, a drawing in progress
-    // included (it freezes the zones it was drawn over), are sent as shown:
-    // the status says when they were changed elsewhere. Unedited zones
-    // re-read with their revision are sent expecting it (see
-    // `rereadSavedZones`).
+    // The save replaces the camera's zones whole, expecting the revision of
+    // the saved zones it replaces, so a save from elsewhere it has not read
+    // is refused (409), never overwritten. Unedited zones go out as saved
+    // now, not as last read here, so an unrelated edit never reverts another
+    // operator's newer zones; they expect their re-read revision (see
+    // `rereadSavedZones`). Edited zones, a drawing in progress included (it
+    // freezes the zones it was drawn over), are sent as shown, expecting the
+    // latest snapshot read here since the latest save, installed or held by
+    // the drawing: once one has read another operator's save, the status
+    // says the zones changed elsewhere and saving replaces them knowingly.
+    // With no snapshot read, nothing is expected.
     let cfg = draft;
-    let expected: string | undefined;
+    const read = snap && snap.seq > zoneSaveSeq(camera.id) ? snap : zoneView.installed?.read;
+    let expected = read?.body.zones_revision;
     if (!isNew && !sketching && draft.zones === zoneView.synced) {
       setChecking(true);
       let saved: SavedZones;
