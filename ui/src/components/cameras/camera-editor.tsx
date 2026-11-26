@@ -1,4 +1,5 @@
 import {
+  focusManager,
   useIsMutating,
   useMutation,
   useQuery,
@@ -9,7 +10,7 @@ import {
   AlertTriangle,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { toast } from "sonner";
 
 import { getCameraConfigSnapshot } from "@/api/admin";
@@ -183,11 +184,18 @@ const statsKey = (id: number) => ["cameras", "stats", id] as const;
 const snapshotKey = (id: number) => ["cameras", "config-snapshot", id] as const;
 const saveKey = (id: number) => ["cameras", "save", id] as const;
 
-/** Drop any request in flight and start a new one, rather than joining it. */
-function restartQuery(qc: QueryClient, queryKey: readonly unknown[]) {
+/**
+ * Drop any request in flight and start a new one, rather than joining it.
+ * `refetchType: "none"` only marks the query stale, for its revalidation.
+ */
+function restartQuery(
+  qc: QueryClient,
+  queryKey: readonly unknown[],
+  refetchType: "active" | "none" = "active",
+) {
   void qc
     .cancelQueries({ queryKey, exact: true })
-    .then(() => qc.invalidateQueries({ queryKey, exact: true }));
+    .then(() => qc.invalidateQueries({ queryKey, exact: true, refetchType }));
 }
 
 /**
@@ -518,15 +526,20 @@ export function CameraEditor({
   const application = deriveZoneApplication(saved, statsQ, zoneDraft, epoch);
   const pollMs = zoneApplicationPollMs(application, [statsQ.error, snapQ.error], zoneView.savedAt);
 
-  // A newly installed snapshot needs a stats read begun after it.
+  // A newly installed snapshot needs a stats read begun after it. A hidden
+  // page leaves that read to its revalidation once visible again.
   const installedSeq = zoneView.installed?.seq;
   useEffect(() => {
-    if (installedSeq !== undefined) restartQuery(qc, statsKey(camera.id));
+    if (installedSeq === undefined) return;
+    restartQuery(qc, statsKey(camera.id), focusManager.isFocused() ? "active" : "none");
   }, [qc, camera.id, installedSeq]);
   // A mismatch or a failed snapshot read reloads the saved zones at once,
-  // then at most once per receipt interval, never while a save is pending.
+  // then at most once per receipt interval, never while a save is pending
+  // or while the page is hidden (it reconciles once visible again).
   const receiptKind = application.kind === "unsaved" ? application.receipt.kind : application.kind;
+  const visible = useSyncExternalStore(focusManager.subscribe, () => focusManager.isFocused());
   const reconcile =
+    visible &&
     !isNew &&
     pollMs !== false &&
     !saving &&

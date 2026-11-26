@@ -171,6 +171,14 @@ const zoneRow = (page: Page, name: string) =>
 const polygon = (page: Page, zone: Zone) =>
   page.locator(`svg polygon[points="${zone.polygon.map(([x, y]) => `${x},${y}`).join(" ")}"]`);
 
+/** Hide or show the page, as a tab switch does. */
+async function setVisibility(page: Page, state: "hidden" | "visible") {
+  await page.evaluate((s) => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => s });
+    document.dispatchEvent(new Event("visibilitychange", { bubbles: true }));
+  }, state);
+}
+
 // A receipt change shows on the next poll: every 2 s just after a save,
 // otherwise at the editor's 5 s stats refresh.
 const POLL = { timeout: 15_000 };
@@ -456,6 +464,34 @@ test.describe("zone application", () => {
     await expect(status).toContainText("Cannot verify: no access to the saved zones", POLL);
     await expect(zoneRow(page, "Mine")).toHaveCount(0);
     await expect(page.getByText("Unsaved changes")).toHaveCount(0);
+  });
+
+  test("a hidden page reconciles a late mismatch only once visible again", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const receipt = await controlReceipt(page, cameraId);
+    receipt.set(applied(1));
+    const reads = [`/api/v1/admin/cameras/${cameraId}/config-snapshot`, `/api/v1/cameras/${cameraId}/stats`];
+    const started: string[] = [];
+    page.on("request", (r) => started.push(new URL(r.url()).pathname));
+    await page.goto(`/cameras/${cameraId}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    // A stats read in flight when the page is hidden lands after another
+    // operator's save and reports the mismatch.
+    const held = receipt.holdNext();
+    await held.parked;
+    await setVisibility(page, "hidden");
+    receipt.set(applied(2));
+    await saveZonesElsewhere(page, cameraId, [DOCK]);
+    const from = started.length;
+    held.release(applied(2));
+    await page.waitForTimeout(4_000);
+    expect(started.slice(from).filter((p) => reads.includes(p))).toEqual([]);
+
+    await setVisibility(page, "visible");
+    await expect(zoneRow(page, "Loading dock")).toBeVisible(POLL);
+    await expect(status).toContainText("Applied to camera", POLL);
   });
 
   test("failed reads, old receipts and engine failures are never Applied, and recover", async ({ page }) => {
