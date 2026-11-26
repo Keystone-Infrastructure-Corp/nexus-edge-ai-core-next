@@ -22,8 +22,8 @@
 //!   moves past the jump so no window overlapping it reads complete, and
 //!   pruning follows monotonic time so a forward jump deletes no history.
 
-use std::collections::BTreeMap;
-use std::sync::{Mutex, PoisonError};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -57,6 +57,49 @@ const WINDOW_SECONDS: [i64; 2] = [60 * 60, 24 * 60 * 60];
 #[derive(Debug, Default)]
 pub(crate) struct DeliveryState {
     clock: Mutex<DeliveryClock>,
+    transfers: Mutex<Transfers>,
+}
+
+/// Clip ids an uploader is transferring now, per queue; `None` until that
+/// queue's uploader is tracked, so the snapshot cannot claim zero.
+#[derive(Debug, Default)]
+struct Transfers {
+    ordinary: Option<BTreeSet<i64>>,
+    alert: Option<BTreeSet<i64>>,
+}
+
+impl Transfers {
+    fn of(&mut self, source: RecordingSource) -> &mut Option<BTreeSet<i64>> {
+        match source {
+            RecordingSource::Ordinary => &mut self.ordinary,
+            RecordingSource::Alert => &mut self.alert,
+        }
+    }
+}
+
+impl DeliveryState {
+    fn transfers(&self) -> std::sync::MutexGuard<'_, Transfers> {
+        self.transfers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Marks one clip as being transferred until dropped; see
+/// [`Store::begin_transfer`].
+#[must_use = "the clip is in flight only while the guard lives"]
+pub struct TransferGuard {
+    state: Arc<DeliveryState>,
+    source: RecordingSource,
+    id: i64,
+}
+
+impl Drop for TransferGuard {
+    fn drop(&mut self) {
+        if let Some(ids) = self.state.transfers().of(self.source) {
+            ids.remove(&self.id);
+        }
+    }
 }
 
 /// Wall-clock readings paired with the monotonic clock, to notice a
@@ -240,9 +283,17 @@ pub struct PartitionTotals {
     pub oldest_capture_at: Option<DateTime<Utc>>,
 }
 
+/// Rows an uploader is transferring now: a marked subset of the queue's
+/// partitions, never an addition to them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlight {
+    pub count: i64,
+    pub known_bytes: i64,
+    pub unknown_size_count: i64,
+}
+
 /// One upload queue at `sampled_at`. An in-flight transfer stays in the
 /// partition it was selected from until its completion commits.
-// shortcut: in-flight transfers are not marked, add a marker when the capacity view shows them.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryQueue {
     /// `None` when the queue has no quarantine (alert clips).
@@ -253,6 +304,9 @@ pub struct DeliveryQueue {
     pub ready: PartitionTotals,
     /// Rows still being written: outside every partition, sizes unknown.
     pub open: PartitionTotals,
+    /// The partitions' rows being transferred now, already counted in
+    /// them. `None` when this process does not track the queue's uploader.
+    pub in_flight: Option<InFlight>,
 }
 
 /// Counters summed over a window. Payload bytes only: not network usage.
@@ -453,6 +507,30 @@ impl Store {
         Ok(horizon)
     }
 
+    /// `source`'s uploader runs in this process: report its transfers
+    /// (`in_flight`) from now on instead of null.
+    pub fn track_transfers(&self, source: RecordingSource) {
+        self.delivery
+            .transfers()
+            .of(source)
+            .get_or_insert_with(BTreeSet::new);
+    }
+
+    /// Mark clip `id` of `source` as in flight until the guard drops; hold
+    /// it from selection until the completion commits or the attempt fails.
+    pub fn begin_transfer(&self, source: RecordingSource, id: i64) -> TransferGuard {
+        self.delivery
+            .transfers()
+            .of(source)
+            .get_or_insert_with(BTreeSet::new)
+            .insert(id);
+        TransferGuard {
+            state: self.delivery.clone(),
+            source,
+            id,
+        }
+    }
+
     /// Every finalized, undelivered row of `source`'s queue with its
     /// partition at `now` and enrollment `floor`, by id. The snapshot
     /// aggregates the same classification.
@@ -560,6 +638,12 @@ impl Store {
         // A jump with no write since must not leave its windows complete;
         // checked outside the read transaction, which then never writes.
         self.check_clock(&mut *self.pool.acquire().await?).await?;
+        // Read before the snapshot: a transfer that completes in between is
+        // no longer queued there, so the marked rows stay a subset.
+        let (ordinary_ids, alert_ids) = {
+            let t = self.delivery.transfers();
+            (t.ordinary.clone(), t.alert.clone())
+        };
         let mut tx = self.pool.begin().await?;
         let since: String = sqlx::query_scalar(
             "SELECT accounting_since FROM recording_delivery_baseline WHERE id = 1",
@@ -567,9 +651,22 @@ impl Store {
         .fetch_one(&mut *tx)
         .await?;
         let accounting_since = crate::motion::parse_ts(&since)?;
-        let ordinary =
-            queue_totals(&mut tx, RecordingSource::Ordinary, now, floor.as_deref()).await?;
-        let alert = queue_totals(&mut tx, RecordingSource::Alert, now, floor.as_deref()).await?;
+        let ordinary = queue_totals(
+            &mut tx,
+            RecordingSource::Ordinary,
+            now,
+            floor.as_deref(),
+            ordinary_ids,
+        )
+        .await?;
+        let alert = queue_totals(
+            &mut tx,
+            RecordingSource::Alert,
+            now,
+            floor.as_deref(),
+            alert_ids,
+        )
+        .await?;
         let end = now
             - Duration::seconds(now.timestamp().rem_euclid(60))
             - Duration::nanoseconds(i64::from(now.timestamp_subsec_nanos()));
@@ -596,6 +693,7 @@ async fn queue_totals(
     source: RecordingSource,
     now: DateTime<Utc>,
     floor: Option<&str>,
+    in_flight: Option<BTreeSet<i64>>,
 ) -> Result<DeliveryQueue, StoreError> {
     let g = source.gates();
     let rows = sqlx::query(&format!(
@@ -638,6 +736,25 @@ async fn queue_totals(
             },
         };
         *slot = totals;
+    }
+    if let Some(ids) = in_flight {
+        // Integer ids, so formatting them into the statement is safe.
+        let ids: Vec<String> = ids.iter().map(i64::to_string).collect();
+        let (count, known_bytes, unknown_size_count) = sqlx::query_as(&format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN size_bytes > 0 THEN size_bytes END), 0),
+                    COALESCE(SUM(size_bytes <= 0), 0)
+               FROM {} WHERE ({}) AND id IN ({})",
+            g.table,
+            g.queue,
+            ids.join(",")
+        ))
+        .fetch_one(&mut *conn)
+        .await?;
+        q.in_flight = Some(InFlight {
+            count,
+            known_bytes,
+            unknown_size_count,
+        });
     }
     Ok(q)
 }

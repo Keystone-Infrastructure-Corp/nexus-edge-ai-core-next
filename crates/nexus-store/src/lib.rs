@@ -35,8 +35,8 @@ pub use motion::{
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
 pub use recording_delivery::{
-    CameraDelivery, DeliveryCounters, DeliveryQueue, DeliveryWindow, PartitionTotals,
-    QueuePartition, RecordingDeliverySnapshot, RecordingSource, SourceCounters,
+    CameraDelivery, DeliveryCounters, DeliveryQueue, DeliveryWindow, InFlight, PartitionTotals,
+    QueuePartition, RecordingDeliverySnapshot, RecordingSource, SourceCounters, TransferGuard,
     ALERT_COLD_RETRY_SECS,
 };
 pub use sessions::{NewRefreshToken, RefreshToken, RefreshTokenId, SessionsError};

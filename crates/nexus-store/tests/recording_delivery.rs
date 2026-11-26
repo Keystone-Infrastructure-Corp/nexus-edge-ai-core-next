@@ -711,6 +711,54 @@ async fn recording_delivery_reports_loss_since_the_window_end() {
     assert_eq!(snap.since_window_end.alert, DeliveryCounters::default());
 }
 
+/// A row being transferred is a marked subset of the partition it was
+/// selected from, never an extra total: it stays there until its
+/// completion commits. `in_flight` is null until the queue's uploader is
+/// tracked.
+#[tokio::test]
+async fn recording_delivery_marks_in_flight_rows_without_moving_totals() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let now = at(12, 0, 0);
+    let sending = closed_clip(&store, 1, at(11, 0, 0), 1_000, true).await;
+    let unknown = closed_clip(&store, 1, at(11, 10, 0), 0, true).await;
+    closed_clip(&store, 2, at(11, 20, 0), 2_000, true).await;
+    let snap =
+        |store: Store| async move { store.recording_delivery_stats(now, None).await.unwrap() };
+
+    let before = snap(store.clone()).await;
+    assert_eq!(before.ordinary.in_flight, None, "no uploader: cannot tell");
+    store.track_transfers(RecordingSource::Ordinary);
+    let idle = snap(store.clone()).await;
+    let idle_flight = idle.ordinary.in_flight.clone().unwrap();
+    assert_eq!(idle_flight.count, 0);
+    assert_eq!(
+        idle.alert.in_flight, None,
+        "the alert uploader is not tracked"
+    );
+
+    let t1 = store.begin_transfer(RecordingSource::Ordinary, sending);
+    let t2 = store.begin_transfer(RecordingSource::Ordinary, unknown);
+    let busy = snap(store.clone()).await;
+    let f = busy.ordinary.in_flight.clone().unwrap();
+    assert_eq!(
+        (f.count, f.known_bytes, f.unknown_size_count),
+        (2, 1_000, 1)
+    );
+    assert_eq!(busy.ordinary.ready, idle.ordinary.ready, "totals unchanged");
+
+    // Completion commits before the transfer ends: no longer queued, so
+    // no longer in flight either.
+    store
+        .mark_cold_replicated(sending, &cold_mark("s.mp4", now))
+        .await
+        .unwrap();
+    let f = snap(store.clone()).await.ordinary.in_flight.unwrap();
+    assert_eq!((f.count, f.known_bytes), (1, 0));
+    drop((t1, t2));
+    assert_eq!(snap(store).await.ordinary.in_flight.unwrap().count, 0);
+}
+
 /// Windows are whole UTC minutes ending at the start of the sample's
 /// minute; a clip finalized one millisecond before the hour belongs to
 /// the previous hour.

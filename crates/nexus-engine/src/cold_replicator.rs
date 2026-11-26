@@ -234,6 +234,7 @@ pub async fn run_cold_replicator(
         batch_size = BATCH_SIZE,
         "cold replicator starting"
     );
+    store.track_transfers(RecordingSource::Ordinary);
 
     // Subscribe BEFORE the first tick so we don't miss events that
     // fire while we're servicing the boot-time drain.
@@ -881,6 +882,7 @@ pub async fn run_alert_clip_uploader(
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     info!("alert-clip uploader starting");
+    store.track_transfers(RecordingSource::Alert);
     // The first interval tick fires immediately, so clips left ready
     // across a restart ship at boot.
     let mut interval = tokio::time::interval(ALERT_COLD_RETRY);
@@ -979,6 +981,8 @@ async fn upload_alert_clip_one(
     backend_handle: &str,
     clip: &AlertClipRow,
 ) -> Result<(), UploadError> {
+    // SPEC-090 — in flight until this returns, after the completion commits.
+    let _transfer = store.begin_transfer(RecordingSource::Alert, clip.id);
     let sha256 = clip.sha256.as_deref().ok_or(UploadError::MissingSha256)?;
     let hot_path_rel = clip.path.as_str();
     let edge_clip_id = format!("alert-{}", clip.id);
@@ -1086,6 +1090,8 @@ async fn upload_one(
     clip: &ClipRow,
     attached_history: Option<bool>,
 ) -> Result<(), UploadError> {
+    // SPEC-090 — in flight until this returns, after the completion commits.
+    let _transfer = store.begin_transfer(RecordingSource::Ordinary, clip.id);
     let hot_path_rel = clip
         .hot_path
         .as_deref()
@@ -2684,6 +2690,59 @@ mod tests {
         assert_eq!(c.alert.delivered_bytes, 11);
         assert_eq!(c.alert.generated_bytes, 11);
         assert_eq!(c.ordinary.attempted_bytes, 0, "no motion tick ran");
+    }
+
+    /// SPEC-090 — while its PUT is in flight a clip is marked in flight
+    /// and still counted in `ready`; once its completion commits it is in
+    /// neither.
+    #[tokio::test]
+    async fn recording_delivery_marks_the_clip_in_transfer() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let release = Arc::new(Notify::new());
+        let hook_release = release.clone();
+        *backend.first_put_hook.lock() = Some(Box::pin(async move {
+            hook_release.notified().await;
+        }));
+        let tick_task = {
+            let (store, backend) = (store.clone(), backend.clone());
+            tokio::spawn(async move { run_tick(&store, &clips_dir, &backend).await })
+        };
+        for _ in 0..200 {
+            if !backend.put_paths.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(backend.put_paths.lock().len(), 1, "motion put in flight");
+
+        let snap = store
+            .recording_delivery_stats(Utc::now(), None)
+            .await
+            .unwrap();
+        let f = snap
+            .ordinary
+            .in_flight
+            .expect("the uploader tracks transfers");
+        assert_eq!((f.count, f.known_bytes), (1, 10));
+        assert_eq!(snap.ordinary.ready.count, 1, "still where it was selected");
+
+        release.notify_one();
+        tick_task.await.unwrap();
+        let snap = store
+            .recording_delivery_stats(Utc::now(), None)
+            .await
+            .unwrap();
+        assert_eq!(snap.ordinary.in_flight.unwrap().count, 0);
+        assert_eq!(snap.ordinary.ready.count, 0);
+        assert!(store
+            .get_clip(clip_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cold_handle
+            .is_some());
     }
 
     /// SPEC-090 — a successful upload counts the bytes it sent as

@@ -14738,6 +14738,16 @@ mod tests {
         assert!(rd["alert"]["quarantined"].is_null(), "unsupported is null");
         assert_eq!(rd["windows"][0]["window_seconds"], 3600);
         assert_eq!(rd["windows"][1]["window_seconds"], 86400);
+        assert!(rd["since_window_end"]["ordinary"].is_object(), "{body}");
+        assert!(
+            rd["ordinary"]["in_flight"].is_null(),
+            "no uploader runs here: cannot tell"
+        );
+        store.track_transfers(nexus_store::RecordingSource::Ordinary);
+        let body = get_storage_json(app.clone()).await;
+        let flight = &body["recording_delivery"]["ordinary"]["in_flight"];
+        assert_eq!(flight["count"], 0, "{body}");
+        assert!(body["recording_delivery"]["alert"]["in_flight"].is_null());
         assert!(body["hot"].is_object() && body["usb"].is_object());
 
         sqlx::query("DROP TABLE recording_delivery_baseline")
