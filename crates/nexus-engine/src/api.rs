@@ -3002,44 +3002,79 @@ struct CameraFrameStatsView {
     analysis_stream: Option<nexus_pipeline::AnalysisStreamStatus>,
     /// SPEC-088 — the zone revision and enabled flag saved now against what
     /// the camera's supervisor generations acknowledged. Absent only for a
-    /// camera whose row is not saved or cannot be read, which a reader takes
-    /// as "not reported", never as applied.
+    /// camera that is not saved, which a reader takes as "not reported",
+    /// never as applied.
     #[serde(skip_serializing_if = "Option::is_none")]
-    zones_runtime: Option<nexus_pipeline::zone_application::ZonesRuntime>,
+    zones_runtime: Option<ZonesReceipt>,
 }
+
+/// SPEC-088 — a camera's `zones_runtime`: its receipt, or `read_error` with
+/// every other key but the schema version `null` when its saved zones could
+/// not be read (the store failed, or this build cannot read its row). A
+/// reader takes that for a failed read, neither applied nor an engine that
+/// does not report zone application, and keeps reading.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ZonesReceipt {
+    Read(nexus_pipeline::zone_application::ZonesRuntime),
+    ReadError {
+        schema_version: u32,
+        desired_revision: (),
+        applied_revision: (),
+        generation: (),
+        applied_generation: (),
+        state: &'static str,
+        applied_at: (),
+        error_code: (),
+    },
+}
+
+const ZONES_READ_ERROR: ZonesReceipt = ZonesReceipt::ReadError {
+    schema_version: 1,
+    desired_revision: (),
+    applied_revision: (),
+    generation: (),
+    applied_generation: (),
+    state: "read_error",
+    applied_at: (),
+    error_code: (),
+};
 
 /// SPEC-088 — each saved camera's zone application status, its desired
 /// revision hashed from the zones in the store now and its enabled flag read
 /// with them, so a read straight after a save already reports the saved
-/// zones, never the running ones as applied.
+/// zones, never the running ones as applied. `None` when the saved cameras
+/// could not be read: then no camera's status is known, and each reads
+/// [`ZONES_READ_ERROR`].
 async fn zones_runtime(
     s: &ApiState,
     now: std::time::Instant,
-) -> std::collections::HashMap<CameraId, nexus_pipeline::zone_application::ZonesRuntime> {
+) -> Option<std::collections::HashMap<CameraId, ZonesReceipt>> {
     let registry = s.frame_stats.zone_application();
     // No save commits between this read and the requests it makes.
     let _reading = registry.saves().read().await;
-    let cameras = match s.store.list_readable_cameras().await {
-        Ok((cameras, _unreadable)) => cameras,
+    let (cameras, unreadable) = match s.store.list_readable_cameras().await {
+        Ok(read) => read,
         Err(e) => {
-            tracing::warn!(error = %e, "camera stats: saved zones unreadable; zone application not reported");
-            return std::collections::HashMap::new();
+            tracing::warn!(error = %e, "camera stats: saved zones unreadable; zone application reported as a read error");
+            return None;
         }
     };
-    cameras
-        .iter()
-        .map(|cam| {
-            let desired = nexus_pipeline::zone_application::zone_revision(&cam.zones);
-            (
-                cam.id,
-                registry.snapshot(cam.id, &desired, cam.ingest.enabled, now),
-            )
-        })
-        .collect()
+    let receipts = cameras.iter().map(|cam| {
+        let desired = nexus_pipeline::zone_application::zone_revision(&cam.zones);
+        let receipt = registry.snapshot(cam.id, &desired, cam.ingest.enabled, now);
+        (cam.id, ZonesReceipt::Read(receipt))
+    });
+    Some(
+        receipts
+            .chain(unreadable.into_iter().map(|id| (id, ZONES_READ_ERROR)))
+            .collect(),
+    )
 }
 
 /// 404 only when there is nothing to report: no frame since the supervisor
-/// last (re)started, and no saved camera to report zone application for. A
+/// last (re)started, and no saved camera to report zone application for (a
+/// failed read of the saved cameras cannot tell, so it reports that). A
 /// restarting camera reads as no frame yet, with its zone status, rather than
 /// as missing.
 async fn get_camera_stats(
@@ -3047,7 +3082,9 @@ async fn get_camera_stats(
     Path(id): Path<CameraId>,
 ) -> Result<Json<CameraFrameStatsView>, ApiError> {
     let now = std::time::Instant::now();
-    let zones = zones_runtime(&s, now).await.remove(&id);
+    let zones = zones_runtime(&s, now)
+        .await
+        .map_or(Some(ZONES_READ_ERROR), |mut zones| zones.remove(&id));
     let snap = match (s.frame_stats.snapshot(id), &zones) {
         (Some(snap), _) => snap,
         (None, Some(_)) => nexus_pipeline::CameraFrameStats::default(),
@@ -3069,7 +3106,7 @@ fn build_camera_stats_view(
     id: CameraId,
     snap: &nexus_pipeline::CameraFrameStats,
     now: std::time::Instant,
-    zones_runtime: Option<nexus_pipeline::zone_application::ZonesRuntime>,
+    zones_runtime: Option<ZonesReceipt>,
 ) -> CameraFrameStatsView {
     // Absent (camera has no RGB tap, or none of its frames have reached the
     // loop guard yet) reads as all-zero rather than 404 — the caller asked
@@ -3132,12 +3169,17 @@ async fn get_all_camera_stats(
     let now = std::time::Instant::now();
     let mut zones = zones_runtime(&s, now).await;
     let mut stats = s.frame_stats.snapshot_all();
-    for id in zones.keys() {
+    for id in zones.iter().flat_map(|zones| zones.keys()) {
         stats.entry(*id).or_default();
     }
     let views = stats
         .into_iter()
-        .map(|(id, snap)| build_camera_stats_view(&s, id, &snap, now, zones.remove(&id)))
+        .map(|(id, snap)| {
+            let receipt = zones
+                .as_mut()
+                .map_or(Some(ZONES_READ_ERROR), |zones| zones.remove(&id));
+            build_camera_stats_view(&s, id, &snap, now, receipt)
+        })
         .collect();
     Ok(Json(views))
 }
@@ -8384,6 +8426,115 @@ mod tests {
             state_of(&app, id).await,
             "applying",
             "g1's acknowledgement from before B certified the A saved after it"
+        );
+    }
+
+    /// SPEC-088 review 11 — a failed read of the saved zones is no answer.
+    /// While the store cannot list the cameras, every camera's stats, one with
+    /// frames and one without, carry a `read_error` receipt, never an omitted
+    /// one, which a reader takes for an engine that does not report zone
+    /// application and stops asking. Once the store reads again the receipt is
+    /// back, and a row this build cannot read still reads `read_error`.
+    #[tokio::test]
+    async fn camera_stats_report_a_failed_zone_read_as_a_read_error_until_it_recovers() {
+        use serde_json::json;
+
+        async fn get(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+        /// The single read's `zones_runtime`, and the batch row's.
+        async fn receipts(
+            app: &axum::Router,
+            id: nexus_types::CameraId,
+        ) -> (serde_json::Value, serde_json::Value) {
+            let (status, one) = get(app, &format!("/api/v1/cameras/{id}/stats")).await;
+            assert_eq!(status, StatusCode::OK, "camera {id}: {one}");
+            let (status, all) = get(app, "/api/v1/cameras/stats").await;
+            assert_eq!(status, StatusCode::OK, "{all}");
+            let row = all
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["camera_id"] == id))
+                .map_or(serde_json::Value::Null, |r| r["zones_runtime"].clone());
+            (one["zones_runtime"].clone(), row)
+        }
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let camera = store.list_cameras().await.expect("list cameras")[0].clone();
+        let (id, frameless) = (camera.id, camera.id + 1);
+        let epoch = state.frame_stats.begin_session(id);
+        state
+            .frame_stats
+            .observe_frame(id, epoch, chrono::Utc::now(), 512, 288);
+        let app = super::router(state);
+        let read_error = json!({
+            "schema_version": 1,
+            "desired_revision": null,
+            "applied_revision": null,
+            "generation": null,
+            "applied_generation": null,
+            "state": "read_error",
+            "applied_at": null,
+            "error_code": null,
+        });
+
+        sqlx::query("ALTER TABLE cameras RENAME TO cameras_away")
+            .execute(store.pool())
+            .await
+            .expect("make the saved cameras unreadable");
+        assert_eq!(
+            receipts(&app, id).await,
+            (read_error.clone(), read_error.clone()),
+            "a camera with frames hid the failed read"
+        );
+        assert_eq!(
+            receipts(&app, frameless).await.0,
+            read_error,
+            "a camera with no frame, saved or not, cannot be told apart while the read fails"
+        );
+
+        sqlx::query("ALTER TABLE cameras_away RENAME TO cameras")
+            .execute(store.pool())
+            .await
+            .expect("make the saved cameras readable again");
+        let mut unreadable = camera.clone();
+        unreadable.id = frameless;
+        store
+            .upsert_camera(&unreadable)
+            .await
+            .expect("save a camera");
+        sqlx::query(
+            "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') WHERE id = ?",
+        )
+        .bind(frameless)
+        .execute(store.pool())
+        .await
+        .expect("give it a codec this build cannot read");
+        let (one, row) = receipts(&app, id).await;
+        assert_eq!(one, row, "the batch and the single read disagree");
+        assert_eq!(
+            (&one["state"], &one["desired_revision"]),
+            (
+                &json!("applying"),
+                &json!(nexus_pipeline::zone_application::zone_revision(
+                    &camera.zones
+                ))
+            ),
+            "the receipt did not recover with the store: {one}"
+        );
+        assert_eq!(
+            receipts(&app, frameless).await,
+            (read_error.clone(), read_error),
+            "a row this build cannot read hid the failed read"
         );
     }
 

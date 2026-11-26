@@ -66,6 +66,18 @@ const applying =
     error_code: null,
   });
 
+/** The engine could not read the saved zones: every key but the state null, which `Receipt` cannot type. */
+const READ_ERROR = {
+  schema_version: 1,
+  desired_revision: null,
+  applied_revision: null,
+  generation: null,
+  applied_generation: null,
+  state: "read_error",
+  applied_at: null,
+  error_code: null,
+} as unknown as Receipt;
+
 /** Call the engine as the signed-in admin, through the page's network. */
 async function engine<T>(page: Page, method: string, path: string, body?: unknown): Promise<T> {
   return page.evaluate(
@@ -605,6 +617,10 @@ test.describe("zone application", () => {
 
     receipt.set(() => "error");
     await expect(status).toContainText("Cannot confirm: status read failed", POLL);
+    await expect(page.getByText("Applied to camera")).toHaveCount(0);
+
+    receipt.set(() => READ_ERROR);
+    await expect(status).toContainText("Cannot confirm: engine could not read the saved zones", POLL);
     await expect(page.getByText("Applied to camera")).toHaveCount(0);
 
     receipt.set((r, base) => ({

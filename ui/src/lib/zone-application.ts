@@ -66,6 +66,18 @@ const zonesRuntimeSchema = z
         : r.error_code === null,
   );
 
+/** The engine could not read the saved zones: every key but the state null. */
+const readErrorSchema = z.object({
+  schema_version: z.literal(1),
+  desired_revision: z.null(),
+  applied_revision: z.null(),
+  generation: z.null(),
+  applied_generation: z.null(),
+  state: z.literal("read_error"),
+  applied_at: z.null(),
+  error_code: z.null(),
+});
+
 let acceptanceSeq = 0;
 /**
  * One counter orders save starts and ends, snapshot installations and the
@@ -282,6 +294,15 @@ function deriveReceipt(
   const body = read.data.body;
   if (body.camera_id !== saved.snapshot.camera_id) return contract;
   if (body.zones_runtime === undefined || body.zones_runtime === null) return unsupported;
+  if (readErrorSchema.safeParse(body.zones_runtime).success) {
+    return {
+      kind: "disconnected",
+      readAt,
+      title: "Cannot confirm: engine could not read the saved zones",
+      detail:
+        "The engine failed to read this camera's saved zones, so whether the camera is running them is unknown. It is asked again.",
+    };
+  }
   const parsed = zonesRuntimeSchema.safeParse(body.zones_runtime);
   if (!parsed.success) return contract;
   const zr = parsed.data;

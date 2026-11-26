@@ -121,6 +121,27 @@ describe("deriveZoneApplication", () => {
     expect(derive(failed).kind).toBe("disconnected");
   });
 
+  it("shows the engine's failed read of the saved zones as a read failure until it reads again", () => {
+    const readError = {
+      schema_version: 1,
+      desired_revision: null,
+      applied_revision: null,
+      generation: null,
+      applied_generation: null,
+      state: "read_error",
+      applied_at: null,
+      error_code: null,
+    };
+    const a = derive(read(readError));
+    expect(a.kind).toBe("disconnected");
+    expect(a.title).toBe("Cannot confirm: engine could not read the saved zones");
+    expect(zoneApplicationPollMs(a, [], null)).toBe(10_000);
+    expect(receiptGeneration({ camera_id: 7, zones_runtime: readError })).toBeUndefined();
+    // Only every other key null is a read error.
+    expect(derive(read({ ...readError, generation: 2 })).kind).toBe("failed");
+    expect(derive(read(receipt())).kind).toBe("applied");
+  });
+
   it("separates a denied, malformed and failed snapshot read", () => {
     const r = read(receipt());
     expect(derive(r, { snapshot: null, error: new ApiError(403, "forbidden") }).title).toBe(
