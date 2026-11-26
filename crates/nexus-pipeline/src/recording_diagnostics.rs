@@ -526,8 +526,7 @@ pub struct ShadowRecording {
 
 impl ShadowRecording {
     /// `None` for legacy, and for a tracker with no observed/predicted
-    /// contract. `observed` runs as shadow, so legacy still writes the
-    /// footage: nothing activates observed recording yet (SPEC-089 Task 4).
+    /// contract. Runs as shadow whatever the policy's mode: legacy writes.
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         registry: &RecordingActivityRegistry,
@@ -540,12 +539,6 @@ impl ShadowRecording {
         pre_roll_secs: u32,
     ) -> Option<Self> {
         let policy = policy.filter(|p| p.mode != RecordingPolicyMode::Legacy)?;
-        if policy.mode == RecordingPolicyMode::Observed {
-            warn!(
-                camera_id,
-                "recording_policy observed cannot be activated yet; running shadow, legacy records"
-            );
-        }
         Self::start_as(
             registry,
             camera_id,

@@ -324,7 +324,6 @@ pub fn spawn_camera(
             record_motion_clip_on_alert: clips_cfg.record_motion_clip_on_alert,
             frame_width: supervisor_w,
             frame_height: supervisor_h,
-            observed_enabled: false,
         },
         recorder.clone(),
         store.clone(),

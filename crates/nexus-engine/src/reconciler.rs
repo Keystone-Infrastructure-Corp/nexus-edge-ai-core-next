@@ -2908,6 +2908,56 @@ mod tests {
         );
     }
 
+    /// SPEC-089 — a camera saved as `observed` records from its policy on
+    /// the supervisor the pass started, and the rollback to legacy, applied
+    /// live, keeps that supervisor and the clip it has open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_observed_policy_records_and_rolls_back_without_a_restart() {
+        use nexus_config::{RecordingPolicyConfig, RecordingPolicyMode};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let mut observed = cam(None);
+        observed.behavior.recording_policy = Some(RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Observed,
+            analysis_stale_after_ms: 10_000,
+        });
+        observed.behavior.recording_policy_revision = "rev-observed".into();
+        let args = reconciler_args(recorder.clone(), dir.path(), &[observed]).await;
+        reconcile(&args).await.expect("initial pass");
+        let runtime = || {
+            args.frame_stats
+                .recording_activity()
+                .snapshot(7, std::time::Instant::now())
+        };
+        wait_until("observed opened a clip", || recorder.opens() == 1).await;
+        let mode = runtime().map(|r| r.mode);
+        let original = entry_of(&args.handles, 7);
+
+        args.store
+            .upsert_camera(&cam(None))
+            .await
+            .expect("roll back");
+        reconcile(&args).await.expect("pass after the rollback");
+        let after_rollback = entry_of(&args.handles, 7);
+        let rolled_back = runtime().is_none();
+        // Legacy holds the clip on the person still in view.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let calls = recorder.calls();
+        abort_all(&args.handles);
+
+        assert_eq!(
+            mode,
+            Some(RecordingPolicyMode::Observed),
+            "the saved mode drives the controller"
+        );
+        assert!(
+            Arc::ptr_eq(&after_rollback.task, &original.task),
+            "a rollback must not restart the camera"
+        );
+        assert!(rolled_back, "legacy reports no runtime");
+        assert_eq!(calls, [ClipCall::Open(1)], "the open clip carried on");
+    }
+
     fn entry_of(handles: &HandleMap, camera_id: CameraId) -> RunningCameraEntry {
         handles
             .lock()

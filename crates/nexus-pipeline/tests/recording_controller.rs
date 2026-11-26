@@ -190,6 +190,7 @@ struct Rig {
     handle: CameraHandle,
     recorder: Arc<Logged>,
     store: Arc<Store>,
+    stats: Arc<FrameStatsRegistry>,
     detector: Arc<Script>,
     go: mpsc::UnboundedSender<()>,
     metadata: futures::stream::BoxStream<'static, FrameMetadata>,
@@ -374,6 +375,7 @@ async fn rig(setup: Setup) -> Rig {
         handle,
         recorder,
         store,
+        stats,
         detector,
         go,
         metadata,
@@ -528,6 +530,76 @@ async fn a_hang_late_in_a_clip_rotates_at_the_file_deadline_in_legacy_and_shadow
         );
         rig.stop().await;
     }
+}
+
+fn observed_policy() -> Option<RecordingPolicyConfig> {
+    Some(RecordingPolicyConfig {
+        mode: RecordingPolicyMode::Observed,
+        analysis_stale_after_ms: 10_000,
+    })
+}
+
+/// R-4 through the real supervisor: a camera saved as observed records
+/// degraded coverage from startup while its first analysis never returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_records_degraded_coverage_while_the_first_analysis_hangs() {
+    let mut setup = Setup::new(vec![Step::Hang]);
+    setup.policy = observed_policy();
+    let mut rig = rig(setup).await;
+    rig.feed(0).await;
+    let calls = writes(&calls_until(&rig, 5, |c| opens(c) >= 1).await);
+    assert_eq!((opens(&calls), closes(&calls)), (1, 0), "{calls:#?}");
+    let runtime = rig.stats.recording_activity().snapshot(1, Instant::now());
+    assert_eq!(
+        runtime.map(|r| (r.mode, r.diagnostics.reason)),
+        Some((
+            RecordingPolicyMode::Observed,
+            Some(nexus_pipeline::recording_activity::RecordingReason::DegradedCoverage)
+        ))
+    );
+    rig.stop().await;
+    assert_eq!(closes(&rig.calls()), 1, "the stop finalized it");
+}
+
+/// Observed through the real supervisor: a healthy, empty scene ends the
+/// startup's degraded coverage through the recovery gate and opens no
+/// motion clip after it; cars then open one, linked to their alert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_records_what_its_policy_wants_and_links_alerts() {
+    let mut steps = vec![Step::See(0, 0); 16];
+    steps.extend([Step::See(0, 1); 3]);
+    steps.extend([Step::See(0, 0); 2]);
+    let n = steps.len();
+    let mut setup = Setup::new(steps);
+    setup.policy = observed_policy();
+    let mut rig = rig(setup).await;
+    for i in 0..16 {
+        rig.feed(i).await;
+    }
+    let quiet = writes(&rig.calls());
+    assert_eq!(
+        (opens(&quiet), closes(&quiet)),
+        (1, 1),
+        "only the startup's degraded coverage: {quiet:#?}"
+    );
+    for i in 16..n {
+        rig.feed(i).await;
+    }
+    rig.stop().await;
+    let calls = writes(&rig.calls());
+    assert_eq!((opens(&calls), closes(&calls)), (2, 2), "{calls:#?}");
+    let alert = tokio::time::timeout(Duration::from_secs(1), rig.alerts.next())
+        .await
+        .expect("a car alerted")
+        .unwrap();
+    assert_eq!(
+        rig.store
+            .get_event_clip_id(&alert.event_id.to_string())
+            .await
+            .unwrap(),
+        Some(2),
+        "linked to the clip the cars opened"
+    );
 }
 
 /// The opens and closes, without the size checks between them.
@@ -826,7 +898,6 @@ mod controller {
             record_motion_clip_on_alert: true,
             frame_width: W,
             frame_height: H,
-            observed_enabled: false,
         }
     }
 
@@ -840,7 +911,6 @@ mod controller {
     fn observed(post_roll_secs: u32) -> ControllerConfig {
         ControllerConfig {
             post_roll_secs,
-            observed_enabled: true,
             ..config(Some(RecordingPolicyConfig {
                 mode: RecordingPolicyMode::Observed,
                 analysis_stale_after_ms: 1_000,
@@ -1617,8 +1687,8 @@ mod controller {
         .unwrap();
         assert_eq!(
             applied(&c),
-            Some((RecordingPolicyMode::Shadow, "rev-3".to_owned())),
-            "observed runs as shadow in this build, under its own revision"
+            Some((RecordingPolicyMode::Observed, "rev-3".to_owned())),
+            "observed runs observed, under its own revision"
         );
         c.send(RecordingCommand::PolicyChanged(None, "rev-4".into()), LONG)
             .await

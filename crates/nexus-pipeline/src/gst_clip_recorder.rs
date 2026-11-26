@@ -6426,7 +6426,6 @@ mod epoch_tests {
                 record_motion_clip_on_alert: false,
                 frame_width: 320,
                 frame_height: 240,
-                observed_enabled: false,
             },
             rec.clone(),
             store.clone(),

@@ -1231,16 +1231,16 @@ mod supervisor_shadow {
         assert_eq!(counters["trace_incomplete"], false);
     }
 
-    /// `observed` is not implemented yet: it measures like shadow and
-    /// legacy still writes.
+    /// `observed`, the operator's explicit choice, records from its policy
+    /// instead of legacy's decisions, and its runtime says so.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn observed_runs_as_shadow_until_it_is_implemented() {
+    async fn observed_records_from_its_policy() {
         let legacy = run(None, scenario(), None).await;
         let observed = run(policy(RecordingPolicyMode::Observed), scenario(), None).await;
-        assert_eq!(observed.calls, legacy.calls);
+        assert_ne!(observed.calls, legacy.calls);
         assert_eq!(
             observed.runtime.map(|r| r.mode),
-            Some(RecordingPolicyMode::Shadow)
+            Some(RecordingPolicyMode::Observed)
         );
     }
 

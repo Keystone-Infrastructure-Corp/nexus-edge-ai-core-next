@@ -13,9 +13,9 @@
 //! stop is requested (R-5).
 //!
 //! Legacy is the default and decides as before. Shadow measures the
-//! fresh-evidence policy beside it. Observed lets that policy write, but only
-//! a controller started with [`ControllerConfig::observed_enabled`] runs it,
-//! and nothing in the engine sets that yet (Task 4 adds the gated activation).
+//! fresh-evidence policy beside it. Observed, an operator's explicit
+//! per-camera choice, lets that policy write; a live change back to legacy
+//! keeps the open clip and its links.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -105,9 +105,6 @@ pub struct ControllerConfig {
     /// The analysis frame size new clips record their boxes against.
     pub frame_width: u32,
     pub frame_height: u32,
-    /// Lets `observed` write files. Nothing in the engine sets it: until
-    /// SPEC-089 Task 4's capability-gated activation, observed runs as shadow.
-    pub observed_enabled: bool,
 }
 
 /// One analysed frame.
@@ -853,7 +850,8 @@ impl Controller {
         }
         self.flush_deferred_close().await;
         if self.observed {
-            self.trace(alert.captured_mono, alert.captured_at).await;
+            let (now, wall) = self.now();
+            self.trace(now, wall).await;
         }
         error
     }
@@ -905,10 +903,9 @@ impl Controller {
     fn start_policy(&mut self) {
         let cfg = &self.cfg;
         let registry = self.stats.recording_activity();
-        let observed = cfg.observed_enabled
-            && cfg
-                .policy
-                .is_some_and(|p| p.mode == RecordingPolicyMode::Observed);
+        let observed = cfg
+            .policy
+            .is_some_and(|p| p.mode == RecordingPolicyMode::Observed);
         self.shadow = match cfg.policy {
             Some(policy) if observed => ShadowRecording::start_as(
                 registry,
