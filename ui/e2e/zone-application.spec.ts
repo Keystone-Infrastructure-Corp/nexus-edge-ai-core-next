@@ -1474,15 +1474,39 @@ test.describe("zone application", () => {
       return seen;
     }
 
-    /** Serve camera `id`'s saved settings as an engine without parking does: the zones only. */
+    /** Serve camera `id`'s saved settings as an engine without parking does: the zones only. Counts the reads. */
     async function withoutParking(page: Page, id: number) {
+      let reads = 0;
       await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, async (route) => {
+        reads += 1;
         const res = await route.fetch();
         const body = (await res.json()) as { settings: Record<string, unknown>; parking_revision?: string };
         delete body.settings.parking;
         delete body.parking_revision;
         await route.fulfill({ response: res, json: body });
       });
+      return () => reads;
+    }
+
+    const refused = /^Not saved: this core no longer reports parking zones/;
+
+    /**
+     * The core rolls back to one without parking: the save fails, and the
+     * saved settings read after it carry no parking. Counts those reads.
+     */
+    async function rollBack(page: Page, id: number) {
+      const reads = await withoutParking(page, id);
+      const rolledBack = cameraPath(id);
+      await page.route(rolledBack, (route) =>
+        route.request().method() === "PUT"
+          ? route.fulfill({ status: 500, json: { error: "e2e: rolled back" } })
+          : route.fallback(),
+      );
+      await save(page);
+      await expect(page.getByText("e2e: rolled back")).toBeVisible();
+      await expect(optIn(page)).toHaveCount(0, POLL);
+      await page.unroute(rolledBack);
+      return reads;
     }
 
     /** Hold every read of camera `id`'s saved settings until `release`. */
@@ -1929,23 +1953,9 @@ test.describe("zone application", () => {
       const id = cameraId;
       const { status } = await openApplied(page, id);
       await policy(page).dwell.fill("20");
-
-      // The core rolls back to one without parking: the save fails, and the
-      // saved settings read after it carry no parking.
-      await withoutParking(page, id);
-      const rolledBack = cameraPath(id);
-      await page.route(rolledBack, (route) =>
-        route.request().method() === "PUT"
-          ? route.fulfill({ status: 500, json: { error: "e2e: rolled back" } })
-          : route.fallback(),
-      );
-      await save(page);
-      await expect(page.getByText("e2e: rolled back")).toBeVisible();
-      await expect(optIn(page)).toHaveCount(0, POLL);
-      await page.unroute(rolledBack);
+      await rollBack(page, id);
 
       // The policy edit its controls no longer show is not sent.
-      const refused = /^Not saved: this core no longer reports parking zones/;
       const sent = countPuts(page, id);
       await save(page);
       await expect(page.getByText(refused)).toBeVisible();
@@ -1970,6 +1980,26 @@ test.describe("zone application", () => {
       expect(body.parking_policy_v2).toEqual(POLICY_A);
       expect(body.parking_lot_mode).toBe(true);
       await expect(page.getByText(refused)).toHaveCount(0);
+    });
+
+    test("a parking edit a rolled-back core no longer reports is an unsaved change until discarded", async ({
+      page,
+    }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const { status } = await openApplied(page, id);
+      await policy(page).dwell.fill("20");
+      await rollBack(page, id);
+
+      // The zones shown are the saved ones, but the held policy edit is refused: never Applied.
+      await expect(status).toContainText("Unsaved changes", POLL);
+      await steadyRead(page);
+      await neverApplied(page, 3_000);
+      await expect(status).toContainText("Unsaved changes");
+
+      // Discarded by a reload, the saved settings are Applied again.
+      await page.reload();
+      await expect(status).toContainText("Applied to camera", POLL);
     });
   });
 });

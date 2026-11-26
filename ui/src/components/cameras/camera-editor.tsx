@@ -646,6 +646,10 @@ export function CameraEditor({
   // The engine reports parking (SPEC-077): its snapshot carries the parking
   // settings, which the zone status then certifies with the zones.
   const parkingShown = zoneView.installed?.read.body.parking_revision !== undefined;
+  // The installed snapshot stopped carrying parking (a core rollback): the
+  // parking controls are gone, so a parking edit made before is held: never
+  // sent, and an unsaved change until discarded or parking is reported again.
+  const parkingHeld = zoneView.installed !== null && !parkingShown && parkingEdited(draft, zoneView.synced);
   // Install a snapshot read begun after the latest save; a clean view shows
   // its zones and parking settings, a dirty edit keeps the operator's. A
   // sketch holds it until finished or cancelled: it joins the zones it was
@@ -676,7 +680,7 @@ export function CameraEditor({
   const sent = mutation.isPending && mutation.variables ? mutation.variables.cfg : zoneView.synced;
   const zoneDraft: ZoneDraftState = {
     phase:
-      sketching || !sameTuple(draft, sent, parkingShown)
+      sketching || parkingHeld || !sameTuple(draft, sent, parkingShown)
         ? "dirty"
         : saving
           ? "saving"
@@ -828,10 +832,9 @@ export function CameraEditor({
       setError("URL is required.");
       return;
     }
-    // The installed snapshot stopped carrying parking (a core rollback): the
-    // parking controls are gone, so a parking edit made before is not sent.
-    // Unchanged saved parking zones and policy still pass through.
-    if (zoneView.installed && !parkingShown && parkingEdited(draft, zoneView.synced)) {
+    // A held parking edit is not sent. Unchanged saved parking zones and
+    // policy still pass through.
+    if (parkingHeld) {
       setError("Not saved: this core no longer reports parking zones. Discard the parking changes or reload.");
       return;
     }
