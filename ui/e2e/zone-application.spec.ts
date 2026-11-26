@@ -525,4 +525,33 @@ test.describe("zone application", () => {
     await expect(status).toContainText("Saved; running application cannot be verified", POLL);
     await expect(page.getByText("Applied to camera")).toHaveCount(0);
   });
+
+  for (const code of [503, 403]) {
+    test(`a scheduled stats read answering ${code} drops Applied at once`, async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR]);
+      const receipt = await controlReceipt(page, cameraId);
+      receipt.set(applied(1));
+      await page.goto(`/cameras/${cameraId}`);
+      const status = page.getByTestId("zone-application");
+      await expect(status).toContainText("Applied to camera");
+
+      // The next scheduled read fails; any read after it never answers, so
+      // a retry of the failed one would keep the old Applied on screen.
+      const statsUrl = `/api/v1/cameras/${cameraId}/stats`;
+      const failedRead = page.waitForResponse(
+        (r) => new URL(r.url()).pathname === statsUrl && r.status() === code,
+        POLL,
+      );
+      let failed = false;
+      await page.route(`**${statsUrl}`, async (route) => {
+        if (failed) return new Promise<void>(() => {});
+        failed = true;
+        await route.fulfill({ status: code, json: { error: `e2e: ${code}` } });
+      });
+      await failedRead;
+      await expect(page.getByText("Applied to camera")).toHaveCount(0, { timeout: 500 });
+      await expect(status).toContainText("Cannot confirm: status read failed");
+      await page.unrouteAll({ behavior: "ignoreErrors" });
+    });
+  }
 });

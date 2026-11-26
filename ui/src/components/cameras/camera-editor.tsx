@@ -516,6 +516,9 @@ export function CameraEditor({
       const zone = zonePollMs(q.state);
       return zone === false ? DECODE_REFRESH_MS : Math.min(zone, DECODE_REFRESH_MS);
     },
+    // A failed read shows at once: an internal retry would keep the last
+    // answer (an Applied, say) on screen meanwhile. The cadence reads again.
+    retry: false,
     refetchOnWindowFocus: (q) => (zonePollMs(q.state) === false ? false : "always"),
   });
   const readGeneration =
