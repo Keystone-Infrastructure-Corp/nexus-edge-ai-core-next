@@ -658,7 +658,9 @@ export function CameraEditor({
     !sketching &&
     snap.seq > zoneSaveSeq(camera.id)
   ) {
-    const clean = sameTuple(draft, zoneView.synced, parkingShown);
+    // Parking counts where either snapshot reports it: a parking-mode edit
+    // made during the first read is kept, not overwritten by that read.
+    const clean = sameTuple(draft, zoneView.synced, parkingShown || snap.body.parking_revision !== undefined);
     const tuple = snapshotTuple(snap.body, draft);
     setZoneView((v) => ({
       ...v,

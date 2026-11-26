@@ -1695,6 +1695,32 @@ test.describe("zone application", () => {
       await expect(status).toContainText("Saved; applies when enabled", POLL);
     });
 
+    test("a parking-mode edit made while the first saved-settings read is pending is kept", async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR]);
+      const id = cameraId;
+      const first = await holdSnapshots(page, id);
+      await page.goto(`/cameras/${id}`);
+      await first.parked;
+      const mode = page.getByLabel("Enable parking-lot mode");
+      await expect(mode).not.toBeChecked();
+      await mode.check();
+
+      // The read installs parking with the mode off: the edit stays, unsaved.
+      first.release();
+      const status = page.getByTestId("zone-application");
+      await expect(optIn(page)).toBeVisible(POLL);
+      await expect(status).toContainText("Unsaved changes", POLL);
+      await expect(mode).toBeChecked();
+
+      const put = page.waitForRequest(isPut(id));
+      await save(page);
+      const sent = await put;
+      expect(sent.postDataJSON()).toMatchObject({ zones: [DOOR], parking_lot_mode: true });
+      expect((await sent.response())?.ok()).toBe(true);
+      await expect(status).toContainText("Saved; applies when enabled", POLL);
+      await expect(mode).toBeChecked();
+    });
+
     test("an unsaved policy edit survives another operator's policy save and is never Applied", async ({
       page,
     }) => {
