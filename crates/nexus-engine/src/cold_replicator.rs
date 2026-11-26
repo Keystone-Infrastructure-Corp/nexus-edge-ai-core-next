@@ -1008,7 +1008,7 @@ async fn upload_alert_clip_one(
                 alert_clip_id = clip.id,
                 cold_path, "cold replicator: backend already has alert clip; stamping pointer only"
             );
-            (None, None)
+            (None, existing_copy_bytes(cfg, hot_path_rel).await)
         }
         Ok(_) => {
             let abs = cfg.clips_dir.join(hot_path_rel);
@@ -1131,13 +1131,14 @@ async fn upload_one(
                 cold_path, "cold replicator: backend already has clip; stamping pointer only"
             );
             store
-                .mark_cold_replicated(
+                .mark_cold_uploaded(
                     clip.id,
                     &ClipColdMark {
                         cold_handle: backend_handle.to_string(),
                         cold_path,
                         cold_uploaded_at: Utc::now(),
                     },
+                    existing_copy_bytes(cfg, hot_path_rel).await,
                 )
                 .await
                 .map_err(UploadError::Store)?;
@@ -1233,6 +1234,24 @@ async fn upload_one(
         "cold replicator: clip uploaded"
     );
     Ok(())
+}
+
+/// SPEC-090 — the payload size of a copy the backend already holds (an
+/// earlier PUT whose completion was never recorded): the hot file it was
+/// written from, which `exists` matched by hash. `None` counts the stored
+/// size instead.
+// shortcut: with the hot file unreadable and the stored size unknown the
+// delivery counts 0 bytes (warned); flagging it as unknown-size needs a
+// bucket column (a migration); add one if this warning is ever seen.
+async fn existing_copy_bytes(cfg: &ColdReplicatorConfig, hot_path_rel: &str) -> Option<i64> {
+    let abs = cfg.clips_dir.join(hot_path_rel);
+    match tokio::fs::metadata(&abs).await {
+        Ok(m) => i64::try_from(m.len()).ok(),
+        Err(e) => {
+            warn!(path = %abs.display(), error = %e, "cold replicator: existing copy's size unknown; counting the stored size");
+            None
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2800,5 +2819,43 @@ mod tests {
             hour_counters(&store).await.ordinary.delivered_bytes,
             1 << 20
         );
+    }
+
+    /// SPEC-090 — a copy the backend already holds (its PUT succeeded, then
+    /// the engine restarted before the completion was recorded) delivers
+    /// that copy's size, not the unknown stored size (0), on both queues.
+    #[tokio::test]
+    async fn recording_delivery_counts_an_existing_copy_when_size_unknown() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        tokio::fs::write(clips_dir.join("1/clip_0001.mp4"), vec![7u8; 1 << 20])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE motion_clips SET size_bytes = 0 WHERE id = ?")
+            .bind(clip_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 0, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        backend.existing.lock().extend([
+            format!("1/{clip_id}.mp4"),
+            format!("alert/1/2026-07-17/alert-{alert_id}.mp4"),
+        ]);
+        run_tick(&store, &clips_dir, &backend).await;
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+        alert_upload_pass(&cfg, &store, &registry).await;
+
+        assert_eq!(backend.put_count(), 0, "both copies were already there");
+        let c = hour_counters(&store).await;
+        assert_eq!(c.ordinary.delivered_bytes, 1 << 20, "not the stored 0");
+        assert_eq!(c.alert.delivered_bytes, 11, "alert-bytes, not the stored 0");
+        assert_eq!(c.ordinary.attempted_bytes + c.alert.attempted_bytes, 0);
     }
 }
