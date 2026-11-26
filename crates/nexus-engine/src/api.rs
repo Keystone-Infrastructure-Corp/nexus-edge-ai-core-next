@@ -8354,25 +8354,22 @@ mod tests {
         assert_eq!(state_of(&app, id).await, "applied");
 
         // B's save: committed, and paused before it tells the registry,
-        // holding what a save holds there.
-        let paused = registry.saves().write().await;
+        // holding the lock. Held for reading, so a save of A has to queue for
+        // it, and once it has (a queued writer takes every free permit, so
+        // `try_read` fails) it must not have committed.
+        let paused = registry.saves().read().await;
         store.upsert_camera(&b_camera).await.expect("commit B");
-        let mut save_a = tokio::spawn(put(app.clone(), a_camera.clone()));
-        let a_while_b_paused =
-            tokio::time::timeout(std::time::Duration::from_millis(300), &mut save_a)
-                .await
-                .ok();
+        let save_a = tokio::spawn(put(app.clone(), a_camera.clone()));
+        while registry.saves().try_read().is_ok() && !save_a.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let a_committed_while_b_paused = save_a.is_finished();
         let b_still_saved = store.list_cameras().await.expect("list cameras")[0]
             .zones
             .clone();
         registry.request(id, &b, true);
         drop(paused);
-        let a_committed_while_b_paused = a_while_b_paused.is_some();
-        let saved_a = match a_while_b_paused {
-            Some(done) => done,
-            None => save_a.await,
-        };
-        assert_eq!(saved_a.expect("save A"), StatusCode::OK);
+        assert_eq!(save_a.await.expect("save A"), StatusCode::OK);
 
         assert!(
             !a_committed_while_b_paused && b_still_saved == b_camera.zones,
@@ -8497,51 +8494,173 @@ mod tests {
         );
     }
 
-    /// SPEC-088 — as above for a fleet push: one that read the cameras
-    /// before a zone save committed and writes after it keeps the save.
+    /// SPEC-088 — what every read-modify-write of a camera's whole row must
+    /// do: take the save lock before it reads the row, and commit and
+    /// request only under it. Holds the lock for reading, so `writer` has to
+    /// queue for it, and once it has (a queued writer takes every free
+    /// permit, so `try_read` fails) checks it has not committed. Zone save
+    /// `b_camera` then lands ahead of it, and the writer must write B's zones
+    /// back, not a row it read before it queued. Returns the row it left.
+    async fn write_behind_a_zone_save(
+        store: &Store,
+        registry: &nexus_pipeline::zone_application::ZoneApplicationRegistry,
+        b_camera: &nexus_config::CameraConfig,
+        writer: impl std::future::Future<Output = StatusCode> + Send + 'static,
+    ) -> nexus_config::CameraConfig {
+        let row = || async move {
+            let cameras = store.list_cameras().await.unwrap();
+            cameras.into_iter().find(|c| c.id == b_camera.id).unwrap()
+        };
+        let before = serde_json::to_value(row().await).unwrap();
+        let reading = registry.saves().read().await;
+        let writer = tokio::spawn(writer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while registry.saves().try_read().is_ok() {
+            assert!(
+                !writer.is_finished() && std::time::Instant::now() < deadline,
+                "the writer never queued for the save lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let while_queued = serde_json::to_value(row().await).unwrap();
+        store.upsert_camera(b_camera).await.unwrap();
+        registry.request(
+            b_camera.id,
+            &nexus_pipeline::zone_application::zone_revision(&b_camera.zones),
+            b_camera.ingest.enabled,
+        );
+        drop(reading);
+        assert_eq!(writer.await.unwrap(), StatusCode::OK);
+        assert_eq!(
+            while_queued, before,
+            "the writer committed before it held the save lock"
+        );
+        let after = row().await;
+        assert_eq!(
+            after.zones, b_camera.zones,
+            "the writer wrote back zones it read before it held the save lock"
+        );
+        after
+    }
+
+    /// SPEC-088 — as above for a fleet push of text prompts.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_fleet_push_across_a_zone_save_keeps_the_save() {
-        use nexus_pipeline::zone_application::zone_revision;
         const SECRET: &[u8] = b"fleet-push-zone-save-secret";
         let (state, store, _dir, _reg, _bus) = build_test_state(Some(SECRET)).await;
-        let mut a_camera = fleet_test_camera(1, "front");
-        a_camera.zones = vec![snapshot_zone("a", 0.2)];
-        store.upsert_camera(&a_camera).await.unwrap();
-        let mut b_camera = a_camera.clone();
+        let mut b_camera = fleet_test_camera(1, "front");
+        store.upsert_camera(&b_camera).await.unwrap();
         b_camera.zones = vec![snapshot_zone("b", 0.3)];
-        let b = zone_revision(&b_camera.zones);
         let frame_stats = state.frame_stats.clone();
-        let registry = frame_stats.zone_application();
         let app = super::router(state);
-
-        // B's save as the API makes it: the boundary, then its write
-        // transaction, held open so a push that read A first waits on it.
-        let saving = registry.saves().write().await;
-        let mut tx = store.begin_tx().await.unwrap();
-        store.upsert_camera_tx(&mut tx, &b_camera).await.unwrap();
-        let push = tokio::spawn({
-            let app = app.clone();
-            async move {
-                fleet_apply(&app, SECRET, "text_prompts", serde_json::json!(["person"]))
-                    .await
-                    .status()
-            }
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        Store::commit_tx(tx).await.unwrap();
-        registry.request(1, &b, true);
-        let g1 = registry.start(1, &b);
-        let b_request = registry.current_request(1, g1).expect("g1 runs B");
-        registry.acknowledge(1, g1, b_request, &b, chrono::Utc::now());
-        drop(saving);
-        assert_eq!(push.await.unwrap(), StatusCode::OK);
-
-        let saved = store.list_cameras().await.unwrap().remove(0);
+        let push = async move {
+            fleet_apply(&app, SECRET, "text_prompts", serde_json::json!(["person"]))
+                .await
+                .status()
+        };
+        let saved =
+            write_behind_a_zone_save(&store, frame_stats.zone_application(), &b_camera, push).await;
         assert_eq!(saved.detector.prompts, vec!["person"], "the push landed");
+    }
+
+    /// SPEC-088 — as above for a fleet push of the detector config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fleet_detector_config_across_a_zone_save_keeps_the_save() {
+        const SECRET: &[u8] = b"fleet-detector-config-zone-save-secret";
+        let (state, store, _dir, _reg, _bus) = build_test_state(Some(SECRET)).await;
+        let mut b_camera = fleet_test_camera(1, "front");
+        store.upsert_camera(&b_camera).await.unwrap();
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let frame_stats = state.frame_stats.clone();
+        let app = super::router(state);
+        let push = async move {
+            let model = serde_json::json!({ "kind": "yolo", "preset": "640" });
+            fleet_apply(&app, SECRET, "detector_config", model)
+                .await
+                .status()
+        };
+        let saved =
+            write_behind_a_zone_save(&store, frame_stats.zone_application(), &b_camera, push).await;
         assert_eq!(
-            saved.zones, b_camera.zones,
-            "the push wrote back the zones it read before B was saved and acknowledged"
+            saved.detector.model_override.map(|m| m.kind).as_deref(),
+            Some("yolo"),
+            "the push landed"
         );
+    }
+
+    /// SPEC-088 — as above for a reprobe apply, which probes before it takes
+    /// the lock and reads the rows it writes back only once it holds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reprobe_apply_across_a_zone_save_keeps_the_save() {
+        let onvif = serve_onvif_media_stub().await;
+        let (mut state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        state.current_inference_model = Arc::new(wide_default_model());
+        let endpoint = format!("http://{onvif}/onvif/device_service");
+        seed_onvif_camera(&store, 1, Some(&endpoint)).await;
+        let mut b_camera = store.list_cameras().await.unwrap().remove(0);
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let frame_stats = state.frame_stats.clone();
+        let app = super::router(state);
+        let apply = async move {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/cameras/reprobe/apply")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"camera_ids":[1]}"#))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            app.oneshot(req).await.unwrap().status()
+        };
+        let saved =
+            write_behind_a_zone_save(&store, frame_stats.zone_application(), &b_camera, apply)
+                .await;
+        assert!(
+            saved
+                .ingest
+                .analysis_url
+                .is_some_and(|u| u.path().ends_with("/third")),
+            "the reprobe landed"
+        );
+    }
+
+    /// SPEC-088 — as above for an ONVIF network rewrite, which reads the
+    /// camera and calls it before it takes the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_network_rewrite_across_a_zone_save_keeps_the_save() {
+        use axum::response::IntoResponse;
+        const SECRET: &[u8] = b"network-rewrite-across-zone-save-secret";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub =
+            axum::Router::new().fallback(|| async { (StatusCode::OK, "<ok/>").into_response() });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, stub.into_make_service()).await;
+        });
+        let (state, store, _dir, _reg, _bus) = build_test_state(Some(SECRET)).await;
+        let mut b_camera = fleet_test_camera(31, "cam-31");
+        b_camera.onvif = nexus_config::CameraOnvif {
+            endpoint: Some(format!("http://{addr}/onvif/device_service")),
+            username: Some("admin".into()),
+            password: Some("secret".into()),
+        };
+        store.upsert_camera(&b_camera).await.unwrap();
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let frame_stats = state.frame_stats.clone();
+        let rewrite = send_admin(
+            super::router(state),
+            sign_admin_jwt(SECRET),
+            Method::PUT,
+            "/api/v1/admin/cameras/31/network/safe".into(),
+            serde_json::json!({
+                "action": "set_network_protocols",
+                "protocols": [{ "name": "RTSP", "enabled": true, "port": 8554 }],
+            })
+            .to_string(),
+        );
+        let saved =
+            write_behind_a_zone_save(&store, frame_stats.zone_application(), &b_camera, rewrite)
+                .await;
+        assert_eq!(saved.ingest.url.port(), Some(8554), "the rewrite landed");
     }
 
     // Regression: the cloud UI sends `POST /api/v1/admin/cameras`
