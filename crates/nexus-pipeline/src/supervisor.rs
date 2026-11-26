@@ -35,8 +35,8 @@ use crate::gate::MotionGate;
 use crate::recorder::ClipRecorder;
 use crate::recording_activity::AnalysisOutcome;
 use crate::recording_controller::{
-    Alert, ControllerConfig, ControllerGuard, EpochChange, EvidenceProducer, Motion,
-    RecordingCommand, RecordingControl, RecordingReceipt, COMMAND_TIMEOUT,
+    Alert, ControllerConfig, ControllerGuard, EpochChange, Motion, RecordingCommand,
+    RecordingControl, RecordingReceipt, COMMAND_TIMEOUT,
 };
 use crate::recording_diagnostics::{evidence_counts, tracker_backend, EvidenceCounts};
 use crate::sink_router::{AlertClipScheduleGate, SinkRouter};
@@ -441,7 +441,7 @@ async fn run_camera(
     recording: RecordingControl,
     // Dropped however this task ends, which is what tells the controller
     // to finalize a clip this supervisor can no longer close itself.
-    _recording_guard: ControllerGuard,
+    recording_guard: ControllerGuard,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -606,7 +606,7 @@ async fn run_camera(
         // SPEC-089 — every analysis, coalesced for the recording controller,
         // whichever policy it runs. `None` for a tracker that cannot tell an
         // observation from a prediction: its tracks count as none.
-        let mut evidence = EvidenceProducer::new(zone_generation, cfg.behavior.recording_policy);
+        let mut evidence = recording_guard.evidence_producer();
         let backend = tracker_backend(tracker.name());
         // Lets a stop end a frame whose detect never answers (SPEC-089 R-4).
         let mut frame_stop = stop.clone();

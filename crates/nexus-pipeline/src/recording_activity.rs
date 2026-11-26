@@ -119,17 +119,20 @@ impl RecordingActivityPolicy {
         {
             self.degrade(at);
         }
+        // A run reduced under another stale deadline (a live change the
+        // producer had not yet applied) proves nothing under this one.
+        let run = summary
+            .run
+            .filter(|_| summary.stale_after_ms == self.stale_after_ms);
         // A run that began after the last success seen here was broken
         // since: by a failure, or by a stale gap no tick saw.
-        if let (Some(run), Some(seen)) = (summary.run, self.last_success_ms) {
+        if let (Some(run), Some(seen)) = (run, self.last_success_ms) {
             if run.first_ms > seen {
                 self.degrade(seen.saturating_add(self.stale_after_ms));
             }
         }
         self.last_success_ms = self.last_success_ms.max(summary.last_success_ms);
-        let fresh_run = summary
-            .run
-            .filter(|run| now_ms.saturating_sub(run.last_ms) <= self.stale_after_ms);
+        let fresh_run = run.filter(|run| now_ms.saturating_sub(run.last_ms) <= self.stale_after_ms);
         // The producer resets a run on every failure and stale gap, so a
         // fresh run that met the gate is sustained health after them.
         if let Some(at) = fresh_run.and_then(|run| run.recovered_ms) {
@@ -308,6 +311,16 @@ impl EvidenceSummary {
             last_failure: None,
             run: None,
             stale_after_ms,
+        }
+    }
+
+    /// Reduce from now on under `stale_after_ms`. A changed deadline drops
+    /// the success run, gathered under the old one, so recovery takes the
+    /// full gate again.
+    pub fn retune(&mut self, stale_after_ms: u64) {
+        if stale_after_ms != self.stale_after_ms {
+            self.stale_after_ms = stale_after_ms;
+            self.run = None;
         }
     }
 

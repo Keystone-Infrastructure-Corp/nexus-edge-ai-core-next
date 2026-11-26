@@ -18,6 +18,7 @@
 //! keeps the open clip and its links.
 
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -138,17 +139,25 @@ pub struct EvidenceProducer {
     origin: Option<Instant>,
     sequence: u64,
     summary: EvidenceSummary,
+    /// The stale deadline the controller's policy runs, which a live policy
+    /// change moves: every reduction uses the one in force.
+    stale_after_ms: Arc<AtomicU64>,
 }
 
 impl EvidenceProducer {
+    /// A producer for `policy`'s stale deadline alone; a controller's own
+    /// is [`ControllerGuard::evidence_producer`].
     pub fn new(generation: u64, policy: Option<RecordingPolicyConfig>) -> Self {
-        // shortcut: the stale deadline of the policy the camera started with; a live policy change keeps it until the next restart, which only shifts when a long gap resets a success run.
-        let stale_after_ms = u64::try_from(stale_after(policy).as_millis()).unwrap_or(u64::MAX);
+        Self::sharing(generation, Arc::new(AtomicU64::new(stale_after_ms(policy))))
+    }
+
+    fn sharing(generation: u64, stale_after_ms: Arc<AtomicU64>) -> Self {
         Self {
             generation,
             origin: None,
             sequence: 0,
-            summary: EvidenceSummary::new(generation, stale_after_ms),
+            summary: EvidenceSummary::new(generation, stale_after_ms.load(Ordering::Acquire)),
+            stale_after_ms,
         }
     }
 
@@ -165,6 +174,8 @@ impl EvidenceProducer {
         let origin = *self.origin.get_or_insert(captured_mono);
         let at = millis(captured_mono, origin);
         self.sequence += 1;
+        self.summary
+            .retune(self.stale_after_ms.load(Ordering::Acquire));
         self.summary.reduce(
             self.generation,
             self.sequence,
@@ -319,6 +330,17 @@ impl RecordingControl {
 /// (a return, a panic, an abort), tells the controller to finalize.
 pub struct ControllerGuard {
     _alive: watch::Sender<()>,
+    generation: u64,
+    stale_after_ms: Arc<AtomicU64>,
+}
+
+impl ControllerGuard {
+    /// The analysis side's producer for this controller. A live policy
+    /// change moves both onto its stale deadline in the one command, and
+    /// the policy credits no success run reduced under another.
+    pub fn evidence_producer(&self) -> EvidenceProducer {
+        EvidenceProducer::sharing(self.generation, self.stale_after_ms.clone())
+    }
 }
 
 /// Start a camera's controller. `stop` is the camera's stop request, kept
@@ -337,10 +359,16 @@ pub fn spawn(
     stop: watch::Receiver<bool>,
 ) -> (RecordingControl, ControllerGuard) {
     let (tx, rx) = mpsc::channel(COMMAND_CAPACITY);
-    let (guard, alive) = watch::channel(());
+    let (alive_tx, alive) = watch::channel(());
     let control = RecordingControl {
         tx,
         generation: cfg.generation,
+    };
+    let stale_after_ms = Arc::new(AtomicU64::new(stale_after_ms(cfg.policy)));
+    let guard = ControllerGuard {
+        _alive: alive_tx,
+        generation: cfg.generation,
+        stale_after_ms: stale_after_ms.clone(),
     };
     let mut controller = Controller {
         post_roll: PostRoll::new(cfg.post_roll_secs),
@@ -370,14 +398,15 @@ pub fn spawn(
         last_frame: None,
         stall_check: None,
         last_sequence: 0,
+        stale_after_ms,
     };
     controller.start_policy();
     tokio::spawn(controller.run(rx, stop));
-    (control, ControllerGuard { _alive: guard })
+    (control, guard)
 }
 
-fn stale_after(policy: Option<RecordingPolicyConfig>) -> Duration {
-    Duration::from_millis(policy.map_or(DEFAULT_STALE_AFTER_MS, |p| p.analysis_stale_after_ms))
+fn stale_after_ms(policy: Option<RecordingPolicyConfig>) -> u64 {
+    policy.map_or(DEFAULT_STALE_AFTER_MS, |p| p.analysis_stale_after_ms)
 }
 
 /// The last frame's capture clock and when it arrived here.
@@ -446,6 +475,8 @@ struct Controller {
     /// When the controller next acts on its own clock for a silent analysis.
     stall_check: Option<tokio::time::Instant>,
     last_sequence: u64,
+    /// Shared with the analysis side's [`EvidenceProducer`].
+    stale_after_ms: Arc<AtomicU64>,
 }
 
 impl Controller {
@@ -916,6 +947,8 @@ impl Controller {
 
     fn start_policy(&mut self) {
         let cfg = &self.cfg;
+        self.stale_after_ms
+            .store(stale_after_ms(cfg.policy), Ordering::Release);
         let registry = self.stats.recording_activity();
         let observed = cfg
             .policy

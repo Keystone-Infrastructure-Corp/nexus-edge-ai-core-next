@@ -953,8 +953,8 @@ mod controller {
         });
         let stats = Arc::new(FrameStatsRegistry::new());
         let (stop, stop_rx) = watch::channel(false);
-        let producer = EvidenceProducer::new(cfg.generation, cfg.policy);
         let (control, guard) = rc::spawn(cfg, rec.clone(), store.clone(), stats.clone(), stop_rx);
+        let producer = guard.evidence_producer();
         Cam {
             control,
             guard: Some(guard),
@@ -1210,6 +1210,84 @@ mod controller {
             Some((Some(RecordingReason::DegradedCoverage), true, false)),
             "1.5 s old when used"
         );
+    }
+
+    /// R-4: a live stale-deadline change (10 s to 5 s) reaches the analysis
+    /// side too. A success run proven under 10 s, even one in flight across
+    /// the change, cannot end the new policy's degraded coverage, and after
+    /// a six-second analysis gap one success cannot either: each needs three
+    /// passes over two seconds under 5 s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_stale_deadline_change_needs_the_recovery_gate_again() {
+        use RecordingReason::{Activity, DegradedCoverage, Quiet};
+        fn reason(c: &Cam) -> Option<RecordingReason> {
+            proposed(c).and_then(|(reason, _, _)| reason)
+        }
+        async fn at(c: &mut Cam, ms: u64) -> Option<RecordingReason> {
+            c.frame(ms, quiet()).await;
+            reason(c)
+        }
+        let mut c = cam(shadow(10_000), 0, false, false).await;
+        for ms in [0, 1_000, 2_000] {
+            c.frame(ms, quiet()).await;
+        }
+        assert_eq!(at(&mut c, 3_000).await, Some(Quiet), "healthy under 10 s");
+
+        let (mono, wall) = c.clock(4_000);
+        let arrived = c.producer.arrived(mono, wall);
+        let in_flight = c.producer.analysed(
+            mono,
+            wall,
+            AnalysisOutcome::Success,
+            EvidenceCounts::default(),
+            Some(quiet()),
+        );
+        c.send(
+            RecordingCommand::PolicyChanged(shadow(5_000).policy, "rev-5s".into()),
+            LONG,
+        )
+        .await
+        .unwrap();
+        for e in [arrived, in_flight] {
+            c.send(RecordingCommand::Evidence(e), LONG).await.unwrap();
+        }
+        assert_eq!(
+            reason(&c),
+            Some(DegradedCoverage),
+            "a 10 s proof ends nothing"
+        );
+        assert_eq!(at(&mut c, 5_000).await, Some(DegradedCoverage));
+        assert_eq!(at(&mut c, 6_000).await, Some(DegradedCoverage));
+        assert_eq!(
+            at(&mut c, 7_000).await,
+            Some(Activity),
+            "the gate under 5 s"
+        );
+        assert_eq!(at(&mut c, 8_000).await, Some(Quiet));
+
+        let (mono, wall) = c.clock(14_000);
+        let arrived = c.producer.arrived(mono, wall);
+        c.send(RecordingCommand::Evidence(arrived), LONG)
+            .await
+            .unwrap();
+        assert_eq!(reason(&c), Some(DegradedCoverage), "6 s is stale under 5 s");
+        let analysed = c.producer.analysed(
+            mono,
+            wall,
+            AnalysisOutcome::Success,
+            EvidenceCounts::default(),
+            Some(quiet()),
+        );
+        c.send(RecordingCommand::Evidence(analysed), LONG)
+            .await
+            .unwrap();
+        assert_eq!(
+            reason(&c),
+            Some(DegradedCoverage),
+            "one success after the gap"
+        );
+        assert_eq!(at(&mut c, 15_000).await, Some(DegradedCoverage));
+        assert_eq!(at(&mut c, 16_000).await, Some(Activity), "the gate again");
     }
 
     /// R-6: a live policy change mid-minute keeps what the earlier policy
