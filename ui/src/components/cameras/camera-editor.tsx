@@ -1201,6 +1201,9 @@ export function CameraEditor({
         >
           {isNew ? null : <ZoneApplicationStatus application={application} />}
           <ZonesEditor
+            // The access reset above drops the draft; this drops the
+            // unfinished drawing the editor holds of its own.
+            key={`${authority}:${denied}`}
             cameraId={draft.id}
             isNew={isNew}
             zones={draft.zones ?? []}

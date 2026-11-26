@@ -183,6 +183,14 @@ async function setVisibility(page: Page, state: "hidden" | "visible") {
 // otherwise at the editor's 5 s stats refresh.
 const POLL = { timeout: 15_000 };
 
+/** Click the zone canvas at normalised (`x`, `y`). */
+async function clickCanvas(page: Page, x: number, y: number, clicks: 1 | 2 = 1) {
+  const canvas = page.locator('svg[viewBox="0 0 1 1"]').locator("..");
+  const box = await canvas.boundingBox();
+  if (!box) throw new Error("the zone canvas is not laid out");
+  await canvas.click({ position: { x: box.width * x, y: box.height * y }, clickCount: clicks });
+}
+
 /** Applied never shows, checked every 200 ms for `ms`. */
 async function neverApplied(page: Page, ms: number) {
   for (const until = Date.now() + ms; Date.now() < until; await page.waitForTimeout(200)) {
@@ -554,4 +562,46 @@ test.describe("zone application", () => {
       await page.unrouteAll({ behavior: "ignoreErrors" });
     });
   }
+
+  test("a sketch in progress is dropped when the editor's authority changes", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const receipt = await controlReceipt(page, cameraId);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${cameraId}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+    await page.getByRole("button", { name: "New zone" }).click();
+    await clickCanvas(page, 0.6, 0.6);
+    await clickCanvas(page, 0.8, 0.6);
+    await expect(page.getByRole("button", { name: "Finish (2 pt)" })).toBeVisible();
+
+    // The next stats read answers 401; the refresh it triggers carries the
+    // operator role, and the one after it the admin role again.
+    let role: string | null = "operator";
+    let refreshes = 0;
+    await page.route("**/api/v1/auth/refresh", async (route) => {
+      const res = await route.fetch();
+      const tokens = (await res.json()) as { user: Record<string, unknown> };
+      refreshes += 1;
+      await route.fulfill({ response: res, json: { ...tokens, user: { ...tokens.user, ...(role ? { role } : {}) } } });
+    });
+    let expire = true;
+    await page.route(`**/api/v1/cameras/${cameraId}/stats`, (route) => {
+      if (!expire) return route.fallback();
+      expire = false;
+      return route.fulfill({ status: 401, json: { error: "e2e: token expired" } });
+    });
+    await expect.poll(() => refreshes, POLL).toBe(1);
+    await expect(page.getByRole("button", { name: /^Finish/ })).toHaveCount(0);
+    role = null;
+    expire = true;
+    await expect.poll(() => refreshes, POLL).toBe(2);
+
+    // Nothing of the sketch is left to finish or commit.
+    await expect(page.getByRole("button", { name: "New zone" })).toBeVisible();
+    await clickCanvas(page, 0.7, 0.8, 2);
+    await expect(zoneRow(page, "Zone 2")).toHaveCount(0);
+    await expect(zoneRow(page, "Door")).toBeVisible();
+    await expect(status).toContainText("Applied to camera", POLL);
+  });
 });
