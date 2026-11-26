@@ -1,7 +1,7 @@
 # Canonical copy: nexus-home/ci/.github/workflows/factory-route.yml. Copy it verbatim.
 # Routes a work-order issue by its factory:<size> label. Every build runs on Claude:
 # claude.yml builds factory:small and factory:medium, and this hands factory:large to the
-# owner. An assigned issue has been claimed locally and is left alone.
+# owner. An assigned factory:large issue has been claimed locally and is left alone.
 name: Factory route
 
 on:
@@ -34,7 +34,6 @@ jobs:
           echo "SPEC=$spec" >> "$GITHUB_ENV"
 
       - name: Hand large builds to the owner
-        if: github.event.label.name == 'factory:large'
         run: |
           gh label create needs:owner --repo "$REPO" >/dev/null 2>&1 || true
           gh issue edit "$ISSUE" --repo "$REPO" --add-label needs:owner
