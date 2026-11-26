@@ -174,10 +174,16 @@ impl Store {
 
 /// The migration's CHECK admits exactly these.
 fn reason(stored: &str) -> Result<&'static str, StoreError> {
-    ["activity", "post_roll", "degraded_coverage", "quiet"]
-        .into_iter()
-        .find(|r| *r == stored)
-        .ok_or_else(|| StoreError::Decode(format!("recording reason {stored:?}")))
+    [
+        "activity",
+        "post_roll",
+        "degraded_coverage",
+        "quiet",
+        "minimum_duration",
+    ]
+    .into_iter()
+    .find(|r| *r == stored)
+    .ok_or_else(|| StoreError::Decode(format!("recording reason {stored:?}")))
 }
 
 #[cfg(test)]
@@ -363,6 +369,23 @@ mod tests {
         assert_eq!(
             store.list_recording_activity_minutes(1).await.unwrap(),
             vec![earlier, later]
+        );
+    }
+
+    /// Observed mode holds a short clip for the recorder's minimum
+    /// duration: its episode keeps that reason.
+    #[tokio::test]
+    async fn a_minimum_duration_close_is_kept() {
+        let store = in_memory().await;
+        let mut held = episode(1, NOW);
+        held.close_reason = "minimum_duration";
+        store
+            .insert_recording_activity_episode(&held)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_recording_activity_episodes(1).await.unwrap(),
+            vec![held]
         );
     }
 

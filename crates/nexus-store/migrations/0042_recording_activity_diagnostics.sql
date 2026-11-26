@@ -25,10 +25,11 @@ CREATE TABLE IF NOT EXISTS recording_activity_minutes (
 CREATE INDEX IF NOT EXISTS idx_recording_activity_minutes_started
     ON recording_activity_minutes (started_at_ms);
 
--- One legacy clip as the shadow policy saw it: its reason when the clip
--- opened and closed, and the clip's time under each shadow reason
--- (`elapsed`, JSON of the pipeline's `ReasonMs`). No foreign key: clip
--- retention deletes clips independently of these summaries.
+-- One clip as the policy saw it: its reason when the clip opened and
+-- closed (`minimum_duration` when observed mode held a short clip for the
+-- recorder's minimum), and the clip's time under each reason (`elapsed`,
+-- JSON of the pipeline's `ReasonMs`). No foreign key: clip retention
+-- deletes clips independently of these summaries.
 CREATE TABLE IF NOT EXISTS recording_activity_episodes (
     id              INTEGER PRIMARY KEY,
     camera_id       INTEGER NOT NULL,
@@ -38,9 +39,11 @@ CREATE TABLE IF NOT EXISTS recording_activity_episodes (
     opened_at_ms    INTEGER NOT NULL,
     closed_at_ms    INTEGER NOT NULL,
     open_reason     TEXT    NOT NULL
-        CHECK (open_reason IN ('activity', 'post_roll', 'degraded_coverage', 'quiet')),
+        CHECK (open_reason IN ('activity', 'post_roll', 'degraded_coverage', 'quiet',
+                               'minimum_duration')),
     close_reason    TEXT    NOT NULL
-        CHECK (close_reason IN ('activity', 'post_roll', 'degraded_coverage', 'quiet')),
+        CHECK (close_reason IN ('activity', 'post_roll', 'degraded_coverage', 'quiet',
+                                'minimum_duration')),
     elapsed         TEXT    NOT NULL
 );
 
