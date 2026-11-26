@@ -52,28 +52,34 @@ pub const APPLICATION_TIMEOUT: Duration = Duration::from_secs(30);
     reason = "a ZoneConfig is strings, floats, a unit enum and an Option<u32>, which always serialize to JSON"
 )]
 pub fn zone_revision(zones: &[ZoneConfig]) -> String {
+    let json = serde_json::to_vec(&hashed_zones(zones)).expect("zones serialize to JSON");
+    format!("sha256:{:x}", Sha256::digest(json))
+}
+
+/// `zones` as both revisions hash them: every -0.0 vertex coordinate as 0.0.
+fn hashed_zones(zones: &[ZoneConfig]) -> Vec<ZoneConfig> {
     let mut zones = zones.to_vec();
     for (x, y) in zones.iter_mut().flat_map(|z| z.polygon.iter_mut()) {
         // -0.0 + 0.0 is 0.0; every other value is unchanged.
         *x += 0.0;
         *y += 0.0;
     }
-    let json = serde_json::to_vec(&zones).expect("zones serialize to JSON");
-    format!("sha256:{:x}", Sha256::digest(json))
+    zones
 }
 
 /// SPEC-077 — `sha256:` and the lowercase hex digest of the parking tuple a
 /// supervisor runs, as the JSON array `[zones, parking_lot_mode,
-/// parking_policy_v2]`: the zones in saved order, and the whole optional
-/// policy, `null` when absent. Nothing else about the camera moves it, its
-/// credentials included, and it never equals a [`zone_revision`].
+/// parking_policy_v2]`: the zones in saved order, hashed as [`zone_revision`]
+/// hashes them (-0.0 as 0.0), and the whole optional policy, `null` when
+/// absent. Nothing else about the camera moves it, its credentials included,
+/// and it never equals a [`zone_revision`].
 #[expect(
     clippy::expect_used,
     reason = "zones, a bool and an Option of four f64 always serialize to JSON"
 )]
 pub fn parking_revision(camera: &CameraConfig) -> String {
     let tuple = (
-        &camera.zones,
+        hashed_zones(&camera.zones),
         camera.behavior.parking_lot_mode,
         camera.behavior.parking_policy_v2,
     );
@@ -1443,6 +1449,40 @@ mod tests {
             edit(&mut c);
             assert_eq!(parking_revision(&c), a, "{what} moved the parking revision");
         }
+    }
+
+    /// SPEC-077 — a save turning a 0.0 parking vertex into -0.0 is the same
+    /// zones to the reconciler's key (`==`), so nothing restarts: it keeps the
+    /// parking revision, as it keeps the zone revision, and the parking
+    /// receipt stays Applied. Zero vertices hash as they always have.
+    #[test]
+    fn a_negative_zero_parking_vertex_save_keeps_the_parking_revision_and_stays_applied() {
+        let mut zero = parked(Some(policy(10.0)));
+        zero.zones[0].polygon = vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)];
+        let mut negative = zero.clone();
+        negative.zones[0].polygon[0] = (-0.0, -0.0);
+        assert!(negative.zones[0].polygon[0].0.is_sign_negative(), "fixture");
+        assert_eq!(negative.validate_finite(), Ok(()));
+        assert_eq!(negative.zones, zero.zones, "the reconciler would restart");
+        let a = parking_revision(&zero);
+        assert_eq!(
+            a, "sha256:b1dcb920b72278b2d3889ff3e2bcd315ad079c0d2e330a5203713b2b2feef547",
+            "folding -0.0 into 0.0 changed a saved parking digest"
+        );
+        assert_eq!(parking_revision(&negative), a);
+
+        let r = ZoneApplicationRegistry::default();
+        let now = Instant::now();
+        r.request(7, &a, true);
+        let g = r.start(7, &a);
+        frame(&r, g, &a, at(0));
+        // The save requests what it stored; the reconciler restarts nothing.
+        let saved = parking_revision(&negative);
+        r.request(7, &saved, true);
+        assert_eq!(
+            read(&r, &saved, now),
+            (a.clone(), Some(a.clone()), g, Some(g), Applied, None)
+        );
     }
 
     /// SPEC-077 — the parking receipt is this state machine in a registry of
