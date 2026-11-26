@@ -482,6 +482,7 @@ export function CameraEditor({
     phase:
       sketching || draft.zones !== sentZones ? "dirty" : saving ? "saving" : zoneView.awaiting ? "saved" : "clean",
     base: zoneView.base,
+    awaiting: zoneView.awaiting,
   };
   const saved: SavedSnapshot = {
     snapshot: zoneView.installed?.read.body ?? null,

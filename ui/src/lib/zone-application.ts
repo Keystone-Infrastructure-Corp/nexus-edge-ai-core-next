@@ -122,6 +122,11 @@ export type SavedSnapshot = { snapshot: CameraConfigSnapshot | null; error: unkn
 export type ZoneDraftState = {
   phase: "clean" | "dirty" | "saving" | "saved";
   base: string | null;
+  /**
+   * A save went through and its snapshot is not installed yet, as `saved`
+   * says; a dirty edit (a sketch holds the snapshot) can be over one too.
+   */
+  awaiting?: boolean;
 };
 
 /**
@@ -180,7 +185,7 @@ export function deriveZoneApplication(
   draft: ZoneDraftState,
   epoch: AcceptanceEpoch,
 ): ZoneApplication {
-  const receipt = deriveReceipt(saved, read, draft.phase === "saved", epoch);
+  const receipt = deriveReceipt(saved, read, draft.phase === "saved" || draft.awaiting === true, epoch);
   // A denied read, of the saved zones or of the status, shows as such: never
   // as an edit to save or a save in flight, which the denial dropped.
   if (isDenied(saved.error) || isDenied(read.error)) return receipt;

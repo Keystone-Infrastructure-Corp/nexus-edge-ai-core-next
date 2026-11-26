@@ -192,6 +192,17 @@ describe("deriveZoneApplication", () => {
     }
   });
 
+  it("reads an edit over its own save, whose snapshot is not installed, as unsaved, not changed elsewhere", () => {
+    // B was saved here; the snapshot shown is still A's (a sketch holds B's).
+    const over = derive(read(receipt({ desired_revision: B, applied_revision: B })), shown(A), {
+      phase: "dirty",
+      base: null,
+      awaiting: true,
+    });
+    expect(over.title).toBe("Unsaved changes");
+    expect(over.kind === "unsaved" && over.receipt.title).toBe("Saved; applying to camera");
+  });
+
   it("never shows Applied while a save is pending or awaiting its snapshot", () => {
     expect(derive(read(receipt()), shown(), { phase: "saving", base: null }).title).toBe("Saving to camera…");
     expect(derive(read(receipt()), shown(), { phase: "saved", base: null }).title).toBe("Saved; applying to camera");

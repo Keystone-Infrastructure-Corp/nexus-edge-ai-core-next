@@ -6,7 +6,7 @@
 // `zones_runtime` is rewritten, so a receipt can say what a running camera
 // would, with the engine's own revisions.
 
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type Request } from "@playwright/test";
 
 import { loginAsAdmin } from "./helpers";
 
@@ -848,5 +848,124 @@ test.describe("zone application", () => {
     await expect(zoneRow(page, "Loading dock")).toBeVisible();
     await expect(zoneRow(page, "Door")).toHaveCount(0);
     await expect(status).toContainText("Applied to camera", POLL);
+  });
+
+  /** For `ms`, the status reads exactly `title`: no other state, Applied included. */
+  async function statusHolds(page: Page, title: string, ms: number) {
+    const status = page.getByTestId("zone-application");
+    for (const until = Date.now() + ms; Date.now() < until; await page.waitForTimeout(200)) {
+      await expect(status.getByText(title, { exact: true })).toBeVisible({ timeout: 100 });
+    }
+  }
+
+  const isPut = (id: number) => (r: Request) =>
+    r.method() === "PUT" && new URL(r.url()).pathname === `/api/v1/cameras/${id}`;
+
+  test("an edit typed while a save is pending stays unsaved when the save succeeds", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
+    const save = await holdSave(page, id);
+    await page.getByRole("button", { name: /^save$/i }).click();
+    await save.parked;
+    await expect(status).toContainText("Saving to camera…");
+    await zoneRow(page, "Gate").getByRole("textbox").fill("Gate 2");
+    await expect(status.getByText("Unsaved changes", { exact: true })).toBeVisible();
+
+    // The engine applies the save; the newer edit is not part of it.
+    receipt.set(applied(2));
+    const saved = page.waitForResponse((r) => isPut(id)(r.request()));
+    save.release();
+    expect((await saved).ok()).toBe(true);
+    await statusHolds(page, "Unsaved changes", 5_000);
+    await steadyRead(page);
+    await statusHolds(page, "Unsaved changes", 2_000);
+    await expect(zoneRow(page, "Gate 2")).toBeVisible();
+
+    // Saved in turn, the newer edit is what applies.
+    receipt.set(applied(3));
+    const put = page.waitForRequest(isPut(id));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    expect(((await put).postDataJSON() as { zones: Zone[] }).zones).toEqual([{ ...DOOR, name: "Gate 2" }]);
+    await expect(status).toContainText("Applied to camera", POLL);
+    await expect(zoneRow(page, "Gate 2")).toBeVisible();
+  });
+
+  test("a save while sketching on a clean view sends the zones shown, not the sketch", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    await page.getByRole("button", { name: "New zone" }).click();
+    await clickCanvas(page, 0.6, 0.6);
+    await clickCanvas(page, 0.8, 0.6);
+    const finish = page.getByRole("button", { name: "Finish (2 pt)" });
+    await expect(finish).toBeVisible();
+    await expect(status.getByText("Unsaved changes", { exact: true })).toBeVisible();
+
+    receipt.set(applied(2));
+    const put = page.waitForRequest(isPut(id));
+    const saved = page.waitForResponse((r) => isPut(id)(r.request()));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    expect(((await put).postDataJSON() as { zones: Zone[] }).zones).toEqual([DOOR]);
+    expect((await saved).ok()).toBe(true);
+    // The sketch is still open: an unsaved change across the save's reads.
+    await expect(finish).toBeVisible();
+    await statusHolds(page, "Unsaved changes", 5_000);
+    await steadyRead(page);
+    await statusHolds(page, "Unsaved changes", 2_000);
+
+    await finish.locator("..").getByRole("button", { name: "Cancel" }).click();
+    await expect(status).toContainText("Applied to camera", POLL);
+    await expect(zoneRow(page, "Door")).toBeVisible();
+    await expect(zoneRow(page, "Zone 2")).toHaveCount(0);
+  });
+
+  test("a sketch over a pending save is unsaved until it ends, then shows the save", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
+    const save = await holdSave(page, id);
+    const put = page.waitForRequest(isPut(id));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    await save.parked;
+    await expect(status).toContainText("Saving to camera…");
+    await page.getByRole("button", { name: "New zone" }).click();
+    await clickCanvas(page, 0.6, 0.6);
+    const finish = page.getByRole("button", { name: "Finish (1 pt)" });
+    await expect(finish).toBeVisible();
+    await expect(status.getByText("Unsaved changes", { exact: true })).toBeVisible();
+
+    // The save goes through and applies while the sketch is open.
+    receipt.set(applied(2));
+    const saved = page.waitForResponse((r) => isPut(id)(r.request()));
+    save.release();
+    expect((await saved).ok()).toBe(true);
+    expect(((await put).postDataJSON() as { zones: Zone[] }).zones).toEqual([{ ...DOOR, name: "Gate" }]);
+    await statusHolds(page, "Unsaved changes", 5_000);
+    await steadyRead(page);
+    await statusHolds(page, "Unsaved changes", 2_000);
+
+    // Ended empty, it leaves no change: the saved zones show, applied.
+    await finish.locator("..").getByRole("button", { name: "Cancel" }).click();
+    await expect(status).toContainText("Applied to camera", POLL);
+    await expect(zoneRow(page, "Gate")).toBeVisible();
+    await expect(zoneRow(page, "Zone 2")).toHaveCount(0);
   });
 });
