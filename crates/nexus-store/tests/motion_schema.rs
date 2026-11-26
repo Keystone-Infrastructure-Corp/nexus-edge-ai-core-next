@@ -19,7 +19,9 @@ use std::path::PathBuf;
 
 use chrono::{Duration, Timelike, Utc};
 use nexus_config::{CameraConfig, StoreConfig};
-use nexus_store::{ClipClose, EventStore, MotionEventKind, NewClip, NewMotionEvent, Store};
+use nexus_store::{
+    ClipClose, ClipDamage, EventStore, MotionEventKind, NewClip, NewMotionEvent, Store, StoreError,
+};
 use nexus_types::{AlertEvent, Artifacts, BBox, Severity};
 use sqlx::Row;
 use tempfile::TempDir;
@@ -808,6 +810,85 @@ async fn find_largest_quarantined_hot_clip_none_when_all_healthy() {
         .await
         .unwrap()
         .is_none());
+}
+
+/// SPEC-088 review 13: a damaged clip's degradation, quarantine and close
+/// are one write. A rejected close leaves none of them; the close that
+/// goes through leaves the clip closed, quarantined and not pending upload.
+#[tokio::test]
+async fn close_damaged_clip_writes_damage_and_close_together() {
+    let (store, _dir) = fresh_store().await;
+    store.upsert_camera(&sample_camera(1, "c1")).await.unwrap();
+    let now = Utc::now();
+    let id = store
+        .open_clip(&sample_clip(1, now - Duration::seconds(30)))
+        .await
+        .unwrap();
+    let close = ClipClose {
+        ended_at: now,
+        duration_ms: 8_000,
+        size_bytes: 10_000,
+        hot_path: None,
+        sha256: Some("a".into()),
+    };
+    let damage = ClipDamage {
+        dropped_samples: 3,
+        quarantine: Some("clip layout: box after moov is not moof".into()),
+    };
+    let flags = || async {
+        let row = sqlx::query(
+            "SELECT degraded, dropped_samples, cold_quarantined FROM motion_clips WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+        (
+            row.get::<i64, _>(0),
+            row.get::<i64, _>(1),
+            row.get::<i64, _>(2),
+        )
+    };
+
+    // Rejects the close's own write only, after the damage's went through.
+    sqlx::query(
+        "CREATE TRIGGER reject_close BEFORE UPDATE OF ended_at ON motion_clips
+         BEGIN SELECT RAISE(ABORT, 'storage unavailable'); END",
+    )
+    .execute(store.pool())
+    .await
+    .unwrap();
+    let rejected = store.close_damaged_clip(id, &close, &damage).await;
+    let after_rejected = flags().await;
+    sqlx::query("DROP TRIGGER reject_close")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    store.close_damaged_clip(id, &close, &damage).await.unwrap();
+    let row = store.get_clip(id).await.unwrap().unwrap();
+    let gone = store.close_damaged_clip(id + 1, &close, &damage).await;
+
+    assert!(rejected.is_err(), "precondition: the close was rejected");
+    assert_eq!(
+        after_rejected,
+        (0, 0, 0),
+        "a rejected close left its damage"
+    );
+    assert_eq!(flags().await, (1, 3, 1));
+    assert!(row.ended_at.is_some());
+    assert_eq!(
+        row.cold_last_error.as_deref(),
+        Some("clip layout: box after moov is not moof")
+    );
+    assert!(store
+        .clips_pending_cold_upload(10, None)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(
+        matches!(gone, Err(StoreError::NotFound(_))),
+        "a missing row: {gone:?}"
+    );
 }
 
 /// #349 — the cross-camera window read (`list_motion_events_across_cameras`

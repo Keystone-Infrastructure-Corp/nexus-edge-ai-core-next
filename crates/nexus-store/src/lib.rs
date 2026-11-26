@@ -28,9 +28,9 @@ pub use audit::{AuditActorKind, AuditEntry, AuditFilter, AuditOutcome, NewAuditE
 pub use entity::{EntityLocalRecord, EntityLocalUpsert};
 pub use fleet::{FleetManagedMarker, FleetMarkerWrite};
 pub use motion::{
-    ClipClose, ClipColdMark, ClipId, ClipRow, ColdReplicaRow, ColdReplicaStats, DeleteBackendError,
-    MotionEventId, MotionEventKind, MotionEventRow, MotionHistogramBucket, NewClip, NewMotionEvent,
-    PerCameraClipStats, StorageBackendRow,
+    ClipClose, ClipColdMark, ClipDamage, ClipId, ClipRow, ColdReplicaRow, ColdReplicaStats,
+    DeleteBackendError, MotionEventId, MotionEventKind, MotionEventRow, MotionHistogramBucket,
+    NewClip, NewMotionEvent, PerCameraClipStats, StorageBackendRow,
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
 pub use sessions::{NewRefreshToken, RefreshToken, RefreshTokenId, SessionsError};

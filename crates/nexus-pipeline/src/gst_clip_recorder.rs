@@ -111,7 +111,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSrc, AppStreamType};
 use nexus_config::AlertClipsConfig;
-use nexus_store::{AlertClipId, ClipClose, ClipId, NewAlertClip, NewClip, Store};
+use nexus_store::{AlertClipId, ClipClose, ClipDamage, ClipId, NewAlertClip, NewClip, Store};
 use nexus_types::{CameraId, CodecKind};
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::fs;
@@ -357,8 +357,21 @@ struct PumpStats {
 /// clip's writer is already finalized and is never reopened.
 #[derive(Clone)]
 enum FinalStep {
-    Close(ClipClose),
+    /// A damaged clip's close carries its damage, written with it.
+    Close(ClipClose, Option<ClipDamage>),
     Discard,
+}
+
+impl FinalStep {
+    async fn run(&self, store: &Store, clip_id: ClipId) -> Result<(), nexus_store::StoreError> {
+        match self {
+            FinalStep::Close(close, None) => store.close_clip(clip_id, close).await,
+            FinalStep::Close(close, Some(damage)) => {
+                store.close_damaged_clip(clip_id, close, damage).await
+            }
+            FinalStep::Discard => store.discard_clip_metadata(clip_id).await,
+        }
+    }
 }
 
 struct Unfinalized {
@@ -875,10 +888,7 @@ async fn retry_finalize(
     if !unfinalized.lock().contains_key(&clip_id) {
         return true;
     }
-    let retried = match step {
-        FinalStep::Close(close) => store.close_clip(clip_id, close).await,
-        FinalStep::Discard => store.discard_clip_metadata(clip_id).await,
-    };
+    let retried = step.run(store, clip_id).await;
     let mut unfinalized = unfinalized.lock();
     match retried {
         Ok(()) => info!(
@@ -1261,40 +1271,17 @@ impl Writers {
                  marked degraded, not replicated"
             );
         }
-        if pump_stats.dropped > 0 || layout_fault.is_some() {
+        let damage = if pump_stats.dropped > 0 || layout_fault.is_some() {
             state
                 .health
                 .fail("recording has missing samples or a damaged media layout");
-            if let Err(e) = self
-                .store
-                .mark_clip_degraded(handle.clip_id, pump_stats.dropped as i64)
-                .await
-            {
-                warn!(
-                    clip_id = handle.clip_id,
-                    error = %e,
-                    "gst recorder: failed to stamp degraded clip"
-                );
-            }
-        }
-        // Before `close_clip`, which makes the row eligible for upload.
-        if let Some(reason) = layout_fault {
-            if let Err(e) = self
-                .store
-                .quarantine_clip(
-                    handle.clip_id,
-                    Utc::now(),
-                    &format!("clip layout: {reason}"),
-                )
-                .await
-            {
-                warn!(
-                    clip_id = handle.clip_id,
-                    error = %e,
-                    "gst recorder: failed to quarantine damaged clip"
-                );
-            }
-        }
+            Some(ClipDamage {
+                dropped_samples: pump_stats.dropped as i64,
+                quarantine: layout_fault.map(|reason| format!("clip layout: {reason}")),
+            })
+        } else {
+            None
+        };
 
         let close = ClipClose {
             ended_at: args.ended_at,
@@ -1303,10 +1290,11 @@ impl Writers {
             hot_path: Some(rel),
             sha256,
         };
-        let gone = match self.store.close_clip(handle.clip_id, &close).await {
+        let step = FinalStep::Close(close, damage);
+        let gone = match step.run(&self.store, handle.clip_id).await {
             Ok(()) => false,
             Err(e) if row_gone(&e, handle.clip_id, handle.camera_id) => true,
-            Err(e) => return Err(self.unfinalized(handle, FinalStep::Close(close), e)),
+            Err(e) => return Err(self.unfinalized(handle, step, e)),
         };
 
         debug!(
@@ -6090,6 +6078,29 @@ mod epoch_tests {
         started_at: DateTime<Utc>,
         pump_handle: Option<tokio::task::JoinHandle<PumpStats>>,
     ) -> (ClipHandle, PathBuf, gst::Pipeline) {
+        let samples = encode(15, "main", 60, Duration::ZERO);
+        register_samples(
+            rec,
+            store,
+            clips_dir,
+            camera_id,
+            started_at,
+            pump_handle,
+            &samples,
+        )
+        .await
+    }
+
+    /// [`register_clip`] holding `samples`.
+    async fn register_samples(
+        rec: &GstClipRecorder,
+        store: &Store,
+        clips_dir: &Path,
+        camera_id: CameraId,
+        started_at: DateTime<Utc>,
+        pump_handle: Option<tokio::task::JoinHandle<PumpStats>>,
+        samples: &[NalSample],
+    ) -> (ClipHandle, PathBuf, gst::Pipeline) {
         let path = crate::recorder::inflight_clip_path(clips_dir, camera_id, started_at);
         fs::create_dir_all(path.parent().unwrap()).await.unwrap();
         let clip_id = store
@@ -6108,7 +6119,7 @@ mod epoch_tests {
         let (pipeline, appsrc) = GstClipRecorder::build_pipeline(&path, CodecKind::H264).unwrap();
         pipeline.set_state(gst::State::Playing).unwrap();
         let mut last = None;
-        for s in &encode(15, "main", 60, Duration::ZERO) {
+        for s in samples {
             last = Some(
                 push_sample(&appsrc, s, Duration::ZERO, last, FALLBACK_FRAME_INTERVAL_NS).unwrap(),
             );
@@ -6878,6 +6889,66 @@ mod epoch_tests {
         assert!(
             finalized_playable(&store, &clips_dir, clip.clip_id).await,
             "the retry did not stamp the row with the close's final file"
+        );
+    }
+
+    /// SPEC-088 review 13: the store rejected every write of a damaged
+    /// (#376) clip's close, its quarantine's too. The retry once the store
+    /// recovers closes the clip quarantined, never eligible for cold upload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_damaged_clips_retried_close_keeps_it_out_of_cold_upload() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        // Two SPS in one file: the layout the damaged-clip fixture records.
+        let mut mixed = encode(15, "main", 60, Duration::ZERO);
+        mixed.extend(encode(20, "main", 60, Duration::from_secs(4)));
+        let (clip, _, _) =
+            register_samples(&rec, &store, &clips_dir, 1, started_at, None, &mixed).await;
+        fail_clip_writes(&store).await;
+
+        let closed = rec
+            .close(
+                clip,
+                ClipFinal {
+                    ended_at: started_at + chrono::Duration::seconds(8),
+                },
+            )
+            .await;
+        restore_clip_writes(&store).await;
+        let settled = wait_for(Duration::from_secs(10), || attempts(&rec, clip).is_none()).await;
+        let row = store.get_clip(clip.clip_id).await.unwrap().unwrap();
+        let pending: Vec<ClipId> = store
+            .clips_pending_cold_upload(10, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect();
+
+        assert!(closed.is_err(), "precondition: the close failed");
+        assert!(settled, "no retry finalized the clip");
+        assert!(
+            row.ended_at.is_some() && row.sha256.is_some(),
+            "the retry did not close the clip"
+        );
+        assert!(
+            row.cold_quarantined,
+            "the retry dropped the clip's quarantine"
+        );
+        assert_eq!(
+            row.cold_last_error.as_deref(),
+            Some("clip layout: box after moov is not moof")
+        );
+        assert!(
+            pending.is_empty(),
+            "damaged footage is upload-eligible: {pending:?}"
         );
     }
 
