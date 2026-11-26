@@ -280,6 +280,7 @@ struct Scenario {
     zones: Vec<ZoneConfig>,
     policy: Option<ParkingPolicyV2>,
     scripted_ids: bool,
+    anchor_ttl_secs: Option<u32>,
 }
 
 impl Scenario {
@@ -289,6 +290,7 @@ impl Scenario {
             zones: stalls(),
             policy: Some(policy()),
             scripted_ids: false,
+            anchor_ttl_secs: None,
         }
     }
 }
@@ -343,7 +345,13 @@ impl Outcome {
     }
 }
 
-/// Run the shots, then one empty frame 500 ms after the last whose
+/// An anchor center from the registry, to the hundredth of a pixel.
+fn center(a: &serde_json::Value) -> (f32, f32) {
+    let px = |v: &serde_json::Value| ((v.as_f64().unwrap() * 100.0).round() / 100.0) as f32;
+    (px(&a["center_x"]), px(&a["center_y"]))
+}
+
+/// Run the shots, then a repeat of the last one 500 ms later whose
 /// metadata shows every shot has been fully handled, then stop the camera.
 /// `dir` holds the store and the anchor registry, so a second run on the
 /// same `dir` is the camera's next generation.
@@ -385,6 +393,7 @@ async fn run(s: Scenario, dir: &Path) -> Outcome {
         behavior: CameraBehavior {
             parking_lot_mode: true,
             parking_policy_v2: s.policy,
+            anchor_ttl_secs: s.anchor_ttl_secs,
             ..Default::default()
         },
         onvif: Default::default(),
@@ -395,13 +404,10 @@ async fn run(s: Scenario, dir: &Path) -> Outcome {
 
     let mono0 = Instant::now();
     let n = s.shots.len();
-    let last_ms = s.shots.last().map_or(0, |shot| shot.ms);
     let mut shots = s.shots;
-    shots.push(Shot {
-        ms: last_ms + 500,
-        size: shots.last().map_or(SIZE, |shot| shot.size),
-        cars: Vec::new(),
-    });
+    let mut last = shots.last().cloned().expect("a shot");
+    last.ms += 500;
+    shots.push(last);
     let frames: Vec<Frame> = shots
         .iter()
         .enumerate()
@@ -499,12 +505,7 @@ async fn run(s: Scenario, dir: &Path) -> Outcome {
                 .as_array()
                 .expect("anchors")
                 .iter()
-                .map(|a| {
-                    (
-                        a["center_x"].as_f64().unwrap() as f32,
-                        a["center_y"].as_f64().unwrap() as f32,
-                    )
-                })
+                .map(center)
                 .collect()
         })
         .unwrap_or_default();
@@ -545,4 +546,547 @@ async fn a_car_queueing_in_the_lane_is_never_hidden() {
         "motion never ends"
     );
     assert!(o.anchors.is_empty(), "no anchor in the lane");
+}
+
+/// The stall every single-car scenario parks in: (128, 144) px at 512x288.
+fn in_stall() -> Car {
+    car(0.25, 0.5)
+}
+
+fn first_at(times: &[u64], from_ms: u64) -> usize {
+    times
+        .iter()
+        .position(|&ms| ms >= from_ms)
+        .expect("a frame then")
+}
+
+/// Write an anchor registry as an earlier generation would have left it.
+fn seed_anchors(dir: &Path, anchors: &[(f32, f32)]) {
+    let registry = dir.join("static_objects");
+    std::fs::create_dir_all(&registry).unwrap();
+    let anchors: Vec<_> = anchors
+        .iter()
+        .map(|&(x, y)| {
+            json!({"label": "vehicle.car", "center_x": x, "center_y": y,
+                   "last_seen_unix_ms": wall0().timestamp_millis()})
+        })
+        .collect();
+    let doc = json!({"version": 1, "camera_id": 1, "anchors": anchors});
+    std::fs::write(registry.join("cam-1.json"), doc.to_string()).unwrap();
+}
+
+/// A car arriving at a stall whose last car left unseen, so its anchor is
+/// still on disk: the arrival is alerted and recorded, and only its own
+/// observed dwell hides it, at the stall's existing anchor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_new_arrival_is_alerted_and_recorded_until_its_own_dwell() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    seed_anchors(dir.path(), &[(128.0, 144.0)]);
+    let times = every(690, 0, 15_000);
+    let o = run(
+        Scenario::v2(shots(&times, |_, _| vec![in_stall()])),
+        dir.path(),
+    )
+    .await;
+    let parked = first_at(&times, 5_000);
+    for (k, ms) in times.iter().enumerate() {
+        assert_eq!(o.static_at(k, 0.25, 0.5), k >= parked, "{ms} ms");
+    }
+    assert_eq!(o.fired("any_vehicle"), vec![0], "alerted on arrival");
+    assert!(
+        o.fired("lingering_vehicle").is_empty(),
+        "hidden once parked"
+    );
+    assert_eq!(o.opened, vec![wall0()], "recorded from arrival");
+    assert_eq!(o.anchors, vec![(128.0, 144.0)], "the stall's one anchor");
+}
+
+/// An established parked car whose detection drops out for three frames:
+/// coasting credits nothing, so on reacquisition it is visible again, in
+/// the same alert episode, until a fresh observed dwell hides it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_car_lost_and_reacquired_is_visible_until_a_fresh_dwell() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let times = every(690, 0, 25_000);
+    let unseen = |ms: u64| (9_000..11_000).contains(&ms);
+    let o = run(
+        Scenario::v2(shots(&times, |_, ms| {
+            vec![Car {
+                seen: !unseen(ms),
+                ..in_stall()
+            }]
+        })),
+        dir.path(),
+    )
+    .await;
+    let back = first_at(&times, 11_000);
+    for (k, &ms) in times.iter().enumerate() {
+        let want = (5_000..9_000).contains(&ms) || ms >= times[back] + 5_000;
+        assert_eq!(o.static_at(k, 0.25, 0.5), want, "{ms} ms");
+    }
+    assert_eq!(o.fired("any_vehicle"), vec![0], "one parked episode");
+    assert_eq!(
+        o.fired("lingering_vehicle"),
+        vec![back],
+        "seen again, visible and older than the dwell"
+    );
+    let born = |r: &&MotionEventRow| r.kind == MotionEventKind::Born;
+    assert_eq!(
+        o.motion.iter().filter(born).count(),
+        2,
+        "its motion restarted"
+    );
+    assert_eq!(o.anchors, vec![(128.0, 144.0)], "reclaimed, not duplicated");
+}
+
+/// A car crawling down the aisle past two parked cars, through each one's
+/// anchor radius: one alert for its whole pass, never hidden, and both
+/// parked cars stay hidden with their anchors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_passing_car_is_alerted_once_and_takes_no_anchor() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let times = every(690, 0, 25_000);
+    let passer_y = |ms: u64| 0.05 + (ms as f32 - 8_000.0) / 1_000.0 * 0.05;
+    let o = run(
+        Scenario::v2(shots(&times, |_, ms| {
+            let mut cars = vec![car(0.2, 0.3), car(0.2, 0.7)];
+            if ms >= 8_000 {
+                cars.push(car(0.26, passer_y(ms)));
+            }
+            cars
+        })),
+        dir.path(),
+    )
+    .await;
+    let passing = first_at(&times, 8_000);
+    for (k, &ms) in times.iter().enumerate().skip(first_at(&times, 5_000)) {
+        assert!(
+            o.static_at(k, 0.2, 0.3) && o.static_at(k, 0.2, 0.7),
+            "{ms} ms"
+        );
+        if k >= passing {
+            assert!(
+                !o.static_at(k, 0.26, passer_y(ms)),
+                "passer hidden at {ms} ms"
+            );
+        }
+    }
+    assert_eq!(o.fired("any_vehicle"), vec![0, 0, passing]);
+    assert_eq!(o.fired("lingering_vehicle"), vec![first_at(&times, 16_000)]);
+    assert_eq!(o.anchors, vec![(102.4, 86.4), (102.4, 201.6)]);
+}
+
+/// A parked car seen driving out of its stall erases its anchor, is
+/// alerted again and recorded leaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_car_driving_away_erases_its_anchor_and_alerts_again() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let times = every(690, 0, 40_000);
+    let leaving = first_at(&times, 30_000);
+    let x = |k: usize| 0.25 + 0.03 * k.saturating_sub(leaving - 1) as f32;
+    let o = run(
+        Scenario::v2(shots(&times, |k, _| vec![car(x(k), 0.5)])),
+        dir.path(),
+    )
+    .await;
+    for (k, &ms) in times.iter().enumerate() {
+        let want = (5_000..30_000).contains(&ms);
+        assert_eq!(o.static_at(k, x(k), 0.5), want, "{ms} ms");
+    }
+    // 15 px a frame: out of the 40 px anchor radius on its third frame.
+    assert_eq!(o.fired("any_vehicle"), vec![0, leaving + 2]);
+    assert_eq!(
+        o.opened,
+        vec![
+            wall0(),
+            wall0() + chrono::Duration::milliseconds(times[leaving] as i64)
+        ],
+        "recorded on arrival and again leaving"
+    );
+    assert!(
+        o.anchors.is_empty(),
+        "the stall is free for the next arrival"
+    );
+}
+
+/// A tracker that hands a parked car's id to another object: the reused id
+/// inherits neither the parked verdict nor the anchor, and is alerted as
+/// a new episode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reused_track_id_inherits_no_parked_verdict_or_anchor() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let times = every(690, 0, 20_000);
+    let gone = first_at(&times, 10_000);
+    let x = |k: usize| 0.4 + 0.01 * (k - gone) as f32;
+    let mut s = Scenario::v2(shots(&times, |k, _| {
+        let id = 7;
+        match k.cmp(&gone) {
+            std::cmp::Ordering::Less => vec![Car { id, ..in_stall() }],
+            std::cmp::Ordering::Equal => vec![],
+            std::cmp::Ordering::Greater => vec![Car {
+                id,
+                ..car(x(k), 0.5)
+            }],
+        }
+    }));
+    s.scripted_ids = true;
+    let o = run(s, dir.path()).await;
+    for (k, &ms) in times.iter().enumerate() {
+        if k < gone {
+            assert_eq!(o.static_at(k, 0.25, 0.5), ms >= 5_000, "{ms} ms");
+        } else if k > gone {
+            assert!(!o.static_at(k, x(k), 0.5), "reused id hidden at {ms} ms");
+        }
+    }
+    assert_eq!(o.fired("any_vehicle"), vec![0, gone + 1]);
+    assert_eq!(
+        o.anchors,
+        vec![(128.0, 144.0)],
+        "left to expire, not erased"
+    );
+}
+
+/// A stream resized mid-dwell: every candidate starts over in the new
+/// geometry, so the car is visible, and alerted as the new box it is, until
+/// it dwells again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resized_stream_starts_every_dwell_over() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let times = every(690, 0, 20_000);
+    let resized = first_at(&times, 10_000);
+    let mut shots = shots(&times, |_, _| vec![in_stall()]);
+    for shot in &mut shots[resized..] {
+        shot.size = (1024, 576);
+    }
+    let o = run(Scenario::v2(shots), dir.path()).await;
+    for (k, &ms) in times.iter().enumerate() {
+        let want = (5_000..10_000).contains(&ms) || ms >= times[resized] + 5_000;
+        assert_eq!(o.static_at(k, 0.25, 0.5), want, "{ms} ms");
+    }
+    assert_eq!(o.fired("any_vehicle"), vec![0, resized]);
+    assert_eq!(
+        o.anchors,
+        vec![(128.0, 144.0), (256.0, 288.0)],
+        "the old geometry's anchor is left to expire"
+    );
+}
+
+/// Removing a parking zone (a new generation of the camera): the car in
+/// it is never hidden again and its anchor is neither matched nor
+/// refreshed, so it expires; the car in the remaining zone dwells again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removed_parking_zone_hides_nothing_and_its_anchor_expires() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let both = || vec![car(0.12, 0.5), car(0.37, 0.5)];
+    let first = every(690, 0, 10_000);
+    let mut s = Scenario::v2(shots(&first, |_, _| both()));
+    s.zones = vec![parking("a", 0.0, 0.25), parking("b", 0.25, 0.5)];
+    let o = run(s, dir.path()).await;
+    let last = first.len() - 1;
+    assert!(o.static_at(last, 0.12, 0.5) && o.static_at(last, 0.37, 0.5));
+    assert_eq!(o.anchors.len(), 2);
+
+    let second = every(690, 12_000, 50_000);
+    let mut s = Scenario::v2(shots(&second, |_, _| both()));
+    s.zones = vec![parking("a", 0.0, 0.25)];
+    s.anchor_ttl_secs = Some(30);
+    let o = run(s, dir.path()).await;
+    for (k, &ms) in second.iter().enumerate() {
+        assert_eq!(o.static_at(k, 0.12, 0.5), ms >= 17_000, "{ms} ms");
+        assert!(!o.static_at(k, 0.37, 0.5), "hidden at {ms} ms");
+    }
+    assert_eq!(o.fired("any_vehicle"), vec![0, 0], "a new generation");
+    assert_eq!(
+        o.fired("lingering_vehicle"),
+        vec![first_at(&second, 20_000)]
+    );
+    assert_eq!(o.anchors, vec![(61.44, 144.0)], "zone b's anchor expired");
+}
+
+// ---- The plan's vectors at every analysis rate and two resolutions ----
+//
+// Replayed through ByteTrack, the v2 filter and the rules in the
+// supervisor's order, without the supervisor: its motion gate passes at most
+// 8 frames a second.
+
+const RATES: [f64; 5] = [0.5, 1.45, 2.0, 8.0, 30.0];
+
+/// One replayed vector: a vehicle's box size and its center at capture
+/// second `t` on a 512x288 frame (`None`: not detected), with or without
+/// +/-3 px of alternating jitter.
+struct Vector {
+    name: &'static str,
+    secs: f64,
+    size: (u32, u32),
+    box_px: (f32, f32),
+    jitter: bool,
+    policy: ParkingPolicyV2,
+    at: fn(f64) -> Option<(f32, f32)>,
+}
+
+/// One replayed frame: capture second, whether the vehicle was detected,
+/// static, and whether `any_vehicle` fired.
+#[derive(Debug, PartialEq)]
+struct Sample {
+    t: f64,
+    seen: bool,
+    hidden: bool,
+    fired: bool,
+}
+
+/// Capture ms from 0 to `secs` at `fps`, each interval scaled by a
+/// repeating 1, 0.7, 1.3, 0.85, 1.15: nonuniform, at the same mean rate.
+fn nonuniform_ms(fps: f64, secs: f64) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut ms: f64 = 0.0;
+    for k in 0.. {
+        if ms > secs * 1_000.0 {
+            break;
+        }
+        out.push(ms.round() as u64);
+        ms += 1_000.0 / fps * [1.0, 0.7, 1.3, 0.85, 1.15][k % 5];
+    }
+    out
+}
+
+/// `v` at `fps`, with every position and size (and the static filter's
+/// pixel radii) multiplied by `scale`.
+fn replay(v: &Vector, fps: f64, scale: f32) -> Vec<Sample> {
+    let defaults = TrackerConfig::default();
+    let tracker = nexus_tracker::ByteTrackTracker::new(defaults.bytetrack);
+    let base = defaults.static_object;
+    let cfg = nexus_config::StaticObjectConfig {
+        match_distance_pixels: (base.match_distance_pixels as f32 * scale) as u32,
+        track_id_reuse_reset_pixels: (base.track_id_reuse_reset_pixels as f32 * scale) as u32,
+        ..base
+    };
+    let mut filter = nexus_tracker::StaticObjectFilter::new(cfg, 1, None)
+        .with_parking_policy(&v.policy, &stalls())
+        .expect("valid policy");
+    let rules = RuleEvaluator::new(&RulesConfig::default(), &[vehicle_rule("any_vehicle", 0)])
+        .expect("compile rules");
+    let (w, h) = (
+        (v.size.0 as f32 * scale) as u32,
+        (v.size.1 as f32 * scale) as u32,
+    );
+    let mono0 = Instant::now();
+    nonuniform_ms(fps, v.secs)
+        .into_iter()
+        .enumerate()
+        .map(|(k, ms)| {
+            let t = ms as f64 / 1_000.0;
+            let mono = mono0 + Duration::from_millis(ms);
+            let jitter = match (v.jitter, k % 2) {
+                (false, _) => 0.0,
+                (true, 0) => 3.0,
+                (true, _) => -3.0,
+            };
+            let dets: Vec<Detection> = (v.at)(t)
+                .map(|(x, y)| {
+                    let (x, y) = ((x + jitter) * scale, y * scale);
+                    let (bw, bh) = (v.box_px.0 * scale / 2.0, v.box_px.1 * scale / 2.0);
+                    Detection {
+                        label: "vehicle.car".into(),
+                        confidence: 0.9,
+                        bbox: BBox {
+                            x1: x - bw,
+                            y1: y - bh,
+                            x2: x + bw,
+                            y2: y + bh,
+                        },
+                        attributes: Default::default(),
+                    }
+                })
+                .into_iter()
+                .collect();
+            let seen = !dets.is_empty();
+            let frame = Frame {
+                camera_id: 1,
+                frame_id: k as u64 + 1,
+                captured_at: wall0() + chrono::Duration::milliseconds(ms as i64),
+                captured_mono: mono,
+                width: w,
+                height: h,
+                format: PixelFormat::Rgb24,
+                data: Arc::new(Vec::new()),
+                trace_id: format!("replay-{k}"),
+            };
+            let mut tracked = tracker.update(dets, mono);
+            filter.classify(&frame, &mut tracked);
+            let fired = !rules
+                .evaluate(
+                    1,
+                    frame.frame_id,
+                    frame.captured_at,
+                    mono,
+                    &frame.trace_id,
+                    w,
+                    h,
+                    &[],
+                    &tracked,
+                )
+                .is_empty();
+            Sample {
+                t,
+                seen,
+                hidden: tracked.iter().any(is_object_static),
+                fired,
+            }
+        })
+        .collect()
+}
+
+/// A 120x90 box: a 150 px diagonal.
+fn plan_vector(name: &'static str, secs: f64, at: fn(f64) -> Option<(f32, f32)>) -> Vector {
+    Vector {
+        name,
+        secs,
+        size: SIZE,
+        box_px: (120.0, 90.0),
+        jitter: true,
+        policy: policy(),
+        at,
+    }
+}
+
+/// The first sample at or after `t`.
+fn first_from(samples: &[Sample], t: f64) -> Option<f64> {
+    samples.iter().map(|s| s.t).find(|&s| s >= t)
+}
+
+fn hidden_from(samples: &[Sample]) -> Option<f64> {
+    samples.iter().find(|s| s.hidden).map(|s| s.t)
+}
+
+fn fired_at(samples: &[Sample]) -> Vec<f64> {
+    samples.iter().filter(|s| s.fired).map(|s| s.t).collect()
+}
+
+/// The plan's vectors decide alike at 0.5, 1.45, 2, 8 and 30 fps, on
+/// nonuniform capture intervals, with jitter, and at twice the resolution;
+/// each within one observation interval of where the plan places it.
+#[test]
+fn the_plan_vectors_decide_alike_at_every_rate_and_resolution() {
+    let parked = plan_vector("parked in a stall", 12.0, |_| Some((100.0, 150.0)));
+    let queued = plan_vector("queued in the lane", 20.0, |_| Some((400.0, 150.0)));
+    let moving = plan_vector("moving through the stalls", 8.0, |t| {
+        Some((60.0 + 20.0 * t as f32, 40.0 + 20.0 * t as f32))
+    });
+    let regained = plan_vector("seen, lost from 1 s to 8 s, seen", 15.0, |t| {
+        (!(1.0..8.0).contains(&t)).then_some((100.0, 150.0))
+    });
+    let excursion = plan_vector("parked with a 30 px excursion at 3 s", 12.0, |t| {
+        Some((
+            if (3.0..4.0).contains(&t) {
+                130.0
+            } else {
+                100.0
+            },
+            150.0,
+        ))
+    });
+    let departure = plan_vector("parked, leaving at 12 s", 16.0, |t| {
+        Some((100.0 + 60.0 * (t - 12.0).max(0.0) as f32, 150.0))
+    });
+    for fps in RATES {
+        let interval = 1.3 / fps;
+        let run = |v: &Vector| {
+            let samples = replay(v, fps, 1.0);
+            assert_eq!(
+                samples,
+                replay(v, fps, 2.0),
+                "{} at {fps} fps: doubled",
+                v.name
+            );
+            samples
+        };
+        let ctx = |v: &Vector| format!("{} at {fps} fps", v.name);
+
+        let s = run(&parked);
+        assert_eq!(hidden_from(&s), first_from(&s, 5.0), "{}", ctx(&parked));
+        assert_eq!(fired_at(&s), vec![0.0], "{}", ctx(&parked));
+
+        let s = run(&queued);
+        assert_eq!(hidden_from(&s), None, "{}", ctx(&queued));
+        assert_eq!(fired_at(&s), vec![0.0], "{}", ctx(&queued));
+
+        assert_eq!(hidden_from(&run(&moving)), None, "{}", ctx(&moving));
+
+        let s = run(&regained);
+        let back = s.iter().find(|x| x.seen && x.t >= 8.0).unwrap().t;
+        assert_eq!(
+            hidden_from(&s),
+            first_from(&s, back + 5.0),
+            "{}",
+            ctx(&regained)
+        );
+
+        let s = run(&excursion);
+        let out = s.iter().filter(|x| (3.0..4.0).contains(&x.t));
+        assert!(
+            out.clone().all(|x| !x.hidden),
+            "{}: excursion hidden",
+            ctx(&excursion)
+        );
+        let from = match out.count() {
+            0 => 5.0,
+            _ => first_from(&s, 4.0).unwrap() + 5.0,
+        };
+        assert_eq!(hidden_from(&s), first_from(&s, from), "{}", ctx(&excursion));
+
+        let s = run(&departure);
+        assert_eq!(hidden_from(&s), first_from(&s, 5.0), "{}", ctx(&departure));
+        // Out of the drift bound (15 px, plus 6 of jitter) by 12.35 s.
+        let still = |x: &&Sample| (x.t >= 5.0 && x.t < 12.0) || x.t >= 12.35;
+        for x in s.iter().filter(still) {
+            assert_eq!(x.hidden, x.t < 12.0, "{} at {:.2} s", ctx(&departure), x.t);
+        }
+        // Silent while parked, then alerted once out of the 40 px anchor
+        // radius (plus 6 of jitter), by 12.77 s. A track the tracker splits
+        // off a fast departure at low rates alerts again (BUG-260).
+        let fired = fired_at(&s);
+        let left = fired.iter().copied().find(|&t| t > 0.0);
+        assert_eq!(fired[0], 0.0, "{}", ctx(&departure));
+        assert!(
+            left.is_some_and(|t| t > 12.0 && t <= 12.77 + interval),
+            "{}: {fired:?}",
+            ctx(&departure)
+        );
+    }
+}
+
+/// SPEC-077: a 100x100 box moving 8 px/s, horizontally, vertically or
+/// diagonally the same distance, on a 512x288 or a portrait 288x512 frame,
+/// is 0.0566 diagonals/s: over the 0.05 bound, never hidden.
+#[test]
+fn an_8_px_a_second_crawl_is_never_hidden_in_any_direction_or_orientation() {
+    let crawl = |name, size, at| Vector {
+        name,
+        secs: 12.0,
+        size,
+        box_px: (100.0, 100.0),
+        jitter: false,
+        policy: ParkingPolicyV2 {
+            max_displacement_box_diagonals: 0.20,
+            ..policy()
+        },
+        at,
+    };
+    for size in [SIZE, (288, 512)] {
+        let vectors = [
+            crawl("horizontal", size, |t| Some((60.0 + 8.0 * t as f32, 100.0))),
+            crawl("vertical", size, |t| Some((80.0, 60.0 + 8.0 * t as f32))),
+            crawl("diagonal", size, |t| {
+                let s = t as f32 * 8.0 / std::f32::consts::SQRT_2;
+                Some((60.0 + s, 60.0 + s))
+            }),
+        ];
+        for v in &vectors {
+            for fps in RATES {
+                let s = replay(v, fps, 1.0);
+                assert_eq!(s, replay(v, fps, 2.0), "{} {size:?} at {fps} fps", v.name);
+                assert_eq!(hidden_from(&s), None, "{} {size:?} at {fps} fps", v.name);
+            }
+        }
+    }
 }
