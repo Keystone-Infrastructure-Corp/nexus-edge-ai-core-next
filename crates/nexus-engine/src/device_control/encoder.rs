@@ -274,6 +274,12 @@ fn check_write(
         current.gov_length,
         options.gov_length_range,
     )?;
+    int(
+        "encoding_interval",
+        new.encoding_interval,
+        current.encoding_interval,
+        options.encoding_interval_range,
+    )?;
     if let (Some(q), Some(r)) = (new.quality, options.quality_range) {
         if new.quality != current.quality && !(r.min..=r.max).contains(&q) {
             return Err(format!(
@@ -1029,5 +1035,60 @@ mod tests {
         ] {
             assert!(sets[0].contains(field), "{field} missing: {}", sets[0]);
         }
+    }
+
+    /// A PUT changing `encoding_interval` is judged by the camera's
+    /// `EncodingIntervalRange`: out of range is a 400 with no write.
+    #[tokio::test]
+    async fn an_out_of_range_encoding_interval_is_refused_before_the_write() {
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let srv = MockServer::start().await;
+        for (action, inner) in [
+            (
+                "GetVideoEncoderConfigurations",
+                format!("<trt:GetVideoEncoderConfigurationsResponse>{FULL_H265}</trt:GetVideoEncoderConfigurationsResponse>"),
+            ),
+            (
+                "GetVideoEncoderConfigurationOptions",
+                "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options><tt:H265><tt:EncodingIntervalRange><tt:Min>1</tt:Min><tt:Max>3</tt:Max></tt:EncodingIntervalRange></tt:H265></trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>".into(),
+            ),
+            (
+                "SetVideoEncoderConfiguration",
+                "<trt:SetVideoEncoderConfigurationResponse/>".into(),
+            ),
+        ] {
+            Mock::given(body_string_contains(action))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body>{inner}</s:Body></s:Envelope>"#
+                )))
+                .mount(&srv)
+                .await;
+        }
+        let t = OnvifTarget {
+            endpoint: format!("{}/onvif/device_service", srv.uri()),
+            username: "admin".into(),
+            password: test_secret(),
+        };
+        let interval = |n| VideoEncoderConfig {
+            encoding_interval: Some(n),
+            ..cfg("VE_sub")
+        };
+        let got = preflight(&t, interval(9), PUT_READ_BUDGET)
+            .await
+            .map_err(|ApiError(s, _)| s);
+        assert_eq!(got, Err(StatusCode::BAD_REQUEST));
+        let config = preflight(&t, interval(2), PUT_READ_BUDGET).await.unwrap();
+        set_config(&t, &config, false).await.unwrap();
+        let sets: Vec<String> = srv
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("SetVideoEncoderConfiguration"))
+            .collect();
+        assert_eq!(sets.len(), 1, "only the in-range write is sent: {sets:?}");
+        assert!(sets[0].contains("<tt:EncodingInterval>2</tt:EncodingInterval>"));
     }
 }

@@ -81,6 +81,8 @@ pub struct VideoEncoderOptions {
     pub gov_length_range: Option<IntRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate_range: Option<IntRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_interval_range: Option<IntRange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub profiles_supported: Vec<String>,
 }
@@ -470,6 +472,12 @@ fn apply_option_leaf(
             leaf,
             v,
         ),
+        Some("EncodingIntervalRange") => apply_int(
+            out.encoding_interval_range
+                .get_or_insert_with(IntRange::default),
+            leaf,
+            v,
+        ),
         _ => {
             // Top-level (no range section) profile lists.
             if leaf == "H264ProfilesSupported" || leaf == "H265ProfilesSupported" {
@@ -614,6 +622,7 @@ mod tests {
                 gov_length_range: Some(IntRange { min: 1, max: 200 }),
                 bitrate_range: Some(IntRange { min: 32, max: 4096 }),
                 profiles_supported: vec!["Main".into()],
+                encoding_interval_range: None,
             }
         );
         let jpeg = parse_options(&body, Some("JPEG"));
