@@ -1281,6 +1281,10 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// does, so it is unconditional too. `recording_policy_write_v1` says this
 /// engine serves `PUT /admin/cameras/{id}/recording-policy`, the policy-only
 /// write (SPEC-089); also unconditional.
+/// `parking_policy_v2` says this engine takes `ZoneKind::Parking` zones and a
+/// camera's `parking_policy_v2`, restarts the camera when that policy changes,
+/// and reports the tuple it runs as `parking_runtime` in the camera's stats and
+/// `parking_revision` in its config snapshot (SPEC-077); every build does.
 pub(crate) fn heartbeat_caps(
     hd_transport: Option<nexus_types::HdTransport>,
     talkdown_hw_volume: bool,
@@ -1294,6 +1298,7 @@ pub(crate) fn heartbeat_caps(
         "camera_config_snapshot_v1".to_string(),
         "recording_activity_v1".to_string(),
         "recording_policy_write_v1".to_string(),
+        "parking_policy_v2".to_string(),
     ];
     caps.extend(hd_transport.map(|t| t.cap_tag().to_string()));
     caps.extend(talkdown_hw_volume.then(|| "talkdown_hw_volume".to_string()));
@@ -2824,7 +2829,8 @@ mod health_tests {
                 "talkdown_rules",
                 "camera_config_snapshot_v1",
                 "recording_activity_v1",
-                "recording_policy_write_v1"
+                "recording_policy_write_v1",
+                "parking_policy_v2"
             ]
         );
         for t in nexus_types::HdTransport::all() {
@@ -2838,6 +2844,7 @@ mod health_tests {
                     "camera_config_snapshot_v1",
                     "recording_activity_v1",
                     "recording_policy_write_v1",
+                    "parking_policy_v2",
                     t.cap_tag()
                 ]
             );
@@ -2858,6 +2865,7 @@ mod health_tests {
                 "camera_config_snapshot_v1",
                 "recording_activity_v1",
                 "recording_policy_write_v1",
+                "parking_policy_v2",
                 "talkdown_tts"
             ]
         );
@@ -4725,7 +4733,8 @@ mod heartbeat_ack_tests {
                     "talkdown_rules",
                     "camera_config_snapshot_v1",
                     "recording_activity_v1",
-                    "recording_policy_write_v1"
+                    "recording_policy_write_v1",
+                    "parking_policy_v2"
                 ],
                 "{t}"
             );
@@ -4750,6 +4759,7 @@ mod heartbeat_ack_tests {
                 "camera_config_snapshot_v1",
                 "recording_activity_v1",
                 "recording_policy_write_v1",
+                "parking_policy_v2",
                 "hd_sfu"
             ]
         );
@@ -4773,6 +4783,7 @@ mod heartbeat_ack_tests {
                 "camera_config_snapshot_v1",
                 "recording_activity_v1",
                 "recording_policy_write_v1",
+                "parking_policy_v2",
                 "hd_moq",
             ]
         } else {
@@ -4784,6 +4795,7 @@ mod heartbeat_ack_tests {
                 "camera_config_snapshot_v1",
                 "recording_activity_v1",
                 "recording_policy_write_v1",
+                "parking_policy_v2",
             ]
         };
         assert_eq!(

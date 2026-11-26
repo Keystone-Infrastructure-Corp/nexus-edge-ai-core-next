@@ -8948,6 +8948,79 @@ mod tests {
         assert_eq!(snap["schema_version"], 1);
     }
 
+    /// SPEC-077 — `parking_policy_v2` is on the heartbeat now that both things
+    /// it promises exist: a policy change restarts the camera (the
+    /// reconciler's tests) and its `parking_runtime` receipt is reported. The
+    /// receipt and the snapshot's parking tuple keep the camera
+    /// `settings.read` mapping, and a policy save keeps `settings.write`.
+    #[tokio::test]
+    async fn parking_policy_v2_capability_has_its_receipt_snapshot_and_permissions() {
+        use nexus_cloud_client::actor_token::{EnvelopeContext, VerifiedActor};
+        assert!(crate::cloud_tunnel::heartbeat_caps(None, false, false)
+            .iter()
+            .any(|c| c == "parking_policy_v2"));
+        let actor = |perm: &str| VerifiedActor {
+            sub: "human".into(),
+            role: "viewer".into(),
+            perm: Some(perm.into()),
+            jti: "jti".into(),
+            org_id: "org".into(),
+            actor_org_id: None,
+        };
+        for path in ["/admin/cameras/7/config-snapshot", "/admin/cameras/7/stats"] {
+            let envelope = EnvelopeContext {
+                method: "GET",
+                path,
+            };
+            assert!(
+                actor("settings.read").allows_rpc(envelope, None, false),
+                "{path}"
+            );
+        }
+        let policy_save = serde_json::json!({
+            "id": 7,
+            "name": "c",
+            "url": "virtual://local",
+            "parking_lot_mode": true,
+            "parking_policy_v2": {
+                "dwell_secs": 10.0,
+                "max_speed_box_diagonals_per_sec": 0.05,
+                "max_displacement_box_diagonals": 0.1,
+                "max_observation_gap_secs": 3.0
+            },
+        })
+        .to_string();
+        let put = EnvelopeContext {
+            method: "PUT",
+            path: "/admin/cameras/7",
+        };
+        assert!(actor("settings.write").allows_rpc(put, Some(policy_save.as_bytes()), false));
+        assert!(!actor("settings.read").allows_rpc(put, Some(policy_save.as_bytes()), false));
+
+        const ADMIN_SECRET: &[u8] = b"parking-policy-v2-cap-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let id = store.list_cameras().await.unwrap()[0].id.to_string();
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let snap = read_config_snapshot(&app, &id, &token).await;
+        assert!(
+            snap["settings"]["parking"].is_object() && snap["parking_revision"].is_string(),
+            "{snap}"
+        );
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/admin/cameras/{id}/stats"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let stats: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(stats["parking_runtime"]["schema_version"], 1, "{stats}");
+    }
+
     /// SPEC-069 Phase 1 — the decode/analysis telemetry is only useful
     /// if the cloud console can actually fetch it, and the console
     /// reaches a core ONLY via `admin_proxy`'s `/admin/{tail}` rewrite.
