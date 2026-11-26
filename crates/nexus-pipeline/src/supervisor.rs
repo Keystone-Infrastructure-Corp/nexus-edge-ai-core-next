@@ -230,6 +230,8 @@ pub struct CameraHandle {
     /// SPEC-088 — the zone generation this supervisor runs, which the
     /// reconciler names when it stops it.
     pub zone_generation: u64,
+    /// SPEC-077 — the same for the parking tuple, in its own registry.
+    pub parking_generation: u64,
     /// SPEC-089 — the camera's recording controller, for a live
     /// `recording_policy` change.
     pub recording: RecordingControl,
@@ -311,6 +313,11 @@ pub fn spawn_camera(
     // generation that must acknowledge it, both fixed before the task runs.
     let zone_revision = crate::zone_application::zone_revision(&cfg.zones);
     let zone_generation = stats.zone_application().start(camera_id, &zone_revision);
+    // SPEC-077 — likewise for the zones, parking mode and policy it freezes.
+    let parking_revision = crate::zone_application::parking_revision(&cfg);
+    let parking_generation = stats
+        .parking_application()
+        .start(camera_id, &parking_revision);
     // SPEC-089 — the only owner of this generation's motion clips.
     let (recording, recording_guard) = crate::recording_controller::spawn(
         ControllerConfig {
@@ -359,6 +366,8 @@ pub fn spawn_camera(
         stop_rx,
         zone_generation,
         zone_revision,
+        parking_generation,
+        parking_revision,
         recording.clone(),
         recording_guard,
     ));
@@ -367,6 +376,7 @@ pub fn spawn_camera(
         task,
         stop,
         zone_generation,
+        parking_generation,
         recording,
     }
 }
@@ -439,6 +449,8 @@ async fn run_camera(
     mut stop: watch::Receiver<bool>,
     zone_generation: u64,
     zone_revision: String,
+    parking_generation: u64,
+    parking_revision: String,
     recording: RecordingControl,
     // Dropped however this task ends, which is what tells the controller
     // to finalize a clip this supervisor can no longer close itself.
@@ -533,6 +545,8 @@ async fn run_camera(
         let zones = cfg.zones.clone();
         // SPEC-088 — the last request this generation acknowledged.
         let mut zones_acknowledged = None;
+        // SPEC-077 — likewise in the parking registry.
+        let mut parking_acknowledged = None;
         // Phase 8.1: equipment classes the static filter should also
         // promote to anchors (captured before the annotator config moves).
         let anchor_classes = annotator_cfg.static_anchor_classes.clone();
@@ -680,6 +694,9 @@ async fn run_camera(
             let zone_request = stats
                 .zone_application()
                 .current_request(cfg.id, zone_generation);
+            let parking_request = stats
+                .parking_application()
+                .current_request(cfg.id, parking_generation);
             // Count frames the source produced that this loop never saw.
             //
             // It has to be HERE, not in the tap above: the tap drains
@@ -1427,6 +1444,19 @@ async fn run_camera(
                     );
                     zones_acknowledged = Some(request);
                 }
+                // SPEC-077 — the same frame ran the frozen parking tuple.
+                if let Some(request) =
+                    parking_request.filter(|r| parking_acknowledged != Some(*r))
+                {
+                    stats.parking_application().acknowledge(
+                        cfg.id,
+                        parking_generation,
+                        request,
+                        &parking_revision,
+                        chrono::Utc::now(),
+                    );
+                    parking_acknowledged = Some(request);
+                }
 
                 ControlFlow::Continue(())
             }
@@ -1457,16 +1487,28 @@ async fn run_camera(
         // one, nothing runs its zones any more. Said before the teardown
         // below, whose final close can wait out the recorder's drain.
         if !*stop.borrow() {
-            let registry = stats.zone_application();
-            if zones_acknowledged.is_some() {
-                registry.stop(cfg.id, zone_generation);
-            } else if let Some(request) = registry.current_request(cfg.id, zone_generation) {
-                registry.fail(
-                    cfg.id,
+            for (registry, generation, acknowledged) in [
+                (
+                    stats.zone_application(),
                     zone_generation,
-                    request,
-                    crate::zone_application::ZoneApplicationError::SupervisorExited,
-                );
+                    zones_acknowledged.is_some(),
+                ),
+                (
+                    stats.parking_application(),
+                    parking_generation,
+                    parking_acknowledged.is_some(),
+                ),
+            ] {
+                if acknowledged {
+                    registry.stop(cfg.id, generation);
+                } else if let Some(request) = registry.current_request(cfg.id, generation) {
+                    registry.fail(
+                        cfg.id,
+                        generation,
+                        request,
+                        crate::zone_application::ZoneApplicationError::SupervisorExited,
+                    );
+                }
             }
         }
 

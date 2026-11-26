@@ -19,6 +19,10 @@
 //! ([`ZoneApplicationRegistry::load_generation_floor`]). An acknowledgement
 //! says one frame was processed with the zones, not that analysis stays
 //! healthy: that is the frame stats' job.
+//!
+//! SPEC-077's `parking_runtime` is a second registry, fed the
+//! [`parking_revision`] of the same cameras at the same points, with its own
+//! generations and floor: a zone acknowledgement never certifies parking.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -26,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Utc};
-use nexus_config::ZoneConfig;
+use nexus_config::{CameraConfig, ZoneConfig};
 use nexus_types::CameraId;
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -55,6 +59,25 @@ pub fn zone_revision(zones: &[ZoneConfig]) -> String {
         *y += 0.0;
     }
     let json = serde_json::to_vec(&zones).expect("zones serialize to JSON");
+    format!("sha256:{:x}", Sha256::digest(json))
+}
+
+/// SPEC-077 — `sha256:` and the lowercase hex digest of the parking tuple a
+/// supervisor runs, as the JSON array `[zones, parking_lot_mode,
+/// parking_policy_v2]`: the zones in saved order, and the whole optional
+/// policy, `null` when absent. Nothing else about the camera moves it, its
+/// credentials included, and it never equals a [`zone_revision`].
+#[expect(
+    clippy::expect_used,
+    reason = "zones, a bool and an Option of four f64 always serialize to JSON"
+)]
+pub fn parking_revision(camera: &CameraConfig) -> String {
+    let tuple = (
+        &camera.zones,
+        camera.behavior.parking_lot_mode,
+        camera.behavior.parking_policy_v2,
+    );
+    let json = serde_json::to_vec(&tuple).expect("the parking tuple serializes to JSON");
     format!("sha256:{:x}", Sha256::digest(json))
 }
 
@@ -1292,6 +1315,200 @@ mod tests {
         assert_eq!(
             r.snapshot(7, &a, true, Instant::now()).applied_at,
             Some(at(3))
+        );
+    }
+
+    /// SPEC-077 — candidate values from the plan's calibration grid.
+    fn policy(dwell_secs: f64) -> nexus_config::ParkingPolicyV2 {
+        nexus_config::ParkingPolicyV2 {
+            dwell_secs,
+            max_speed_box_diagonals_per_sec: 0.05,
+            max_displacement_box_diagonals: 0.10,
+            max_observation_gap_secs: 3.0,
+        }
+    }
+
+    /// Camera 7 in parking-lot mode with one parking zone and `policy`, and
+    /// a credential in every field that can hold one.
+    fn parked(policy: Option<nexus_config::ParkingPolicyV2>) -> CameraConfig {
+        let mut camera: CameraConfig = serde_json::from_value(serde_json::json!({
+            "id": 7,
+            "name": "Lot",
+            "url": "rtsp://user:secret@10.0.0.5/main",
+            "analysis_url": "rtsp://user:secret@10.0.0.5/sub",
+            "enabled": true,
+            "onvif": {
+                "endpoint": "http://10.0.0.5/onvif/device_service",
+                "username": "user",
+                "password": "secret",
+            },
+            "parking_lot_mode": true,
+        }))
+        .expect("a camera");
+        camera.behavior.parking_policy_v2 = policy;
+        camera.zones = vec![ZoneConfig {
+            id: "stalls".into(),
+            name: "Stalls".into(),
+            polygon: vec![(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)],
+            kind: ZoneKind::Parking,
+            min_bbox_area_px_override: None,
+        }];
+        camera
+    }
+
+    #[test]
+    fn the_parking_revision_is_a_pinned_sha256_of_zones_mode_and_the_whole_policy() {
+        let a = parking_revision(&parked(Some(policy(10.0))));
+        assert_eq!(
+            a, "sha256:a1c92de498bfeb8b4ff149ef25c61f67199dc3729a198e4d16cc3c43b2f1afc8",
+            "the digest of [zones, true, policy] must not change across processes or releases"
+        );
+        let mut legacy = parked(None);
+        legacy.behavior.parking_lot_mode = false;
+        legacy.zones.clear();
+        assert_eq!(
+            parking_revision(&legacy),
+            "sha256:01bd28a5e805c292e92bcba504a1a3b73cac6f037b6e421c7ebd4e8ca4116c00",
+            "absence is part of the tuple: the digest of [[], false, null]"
+        );
+        assert_ne!(
+            parking_revision(&legacy),
+            zone_revision(&legacy.zones),
+            "a zone-only digest can never stand for the parking tuple"
+        );
+        assert_ne!(a, zone_revision(&parked(Some(policy(10.0))).zones));
+
+        type Edit = fn(&mut CameraConfig);
+        let moves: [(&str, Edit); 9] = [
+            ("dwell", |c| {
+                c.behavior.parking_policy_v2 = Some(policy(20.0))
+            }),
+            ("speed", |c| {
+                let mut p = policy(10.0);
+                p.max_speed_box_diagonals_per_sec = 0.02;
+                c.behavior.parking_policy_v2 = Some(p);
+            }),
+            ("displacement", |c| {
+                let mut p = policy(10.0);
+                p.max_displacement_box_diagonals = 0.20;
+                c.behavior.parking_policy_v2 = Some(p);
+            }),
+            ("gap", |c| {
+                let mut p = policy(10.0);
+                p.max_observation_gap_secs = 6.0;
+                c.behavior.parking_policy_v2 = Some(p);
+            }),
+            ("policy removed", |c| c.behavior.parking_policy_v2 = None),
+            ("mode off", |c| c.behavior.parking_lot_mode = false),
+            ("zone moved", |c| c.zones[0].polygon[0].0 = 0.2),
+            ("zone kind", |c| c.zones[0].kind = ZoneKind::Exclusion),
+            ("zone added", |c| {
+                let mut z = c.zones[0].clone();
+                z.id = "more".into();
+                c.zones.push(z);
+            }),
+        ];
+        for (what, edit) in moves {
+            let mut c = parked(Some(policy(10.0)));
+            edit(&mut c);
+            assert_ne!(parking_revision(&c), a, "{what} kept the parking revision");
+        }
+        let mut swapped = parked(Some(policy(10.0)));
+        let mut second = swapped.zones[0].clone();
+        second.id = "more".into();
+        swapped.zones.insert(0, second.clone());
+        let mut ordered = parked(Some(policy(10.0)));
+        ordered.zones.push(second);
+        assert_ne!(
+            parking_revision(&swapped),
+            parking_revision(&ordered),
+            "order counts"
+        );
+
+        let stays: [(&str, Edit); 7] = [
+            ("name", |c| c.name = "Other".into()),
+            ("url", |c| {
+                c.ingest.url = "rtsp://u2:other@10.0.0.6/main".parse().expect("a url")
+            }),
+            ("analysis url", |c| c.ingest.analysis_url = None),
+            ("onvif password", |c| {
+                c.onvif.password = Some("other".into())
+            }),
+            ("enabled", |c| c.ingest.enabled = false),
+            ("prompts", |c| c.detector.prompts = vec!["truck".into()]),
+            ("anchor ttl", |c| c.behavior.anchor_ttl_secs = Some(60)),
+        ];
+        for (what, edit) in stays {
+            let mut c = parked(Some(policy(10.0)));
+            edit(&mut c);
+            assert_eq!(parking_revision(&c), a, "{what} moved the parking revision");
+        }
+    }
+
+    /// SPEC-077 — the parking receipt is this state machine in a registry of
+    /// its own. A policy-only A→B→A leaves the zones unchanged, so the zone
+    /// receipt is applied throughout; with B's generation started and never
+    /// acknowledged, neither historical A nor B's generation can apply the A
+    /// saved again, and only a fresh A generation does.
+    #[test]
+    fn a_policy_only_a_to_b_to_a_with_b_unacknowledged_needs_a_fresh_a_generation() {
+        let (a_cam, b_cam) = (parked(Some(policy(10.0))), parked(Some(policy(20.0))));
+        let z = zone_revision(&a_cam.zones);
+        assert_eq!(
+            z,
+            zone_revision(&b_cam.zones),
+            "precondition: zones unchanged"
+        );
+        let (a, b) = (parking_revision(&a_cam), parking_revision(&b_cam));
+        let zones = ZoneApplicationRegistry::default();
+        let parking = ZoneApplicationRegistry::default();
+        let now = Instant::now();
+        // What a save, a start and a stop do: tell both registries.
+        let save = |revision: &str| {
+            zones.request(7, &z, true);
+            parking.request(7, revision, true);
+        };
+        let restart = |zg: u64, pg: u64, revision: &str| {
+            zones.stop(7, zg);
+            parking.stop(7, pg);
+            (zones.start(7, &z), parking.start(7, revision))
+        };
+
+        save(&a);
+        let (z1, p1) = (zones.start(7, &z), parking.start(7, &a));
+        let token_a = parking.current_request(7, p1).expect("p1 runs A");
+        frame(&zones, z1, &z, at(0));
+        parking.acknowledge(7, p1, token_a, &a, at(0));
+        assert_eq!(read(&parking, &a, now).4, Applied);
+
+        save(&b);
+        assert_eq!(
+            (read(&zones, &z, now).4, read(&parking, &b, now).4),
+            (Applied, Applying),
+            "a policy-only save left parking applied, or took the zones' verdict"
+        );
+        let (z2, p2) = restart(z1, p1, &b);
+        let token_b = parking.current_request(7, p2).expect("p2 runs B");
+        frame(&zones, z2, &z, at(1));
+        save(&a);
+        assert_eq!(read(&zones, &z, now).4, Applied, "precondition");
+        let pending = (a.clone(), Some(a.clone()), p2, Some(p1), Applying, None);
+        assert_eq!(
+            read(&parking, &a, now),
+            pending,
+            "the zone receipt or historical A/p1 certified parking A"
+        );
+        parking.acknowledge(7, p1, token_a, &a, at(2));
+        parking.acknowledge(7, p2, token_b, &b, at(2));
+        parking.fail(7, p1, token_a, SupervisorExited);
+        assert_eq!(read(&parking, &a, now), pending, "a stale callback counted");
+
+        let (_, p3) = restart(z2, p2, &a);
+        assert!(p3 > p2 && p2 > p1);
+        frame(&parking, p3, &a, at(3));
+        assert_eq!(
+            read(&parking, &a, now),
+            (a.clone(), Some(a.clone()), p3, Some(p3), Applied, None)
         );
     }
 

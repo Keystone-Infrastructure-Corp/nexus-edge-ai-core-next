@@ -89,6 +89,8 @@ pub struct RunningCameraEntry {
     /// SPEC-088 — the supervisor's zone generation, which [`stop_camera`]
     /// names when it stops it.
     zone_generation: u64,
+    /// SPEC-077 — likewise in the parking registry.
+    parking_generation: u64,
     /// SPEC-089 — the camera's recording controller, which takes a
     /// `recording_policy` change without a restart ([`apply_recording_policy`]).
     recording: nexus_pipeline::recording_controller::RecordingControl,
@@ -606,6 +608,7 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
 ///     whose ingest URL has changed, or whose supervisor has exited.
 async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
     let zone_application = args.frame_stats.zone_application();
+    let parking_application = args.frame_stats.parking_application();
     // SPEC-088 — no save commits between this read and its requests below.
     let reading = zone_application.saves().read().await;
     let (live, unreadable) = args.store.list_readable_cameras().await?;
@@ -628,6 +631,11 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
         zone_application.request(
             cam.id,
             &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+            cam.ingest.enabled,
+        );
+        parking_application.request(
+            cam.id,
+            &nexus_pipeline::zone_application::parking_revision(cam),
             cam.ingest.enabled,
         );
     }
@@ -654,6 +662,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             // for comparison; one that is gone has nothing left to report.
             if !live.iter().any(|c| c.id == id) {
                 zone_application.remove(id);
+                parking_application.remove(id);
             }
         }
     }
@@ -667,7 +676,8 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             Some(entry)
                 if entry.key == want
                     && !entry.task.is_finished()
-                    && zone_application.runs(cam_id, entry.zone_generation) =>
+                    && zone_application.runs(cam_id, entry.zone_generation)
+                    && parking_application.runs(cam_id, entry.parking_generation) =>
             {
                 // No change — supervisor still alive, URL still the
                 // same, supervisor dims still match, ingest codec
@@ -797,12 +807,13 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
             entry.stop.clone(),
             entry.task.clone(),
             entry.zone_generation,
+            entry.parking_generation,
         )
     });
     // Only an earlier pass that could not finish the stop left a stop request
     // behind in the map: look again, without waiting.
     let mut recheck = false;
-    if let Some((stop, task, zone_generation)) = stopping {
+    if let Some((stop, task, zone_generation, parking_generation)) = stopping {
         recheck = *stop.borrow();
         let ended = if recheck {
             // Every receiver gone, not just the supervisor's: its recording
@@ -813,6 +824,9 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
             args.frame_stats
                 .zone_application()
                 .stop(cam_id, zone_generation);
+            args.frame_stats
+                .parking_application()
+                .stop(cam_id, parking_generation);
             // Stop, not abort: a stop lets the supervisor finish its frame, and
             // its recording controller closes the open motion clip (BUG-285).
             // The receivers drop when `run_camera` returns and the controller
@@ -1343,6 +1357,7 @@ pub(crate) fn spawn_supervisor(
         key: start.key,
         sessions: start.sessions,
         zone_generation: handle.zone_generation,
+        parking_generation: handle.parking_generation,
         recording: handle.recording,
     }
 }
@@ -1355,7 +1370,7 @@ mod tests {
         RecorderKind, TileGridConfig, ZoneKind,
     };
     use nexus_pipeline::zone_application::{
-        zone_revision, ZoneApplicationError, ZoneApplicationState, ZonesRuntime,
+        parking_revision, zone_revision, ZoneApplicationError, ZoneApplicationState, ZonesRuntime,
         APPLICATION_TIMEOUT,
     };
     use nexus_pipeline::{ClipFinal, ClipHandle, ClipMeta, OpenClip, RecorderError};
@@ -3397,14 +3412,19 @@ mod tests {
             .snapshot(7, desired, true, std::time::Instant::now())
     }
 
-    /// What the API's camera save does: persist, then tell the registry,
-    /// under the registry's save lock.
+    /// What the API's camera save does: persist, then tell both registries,
+    /// under the zone registry's save lock.
     async fn save(args: &ReconcilerArgs, camera: &CameraConfig) {
         let _saving = args.frame_stats.zone_application().saves().write().await;
         args.store.upsert_camera(camera).await.expect("save camera");
         args.frame_stats.zone_application().request(
             camera.id,
             &zone_revision(&camera.zones),
+            camera.ingest.enabled,
+        );
+        args.frame_stats.parking_application().request(
+            camera.id,
+            &parking_revision(camera),
             camera.ingest.enabled,
         );
     }
@@ -3647,12 +3667,14 @@ mod tests {
     /// began, never one saved while it was being processed. A→B→A saved
     /// while a frame of the generation that applied A is in its detector is
     /// a new request for A: that frame must not certify it; the next does.
+    /// SPEC-077 — the same holds for the parking tuple's request.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_save_landing_mid_frame_is_acknowledged_only_by_a_later_frame() {
         let dir = tempfile::tempdir().expect("tempdir");
         let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
         let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
         let a = zone_revision(&[]);
+        let pa = parking_revision(&cam(None));
         let mut b_cam = cam(None);
         b_cam.zones.push(corner());
         let detector = Arc::new(GatedDetector {
@@ -3669,28 +3691,32 @@ mod tests {
         detector.gate.add_permits(1);
         // The loop is sequential: frame 2 in the detector means frame 1 is done.
         wait_until("frame 2 is in the detector", in_detector(2)).await;
-        let before = status(&args, &a);
+        let before = (status(&args, &a), parking(&args, &pa));
         save(&args, &b_cam).await;
         save(&args, &cam(None)).await;
         detector.gate.add_permits(1);
         wait_until("frame 3 is in the detector", in_detector(3)).await;
-        let after_frame_2 = status(&args, &a);
+        let after_frame_2 = (status(&args, &a), parking(&args, &pa));
         detector.gate.add_permits(1 << 16);
         wait_until("a later frame applied the new request for A", || {
             status(&args, &a).state == ZoneApplicationState::Applied
+                && parking(&args, &pa).state == ZoneApplicationState::Applied
         })
         .await;
         let _ = handle.stop.send(true);
         handle.task.await.expect("supervisor stops");
 
         assert_eq!(
-            before.state,
-            ZoneApplicationState::Applied,
+            (before.0.state, before.1.state),
+            (ZoneApplicationState::Applied, ZoneApplicationState::Applied),
             "precondition: frame 1 applied A"
         );
         assert_eq!(
-            after_frame_2.state,
-            ZoneApplicationState::Applying,
+            (after_frame_2.0.state, after_frame_2.1.state),
+            (
+                ZoneApplicationState::Applying,
+                ZoneApplicationState::Applying
+            ),
             "the frame in flight when A→B→A was saved acknowledged that newer request"
         );
     }
@@ -4203,6 +4229,470 @@ mod tests {
         );
     }
 
+    /// SPEC-077 — camera 7 in parking-lot mode, with one parking zone over
+    /// the corner and `policy`.
+    fn parked(policy: Option<ParkingPolicyV2>) -> CameraConfig {
+        let mut camera = cam(None);
+        camera.behavior.parking_lot_mode = true;
+        camera.behavior.parking_policy_v2 = policy;
+        camera.zones = vec![ZoneConfig {
+            kind: ZoneKind::Parking,
+            ..corner()
+        }];
+        camera
+    }
+
+    /// A second candidate policy, differing from [`parking_policy`] only in
+    /// its dwell, so A and B have the same zones.
+    fn policy_b() -> ParkingPolicyV2 {
+        ParkingPolicyV2 {
+            dwell_secs: 20.0,
+            ..parking_policy()
+        }
+    }
+
+    /// Camera 7's parking status, enabled with `desired` saved, read now.
+    fn parking(args: &ReconcilerArgs, desired: &str) -> ZonesRuntime {
+        args.frame_stats
+            .parking_application()
+            .snapshot(7, desired, true, std::time::Instant::now())
+    }
+
+    /// Camera `id`'s parking status as the stats read builds it: the parking
+    /// tuple and enabled flag saved now against what its generations
+    /// acknowledged.
+    async fn parking_status(
+        args: &ReconcilerArgs,
+        id: CameraId,
+        now: std::time::Instant,
+    ) -> Option<ZonesRuntime> {
+        let (cameras, _) = args
+            .store
+            .list_readable_cameras()
+            .await
+            .expect("read cameras");
+        let saved = cameras.into_iter().find(|c| c.id == id)?;
+        Some(args.frame_stats.parking_application().snapshot(
+            id,
+            &parking_revision(&saved),
+            saved.ingest.enabled,
+            now,
+        ))
+    }
+
+    /// SPEC-077 — a policy-only save, read before the pass that restarts the
+    /// camera, reads parking applying with the saved tuple while the zone
+    /// receipt, whose zones did not change, still reads applied: that zone
+    /// success certifies nothing about parking. Only the restarted
+    /// generation's frame applies the policy, and the old generation's late
+    /// acknowledgement counts for nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_only_save_reads_parking_applying_until_its_generation_processes_a_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let (a_cam, b_cam) = (parked(Some(parking_policy())), parked(Some(policy_b())));
+        let args = reconciler_args(recorder, dir.path(), std::slice::from_ref(&a_cam)).await;
+        let registry = args.frame_stats.parking_application();
+        let (a, b) = (parking_revision(&a_cam), parking_revision(&b_cam));
+        assert_eq!(zone_revision(&a_cam.zones), zone_revision(&b_cam.zones));
+
+        reconcile(&args).await.expect("first pass");
+        wait_until("the first generation applied parking A", || {
+            parking(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let p1 = parking(&args, &a).generation;
+        let first_request = registry
+            .current_request(7, p1)
+            .expect("the first generation runs A");
+
+        args.store
+            .upsert_camera(&b_cam)
+            .await
+            .expect("save policy B");
+        let now = std::time::Instant::now();
+        let saved = parking_status(&args, 7, now).await.expect("reported");
+        let zones = zones_status(&args, 7, now).await.expect("reported");
+        reconcile(&args).await.expect("pass after the save");
+        wait_until("the restarted generation applied parking B", || {
+            parking(&args, &b).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let applied = parking(&args, &b);
+        registry.acknowledge(7, p1, first_request, &a, STALE);
+        let after_stale = parking(&args, &b);
+        abort_all(&args.handles);
+
+        assert_eq!(
+            zones.state,
+            ZoneApplicationState::Applied,
+            "precondition: the zone receipt is unchanged by a policy-only save"
+        );
+        assert_eq!(
+            (
+                saved.desired_revision,
+                saved.applied_revision,
+                saved.generation,
+                saved.state
+            ),
+            (b.clone(), Some(a), p1, ZoneApplicationState::Applying),
+            "a read after a policy-only save kept the old parking verdict"
+        );
+        assert_eq!(
+            after_stale, applied,
+            "a stopped generation's late acknowledgement counted"
+        );
+        assert!(applied.generation > p1, "the restart is a new generation");
+        assert_eq!(
+            (applied.applied_revision, applied.applied_generation),
+            (Some(b), Some(applied.generation))
+        );
+    }
+
+    /// SPEC-077 — a policy-only A→B→A through restarts: while the generation
+    /// started for B is current, acknowledged or not, A saved again cannot be
+    /// applied by A's earlier generation or B's, and a matching historical
+    /// digest is no success. Only the replacement A generation applies it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_only_a_to_b_to_a_through_restarts_is_applied_only_by_the_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let (a_cam, b_cam) = (parked(Some(parking_policy())), parked(Some(policy_b())));
+        let args = reconciler_args(recorder, dir.path(), std::slice::from_ref(&a_cam)).await;
+        let registry = args.frame_stats.parking_application();
+        let (a, b) = (parking_revision(&a_cam), parking_revision(&b_cam));
+        reconcile(&args).await.expect("first pass");
+        wait_until("p1 applied A", || {
+            parking(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let p1 = parking(&args, &a).generation;
+        let token_a = registry.current_request(7, p1).expect("p1 runs A");
+
+        save(&args, &b_cam).await;
+        reconcile(&args).await.expect("pass that starts B");
+        let p2 = parking(&args, &b).generation;
+        let token_b = registry.current_request(7, p2).expect("p2 runs B");
+        save(&args, &a_cam).await;
+        let requested = parking(&args, &a);
+        registry.acknowledge(7, p1, token_a, &a, STALE);
+        registry.acknowledge(7, p2, token_b, &b, STALE);
+        let after_stale = parking(&args, &a);
+        reconcile(&args).await.expect("pass that starts A again");
+        let p3 = parking(&args, &a).generation;
+        wait_until("p3 applied A", || {
+            parking(&args, &a).applied_generation == Some(p3)
+        })
+        .await;
+        let applied = parking(&args, &a);
+        registry.acknowledge(7, p1, token_a, &a, STALE);
+        registry.acknowledge(7, p2, token_b, &b, STALE);
+        registry.fail(7, p1, token_a, ZoneApplicationError::SupervisorExited);
+        registry.fail(7, p2, token_b, ZoneApplicationError::SupervisorExited);
+        let after_late = parking(&args, &a);
+        abort_all(&args.handles);
+
+        assert!(p3 > p2 && p2 > p1);
+        assert_eq!(
+            (
+                &requested.desired_revision,
+                requested.generation,
+                requested.state
+            ),
+            (&a, p2, ZoneApplicationState::Applying),
+            "A saved again read applied while B's generation runs: {requested:?}"
+        );
+        assert_eq!(
+            after_stale, requested,
+            "A/p1 or B/p2 acknowledged the new A request"
+        );
+        assert_eq!(
+            (
+                applied.applied_revision.as_deref(),
+                applied.generation,
+                applied.state
+            ),
+            (Some(a.as_str()), p3, ZoneApplicationState::Applied)
+        );
+        assert_eq!(
+            after_late, applied,
+            "an earlier generation's late callback counted"
+        );
+    }
+
+    /// SPEC-077 — a restart with the same parking tuple applies nothing
+    /// until the new generation processes a frame of its own, and the old
+    /// generation's late callbacks count for nothing afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_same_policy_restart_reads_parking_applying_until_the_new_generation_acknowledges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let a_cam = parked(Some(parking_policy()));
+        let args = reconciler_args(recorder, dir.path(), std::slice::from_ref(&a_cam)).await;
+        let registry = args.frame_stats.parking_application();
+        let a = parking_revision(&a_cam);
+        reconcile(&args).await.expect("first pass");
+        wait_until("p1 applied A", || {
+            parking(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let p1 = parking(&args, &a).generation;
+        let stale = registry.current_request(7, p1).expect("p1 runs A");
+
+        assert!(stop_camera(&args, 7).await, "the supervisor stops");
+        let stopped = parking(&args, &a);
+        registry.acknowledge(7, p1, stale, &a, STALE);
+        let after_stale = parking(&args, &a);
+        reconcile(&args).await.expect("pass that restarts it");
+        let p2 = parking(&args, &a).generation;
+        wait_until("p2 applied A", || {
+            parking(&args, &a).applied_generation == Some(p2)
+        })
+        .await;
+        let applied = parking(&args, &a);
+        registry.acknowledge(7, p1, stale, &a, STALE);
+        registry.fail(7, p1, stale, ZoneApplicationError::SupervisorExited);
+        let after_late = parking(&args, &a);
+        abort_all(&args.handles);
+
+        assert_eq!(
+            (
+                stopped.applied_revision.as_deref(),
+                stopped.generation,
+                stopped.applied_generation,
+                stopped.state
+            ),
+            (
+                Some(a.as_str()),
+                p1,
+                Some(p1),
+                ZoneApplicationState::Applying
+            ),
+            "a stopped generation still read applied"
+        );
+        assert_eq!(after_stale, stopped);
+        assert!(p2 > p1, "the restart is a new generation");
+        assert_eq!(applied.state, ZoneApplicationState::Applied);
+        assert_eq!(
+            after_late, applied,
+            "the old generation's late callbacks counted"
+        );
+    }
+
+    /// SPEC-077 — a disabled parking camera reads inactive at once, with no
+    /// deadline and no late callback able to change it; a policy saved while
+    /// disabled moves desired and starts nothing; enabling reads applying
+    /// until a fresh generation acknowledges.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disabled_parking_camera_reads_inactive_and_enabling_needs_a_fresh_acknowledgement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let (a_cam, b_cam) = (parked(Some(parking_policy())), parked(Some(policy_b())));
+        let args = reconciler_args(recorder, dir.path(), std::slice::from_ref(&a_cam)).await;
+        let registry = args.frame_stats.parking_application();
+        let (a, b) = (parking_revision(&a_cam), parking_revision(&b_cam));
+        let later = || std::time::Instant::now() + 2 * APPLICATION_TIMEOUT;
+        let read = |s: ZonesRuntime| {
+            (
+                s.desired_revision,
+                s.applied_revision,
+                s.generation,
+                s.applied_generation,
+                s.state,
+                s.error_code,
+            )
+        };
+        reconcile(&args).await.expect("first pass");
+        wait_until("p1 applied A", || {
+            parking(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let p1 = parking(&args, &a).generation;
+        let token = registry.current_request(7, p1).expect("p1 runs A");
+        let inactive_a = (
+            a.clone(),
+            Some(a.clone()),
+            p1,
+            Some(p1),
+            ZoneApplicationState::Inactive,
+            None,
+        );
+
+        let mut disabled = a_cam.clone();
+        disabled.ingest.enabled = false;
+        args.store.upsert_camera(&disabled).await.expect("disable");
+        let at_once = parking_status(&args, 7, std::time::Instant::now()).await;
+        registry.acknowledge(7, p1, token, &a, STALE);
+        registry.fail(7, p1, token, ZoneApplicationError::SupervisorExited);
+        let after_late = parking_status(&args, 7, std::time::Instant::now()).await;
+        reconcile(&args).await.expect("pass after the disable");
+        let stopped = !args.handles.lock().contains_key(&7);
+        let long_after = parking_status(&args, 7, later()).await;
+
+        let mut disabled_b = b_cam.clone();
+        disabled_b.ingest.enabled = false;
+        save(&args, &disabled_b).await;
+        reconcile(&args)
+            .await
+            .expect("pass after a save while disabled");
+        let started = args.handles.lock().contains_key(&7);
+        let saved_disabled = parking_status(&args, 7, later()).await;
+
+        save(&args, &b_cam).await;
+        let enabled = parking_status(&args, 7, std::time::Instant::now()).await;
+        reconcile(&args).await.expect("pass after the enable");
+        let p2 = parking(&args, &b).generation;
+        wait_until("p2 applied B", || {
+            parking(&args, &b).applied_generation == Some(p2)
+        })
+        .await;
+        let applied = parking_status(&args, 7, std::time::Instant::now()).await;
+        abort_all(&args.handles);
+
+        assert_eq!(at_once.map(read), Some(inactive_a.clone()));
+        assert_eq!(
+            after_late.map(read),
+            Some(inactive_a.clone()),
+            "a late callback counted"
+        );
+        assert!(stopped, "the disabled camera still runs");
+        assert_eq!(
+            long_after.map(read),
+            Some(inactive_a),
+            "inactive is not timed out"
+        );
+        assert!(!started, "a save while disabled started a generation");
+        assert_eq!(
+            saved_disabled.map(read),
+            Some((
+                b.clone(),
+                Some(a.clone()),
+                p1,
+                Some(p1),
+                ZoneApplicationState::Inactive,
+                None
+            ))
+        );
+        assert_eq!(
+            enabled.map(|s| (s.state, s.error_code)),
+            Some((ZoneApplicationState::Applying, None)),
+            "an enable read applied or failed before any generation ran B"
+        );
+        assert!(p2 > p1);
+        assert_eq!(
+            applied.map(|s| (s.applied_revision, s.state)),
+            Some((Some(b), ZoneApplicationState::Applied))
+        );
+    }
+
+    /// SPEC-077 — a supervisor that applied its parking tuple and then ends
+    /// on its own runs it no more: applying, then failed once the timeout
+    /// passes with no replacement, and the replacement recovers it. One that
+    /// ends before its first frame reads failed at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parking_supervisor_that_ends_reads_failed_until_its_replacement_recovers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::EndsOnce)]);
+        let a_cam = parked(Some(parking_policy()));
+        let args = reconciler_args(recorder, dir.path(), std::slice::from_ref(&a_cam)).await;
+        let a = parking_revision(&a_cam);
+
+        reconcile(&args).await.expect("first pass");
+        wait_until("the supervisor ended", || {
+            supervisor_ended(&args.handles, 7)
+        })
+        .await;
+        let ended = std::time::Instant::now();
+        let exited = parking_status(&args, 7, ended).await.expect("reported");
+        let late = parking_status(&args, 7, ended + APPLICATION_TIMEOUT)
+            .await
+            .expect("reported");
+        reconcile(&args).await.expect("pass that restarts it");
+        wait_until("the replacement applied parking", || {
+            let s = parking(&args, &a);
+            s.state == ZoneApplicationState::Applied && s.generation > exited.generation
+        })
+        .await;
+        abort_all(&args.handles);
+
+        assert_eq!(
+            (exited.applied_revision, exited.state, exited.error_code),
+            (Some(a), ZoneApplicationState::Applying, None),
+            "a supervisor that applied parking and ended on its own still reads applied"
+        );
+        assert_eq!(
+            (late.state, late.error_code),
+            (
+                ZoneApplicationState::Failed,
+                Some(ZoneApplicationError::ApplicationTimeout)
+            )
+        );
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NoFrames)]);
+        let args = reconciler_args(recorder, dir.path(), &[a_cam]).await;
+        reconcile(&args).await.expect("first pass");
+        wait_until("the supervisor ended", || {
+            supervisor_ended(&args.handles, 7)
+        })
+        .await;
+        let s = parking_status(&args, 7, std::time::Instant::now())
+            .await
+            .expect("reported");
+        abort_all(&args.handles);
+        assert_eq!(
+            (s.state, s.error_code),
+            (
+                ZoneApplicationState::Failed,
+                Some(ZoneApplicationError::SupervisorExited)
+            )
+        );
+    }
+
+    /// SPEC-077 — a legacy camera with no v2 has a parking receipt too, of
+    /// its tuple with the policy explicitly absent, and its generation
+    /// applies it. Turning `parking_lot_mode` on, with no parking zone or v2,
+    /// changes no zone but is a new parking tuple, which only the restarted
+    /// generation applies.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_legacy_camera_reports_and_applies_its_parking_tuple() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let legacy = cam(None);
+        let args = reconciler_args(recorder, dir.path(), std::slice::from_ref(&legacy)).await;
+        let mut mode_on = legacy.clone();
+        mode_on.behavior.parking_lot_mode = true;
+        let (off, on) = (parking_revision(&legacy), parking_revision(&mode_on));
+        assert_ne!(off, on);
+        reconcile(&args).await.expect("first pass");
+        wait_until("the legacy camera applied its parking tuple", || {
+            parking(&args, &off).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let p1 = parking(&args, &off).generation;
+
+        save(&args, &mode_on).await;
+        let now = std::time::Instant::now();
+        let saved = parking_status(&args, 7, now).await.expect("reported");
+        let zones = zones_status(&args, 7, now).await.expect("reported");
+        reconcile(&args).await.expect("pass after the mode save");
+        wait_until("the restarted generation applied mode on", || {
+            parking(&args, &on).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let applied = parking(&args, &on);
+        abort_all(&args.handles);
+
+        assert_eq!(zones.state, ZoneApplicationState::Applied, "precondition");
+        assert_eq!(
+            (saved.desired_revision, saved.state),
+            (on.clone(), ZoneApplicationState::Applying),
+            "the zone receipt's success certified a new parking mode"
+        );
+        assert!(applied.generation > p1);
+        assert_eq!(applied.applied_revision, Some(on));
+    }
+
     /// What [`GatedOpenRecorder`] saw, in the order it saw it.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum GateCall {
@@ -4460,6 +4950,7 @@ mod tests {
                 analysis: None,
             },
             zone_generation: 0,
+            parking_generation: 0,
             recording: nexus_pipeline::recording_controller::RecordingControl {
                 tx: tokio::sync::mpsc::channel(1).0,
                 generation: 0,
