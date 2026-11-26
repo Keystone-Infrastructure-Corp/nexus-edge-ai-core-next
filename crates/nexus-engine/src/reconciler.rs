@@ -773,10 +773,10 @@ const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_s
 
 /// Whether the camera's supervisor has ended, the recorder work it left is
 /// done and its camera was torn down. `false` means the camera is still
-/// stopping: its supervisor outlived its abort, or the recorder has not
-/// drained the camera. It stays in the map, nothing else is torn down, and
-/// the caller must not start a replacement; a later pass checks on it again
-/// without waiting.
+/// stopping: its supervisor (or the recording controller finalizing its
+/// clip) outlived its abort, or the recorder has not drained the camera. It
+/// stays in the map, nothing else is torn down, and the caller must not
+/// start a replacement; a later pass checks on it again without waiting.
 async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
     // The entry stays in the map until the supervisor has ended and the
     // recorder has drained the camera. Shutdown (`main.rs`) aborts the
@@ -800,7 +800,9 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
     if let Some((stop, task, zone_generation)) = stopping {
         recheck = *stop.borrow();
         let ended = if recheck {
-            task.is_finished()
+            // Every receiver gone, not just the supervisor's: its recording
+            // controller can outlive it inside the final close (SPEC-089).
+            stop.is_closed()
         } else {
             // From here on the generation's zones no longer count as applied.
             args.frame_stats
@@ -842,8 +844,8 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
             // and start a second one for the camera beside it.
             warn!(
                 camera_id = cam_id,
-                "camera reconciler: aborted supervisor is still running; keeping it tracked \
-                 and not restarting the camera until it ends"
+                "camera reconciler: aborted supervisor or its recording controller is still \
+                 running; keeping it tracked and not restarting the camera until it ends"
             );
             return false;
         }
@@ -2386,9 +2388,11 @@ mod tests {
     /// SPEC-088 review 9 — the pass that finds an ended supervisor's
     /// generation no longer running can come while that supervisor's final
     /// close is still pending. It stops the camera the long way: it waits
-    /// out [`SUPERVISOR_STOP_TIMEOUT`], aborts the supervisor inside its
-    /// close and drains the camera. Until the drain succeeds no replacement
-    /// starts and A never reads applied.
+    /// out [`SUPERVISOR_STOP_TIMEOUT`], aborts the supervisor and waits out
+    /// the close, which the camera's recording controller still owns
+    /// (SPEC-089). Until that close completes and a drain succeeds no pass
+    /// starts a replacement, a later one that looks again included, and A
+    /// never reads applied.
     #[tokio::test]
     async fn a_pass_during_a_pending_final_close_aborts_and_drains_before_replacing() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2418,8 +2422,6 @@ mod tests {
             recorder.calls_of(7) == [ClipCall::Open(1), ClipCall::Close(1)]
         })
         .await;
-        // The first drain does not finish within its bound.
-        recorder.drains.lock().push_back(Drain::Stalls);
 
         // Both bounds elapse on the paused clock; every virtual second the
         // test records what the camera reads as. The clock pauses only once
@@ -2447,6 +2449,11 @@ mod tests {
             .expect("pass task")
             .expect("pass during the pending close");
         tokio::time::resume();
+        // Looks again without waiting, with the supervisor gone and its
+        // controller still inside the close.
+        reconcile(&args)
+            .await
+            .expect("pass while the close is still pending");
         let aborted_and_kept = original.task.is_finished() && is_original(&args.handles);
         let before_drain = recorder.calls_of(7);
         recorder
@@ -2454,6 +2461,10 @@ mod tests {
             .as_ref()
             .expect("closes are gated")
             .add_permits(1 << 16);
+        wait_until("the recording controller finished the close", || {
+            original.stop.is_closed()
+        })
+        .await;
         reconcile(&args).await.expect("pass whose drain succeeds");
         wait_until("the replacement applied A", || {
             let s = status(&args, &a);
@@ -2465,7 +2476,7 @@ mod tests {
 
         assert!(
             waited >= SUPERVISOR_STOP_TIMEOUT * 2,
-            "the pass did not wait out the stop and then the drain: {waited:?}"
+            "the pass did not wait out the stop and then the pending close: {waited:?}"
         );
         assert!(
             aborted_and_kept,
