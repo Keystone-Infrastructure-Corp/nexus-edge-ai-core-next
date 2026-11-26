@@ -712,6 +712,14 @@ async fn a_passing_car_is_alerted_once_and_takes_no_anchor() {
     }
     assert_eq!(o.fired("any_vehicle"), vec![0, 0, passing]);
     assert_eq!(o.fired("lingering_vehicle"), vec![first_at(&times, 16_000)]);
+    // The parked cars' post-roll would close the clip at 15 870 ms; the
+    // passer keeps it open for its whole pass.
+    assert_eq!(o.clips, vec![(0, None)]);
+    assert_eq!(
+        o.motion_at(MotionEventKind::Born),
+        vec![0, 0, times[passing]]
+    );
+    assert_eq!(o.motion_at(MotionEventKind::Died), vec![5_520, 5_520]);
     assert_eq!(o.anchors, vec![(102.4, 86.4), (102.4, 201.6)]);
 }
 
@@ -778,6 +786,11 @@ async fn a_reused_track_id_inherits_no_parked_verdict_or_anchor() {
         }
     }
     assert_eq!(o.fired("any_vehicle"), vec![0, gone + 1]);
+    // The reused id is born again and keeps the clip open past the parked
+    // car's post-roll (15 870 ms).
+    assert_eq!(o.clips, vec![(0, None)]);
+    assert_eq!(o.motion_at(MotionEventKind::Born), vec![0, times[gone + 1]]);
+    assert_eq!(o.motion_at(MotionEventKind::Died), vec![5_520]);
     assert_eq!(
         o.anchors,
         vec![(128.0, 144.0)],
@@ -844,6 +857,15 @@ async fn a_resized_stream_starts_every_dwell_over() {
         assert_eq!(o.static_at(k, 0.25, 0.5), want, "{ms} ms");
     }
     assert_eq!(o.fired("any_vehicle"), vec![0, resized]);
+    // The resize gives birth to the car's new box, and to its old one, which
+    // the tracker coasts and v2 never hides; that keeps the clip open. The
+    // new box dies at its own dwell.
+    assert_eq!(o.clips, vec![(0, None)]);
+    assert_eq!(
+        o.motion_at(MotionEventKind::Born),
+        vec![0, times[resized], times[resized]]
+    );
+    assert_eq!(o.motion_at(MotionEventKind::Died), vec![5_520, 15_870]);
     assert_eq!(
         o.anchors,
         vec![(128.0, 144.0), (256.0, 288.0)],
@@ -864,6 +886,8 @@ async fn a_removed_parking_zone_hides_nothing_and_its_anchor_expires() {
     let o = run(s, dir.path()).await;
     let last = first.len() - 1;
     assert!(o.static_at(last, 0.12, 0.5) && o.static_at(last, 0.37, 0.5));
+    assert_eq!(o.clips, vec![(0, None)]);
+    assert_eq!(o.motion_at(MotionEventKind::Died), vec![5_520, 5_520]);
     assert_eq!(o.anchors.len(), 2);
 
     let second = every(690, 12_000, 50_000);
@@ -879,6 +903,17 @@ async fn a_removed_parking_zone_hides_nothing_and_its_anchor_expires() {
     assert_eq!(
         o.fired("lingering_vehicle"),
         vec![first_at(&second, 20_000)]
+    );
+    // The car in zone b is recorded throughout; only zone a's car dies.
+    assert_eq!(o.clips, vec![(12_000, None)]);
+    assert_eq!(
+        o.motion_at(MotionEventKind::Born),
+        vec![0, 0, 12_000, 12_000],
+        "both generations' rows"
+    );
+    assert_eq!(
+        o.motion_at(MotionEventKind::Died),
+        vec![5_520, 5_520, 17_520]
     );
     assert_eq!(o.anchors, vec![(61.44, 144.0)], "zone b's anchor expired");
 }
