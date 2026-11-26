@@ -141,7 +141,8 @@ struct Inner {
     /// supervisor even across a camera's deletion and re-creation.
     last_generation: u64,
     /// The floor file and the highest generation it covers: none above that
-    /// is handed out before a higher floor is written. `None` until
+    /// is handed out before a higher floor is written, or failed to be
+    /// ([`reserve`]). `None` until
     /// [`ZoneApplicationRegistry::load_generation_floor`].
     floor: Option<(PathBuf, u64)>,
     last_request: u64,
@@ -195,8 +196,7 @@ impl Inner {
 fn next_generation(last: &mut u64, floor: &mut Option<(PathBuf, u64)>) -> u64 {
     *last += 1;
     if let Some((path, reserved)) = floor.as_mut().filter(|(_, r)| *last > *r) {
-        *reserved += FLOOR_BLOCK;
-        persist_floor(path, *reserved);
+        reserve(path, reserved, *last - 1 + FLOOR_BLOCK);
     }
     *last
 }
@@ -212,23 +212,32 @@ const FLOOR_BLOCK: u64 = 1 << 20;
 /// Write `floor` to `path` through a synced temp file, a rename and a synced
 /// directory, so a crash or power loss leaves the old floor or the new one.
 fn write_floor(path: &Path, floor: u64) -> std::io::Result<()> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    // A fresh install's state directory may not exist yet: bootstrap creates
+    // it only for an admin secret it generates.
+    if let Some(dir) = dir {
+        std::fs::create_dir_all(dir)?;
+    }
     let tmp = path.with_extension("tmp");
     let mut f = std::fs::File::create(&tmp)?;
     f.write_all(format!("{floor}\n").as_bytes())?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)?;
-    match path.parent().filter(|d| !d.as_os_str().is_empty()) {
+    match dir {
         Some(dir) => std::fs::File::open(dir)?.sync_all(),
         None => Ok(()),
     }
 }
 
-/// [`write_floor`], failing open (R6): the floor only guards the next boot,
-/// so this process keeps handing out rising generations either way.
-fn persist_floor(path: &Path, floor: u64) {
-    if let Err(e) = write_floor(path, floor) {
-        warn!(path = %path.display(), error = %e,
-            "could not persist the zone generation floor; a restart with the clock set back may read stale");
+/// Persist `floor` to `path`, and only then record it as `reserved`. On a
+/// failure the previous reservation stays, so the next start tries again,
+/// and this process keeps handing out rising generations (fail open, R6):
+/// the floor only guards the next boot.
+fn reserve(path: &Path, reserved: &mut u64, floor: u64) {
+    match write_floor(path, floor) {
+        Ok(()) => *reserved = floor,
+        Err(e) => warn!(path = %path.display(), error = %e,
+            "could not persist the zone generation floor; a restart with the clock set back may read stale"),
     }
 }
 
@@ -279,27 +288,38 @@ impl ZoneApplicationRegistry {
 
     /// Keep generations above every earlier boot's, whatever the wall clock
     /// did: start above the floor in `floor_file` (or the clock seed, if
-    /// higher), and persist a new floor a block higher before handing out any
-    /// generation. Call before the first [`Self::start`]. A missing or corrupt
-    /// file falls back to the clock seed and is rewritten. Remaining
-    /// assumptions: the file survives restarts, or the clock does not step
-    /// back across them ([`Self::booted_at`]); and the floor stays below the
-    /// JSON-safe seed cap, which takes billions of restarts or a clock past
-    /// 2255.
+    /// higher), and persist a new floor a block higher, its directory created
+    /// if missing, before handing out any generation; until one is persisted,
+    /// every start tries again. Call before the first [`Self::start`]. A
+    /// missing or corrupt file falls back to the clock seed and is rewritten.
+    /// Remaining assumptions: the file survives restarts, or the clock does
+    /// not step back across them ([`Self::booted_at`]); and the floor stays
+    /// below the JSON-safe seed cap, which takes billions of restarts or a
+    /// clock past 2255.
     pub fn load_generation_floor(&self, floor_file: PathBuf) {
         let mut inner = self.inner.lock();
-        match std::fs::read_to_string(&floor_file).map(|s| s.trim().parse::<u64>()) {
-            // Capped like the clock seed, so a generation stays JSON-safe.
-            Ok(Ok(floor)) => {
-                inner.last_generation = inner.last_generation.max(floor.min(MAX_BOOT_SEED));
+        // What the file reserves: nothing once it is missing or corrupt.
+        let on_disk = match std::fs::read_to_string(&floor_file).map(|s| s.trim().parse::<u64>()) {
+            Ok(Ok(floor)) => floor,
+            Ok(Err(e)) => {
+                warn!(path = %floor_file.display(), error = %e,
+                    "zone generation floor is corrupt; seeding from the wall clock");
+                0
             }
-            Ok(Err(e)) => warn!(path = %floor_file.display(), error = %e,
-                "zone generation floor is corrupt; seeding from the wall clock"),
-            Err(e) => warn!(path = %floor_file.display(), error = %e,
-                "zone generation floor unreadable; seeding from the wall clock"),
-        }
-        let reserved = inner.last_generation + FLOOR_BLOCK;
-        persist_floor(&floor_file, reserved);
+            Err(e) => {
+                warn!(path = %floor_file.display(), error = %e,
+                    "zone generation floor unreadable; seeding from the wall clock");
+                0
+            }
+        };
+        // Capped like the clock seed, so a generation stays JSON-safe.
+        inner.last_generation = inner.last_generation.max(on_disk.min(MAX_BOOT_SEED));
+        let mut reserved = on_disk;
+        reserve(
+            &floor_file,
+            &mut reserved,
+            inner.last_generation + FLOOR_BLOCK,
+        );
         inner.floor = Some((floor_file, reserved));
     }
 
@@ -898,6 +918,52 @@ mod tests {
             last = g;
         }
         assert!(!path.exists());
+    }
+
+    /// SPEC-088 review 11: with an external admin secret or OIDC, bootstrap
+    /// leaves a fresh install's state directory uncreated, so the floor is the
+    /// first thing written into it. It is persisted all the same, and a
+    /// restart with the clock set back still starts above the first boot.
+    #[test]
+    fn a_fresh_install_persists_its_floor_before_the_state_dir_exists() {
+        let a = zone_revision(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state").join("zone_generation_floor");
+        let boot = UNIX_EPOCH + Duration::from_millis(1_795_000_000_000);
+        let first = ZoneApplicationRegistry::booted_at(boot);
+        first.load_generation_floor(path.clone());
+        let last = first.start(7, &a);
+        assert!(path.exists(), "the floor was not persisted");
+
+        let restarted = ZoneApplicationRegistry::booted_at(boot - Duration::from_secs(3600));
+        restarted.load_generation_floor(path.clone());
+        assert!(restarted.start(7, &a) > last, "the restart went back");
+    }
+
+    /// SPEC-088 review 11: a floor that could not be persisted reserves
+    /// nothing, so the next start persists one before it hands out a
+    /// generation above it.
+    #[test]
+    fn a_floor_that_could_not_be_persisted_is_not_reserved() {
+        let a = zone_revision(&[]);
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::write(&state, "").unwrap();
+        let path = state.join("zone_generation_floor");
+        let r = ZoneApplicationRegistry::default();
+        r.load_generation_floor(path.clone());
+        assert!(
+            !path.exists(),
+            "precondition: the floor could not be written"
+        );
+
+        std::fs::remove_file(&state).unwrap();
+        std::fs::create_dir(&state).unwrap();
+        let g = r.start(7, &a);
+        assert!(
+            path.exists() && floor_in(&path) >= g,
+            "generation {g} was handed out above an unpersisted floor"
+        );
     }
 
     #[test]
