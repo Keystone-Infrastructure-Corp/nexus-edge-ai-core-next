@@ -779,7 +779,7 @@ mod controller {
         self as rc, Alert, ControllerConfig, ControllerGuard, EpochChange, EvidenceProducer,
         Motion, RecordingCommand, RecordingControl, RecordingError, RecordingReceipt,
     };
-    use nexus_pipeline::recording_diagnostics::EvidenceCounts;
+    use nexus_pipeline::recording_diagnostics::{EvidenceCounts, Transition};
     use tokio::sync::{watch, Semaphore};
 
     use super::*;
@@ -1209,6 +1209,67 @@ mod controller {
             Some((Some(RecordingReason::DegradedCoverage), true, false)),
             "1.5 s old when used"
         );
+    }
+
+    /// Codex review 4, item 2, through the controller: its wall clock is
+    /// re-anchored to each frame's own capture wall clock. After a +60 s
+    /// correction on a frame analysed late (the controller's clock already
+    /// past it), the next transition (evidence-driven, at that frame's
+    /// capture) and the stale-driven one after it (at the controller's now)
+    /// both read the corrected wall clock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_wall_clock_correction_reaches_the_next_transitions() {
+        use RecordingReason::{Activity, DegradedCoverage, Quiet};
+        let mut c = cam(shadow(1_000), 0, false, false).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while proposed(&c) != Some((Some(Quiet), false, false)) {
+            assert!(Instant::now() < deadline, "{:#?}", c.runtime());
+            c.now(AnalysisOutcome::Success, 0).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (mono, wall) = c.clock(c.elapsed_ms() - 100);
+        let corrected = wall + chrono::Duration::seconds(60);
+        let counts = EvidenceCounts {
+            observed: 1,
+            ..EvidenceCounts::default()
+        };
+        let arrived = c.producer.arrived(mono, corrected);
+        let analysed = c.producer.analysed(
+            mono,
+            corrected,
+            AnalysisOutcome::Success,
+            counts,
+            Some(quiet()),
+        );
+        for e in [arrived, analysed] {
+            c.send(RecordingCommand::Evidence(e), LONG).await.unwrap();
+        }
+        // No more evidence: stale after 1 s.
+        while proposed(&c) != Some((Some(DegradedCoverage), true, false)) {
+            assert!(Instant::now() < deadline, "{:#?}", c.runtime());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let trace = c
+            .stats
+            .recording_activity()
+            .trace(1, Instant::now(), Utc::now())
+            .unwrap();
+        // Wall clock minus policy clock: constant until the correction.
+        let offset = |t: &Transition| (t.wall_at - c.w0).num_milliseconds() - t.at_ms as i64;
+        let n = trace.transitions.len();
+        let [before, next, stale] = &trace.transitions[n - 3..] else {
+            unreachable!()
+        };
+        assert_eq!(
+            (before.reason, next.reason, stale.reason),
+            (Quiet, Activity, DegradedCoverage),
+            "{trace:#?}"
+        );
+        for t in [next, stale] {
+            let moved = offset(t) - offset(before);
+            assert!((moved - 60_000).abs() <= 5, "moved {moved} ms: {trace:#?}");
+        }
     }
 
     /// R-4: a live stale-deadline change (10 s to 5 s) reaches the analysis

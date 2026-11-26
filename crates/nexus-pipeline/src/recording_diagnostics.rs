@@ -39,7 +39,9 @@ pub struct Transition {
     /// a change the stale deadline drove at the controller's now; never
     /// before the previous transition.
     pub at_ms: u64,
-    /// The wall clock read with `at_ms`: a later wall-clock correction moves neither.
+    /// The wall clock at `at_ms`, from the latest frame's own capture wall
+    /// clock: a correction reaches every transition after it and moves no
+    /// earlier one.
     pub wall_at: DateTime<Utc>,
     pub legacy_open: bool,
     pub shadow_open: bool,

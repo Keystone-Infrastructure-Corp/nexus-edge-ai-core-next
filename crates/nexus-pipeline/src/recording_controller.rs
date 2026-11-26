@@ -692,19 +692,17 @@ impl Controller {
         self.last_sequence = self.last_sequence.max(e.sequence);
         // The capture clock never runs back: a frame that waited longer for
         // the analysis loop was captured before the time it already shows.
-        let (mono, wall) = self.now();
-        let arrived = tokio::time::Instant::now();
-        self.last_frame = Some(match self.last_frame {
-            Some(_) if mono >= e.captured_mono => FrameClock {
-                mono,
-                wall,
-                arrived,
-            },
-            _ => FrameClock {
-                mono: e.captured_mono,
-                wall: e.captured_at,
-                arrived,
-            },
+        // Its wall clock is the frame's own, run on to there, so a
+        // wall-clock correction reaches every decision and trace after it.
+        let mono = match self.last_frame {
+            Some(_) => self.now().0.max(e.captured_mono),
+            None => e.captured_mono,
+        };
+        let ran_on = mono.duration_since(e.captured_mono);
+        self.last_frame = Some(FrameClock {
+            mono,
+            wall: e.captured_at + chrono::Duration::from_std(ran_on).unwrap_or_default(),
+            arrived: tokio::time::Instant::now(),
         });
         let (now, wall) = self.now();
         self.stall_check = None;
