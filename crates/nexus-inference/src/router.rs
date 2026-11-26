@@ -65,6 +65,20 @@ impl LayerKey {
         }
     }
 
+    /// Key for the threshold-floor map. The closed-vocab aliases build
+    /// one model (`build_detector_kind`) and on Hailo share one cached
+    /// detector, so they must share one floor.
+    fn floor_key(&self) -> Self {
+        let kind = match self.kind.as_str() {
+            "yolo26n" | "closed_vocab" => "yolo".into(),
+            _ => self.kind.clone(),
+        };
+        Self {
+            kind,
+            ..self.clone()
+        }
+    }
+
     fn display(&self) -> String {
         format!("{}@{}x{}", self.kind, self.input_w, self.input_h)
     }
@@ -121,7 +135,7 @@ impl InferenceRouter {
         // Built at the first camera's instead, a camera asking for less
         // lost its candidates inside the detector, by camera order.
         let mut floors: BTreeMap<LayerKey, f32> = BTreeMap::new();
-        floors.insert(default_key.clone(), default_cfg.model.score_threshold);
+        floors.insert(default_key.floor_key(), default_cfg.model.score_threshold);
         for cam in cameras {
             let base = cam.detector.model_override.as_ref();
             let mut keys: Vec<LayerKey> = base.map(LayerKey::from_model).into_iter().collect();
@@ -138,13 +152,13 @@ impl InferenceRouter {
             let threshold = base.map_or(default_cfg.model.score_threshold, |m| m.score_threshold);
             for key in keys {
                 floors
-                    .entry(key)
+                    .entry(key.floor_key())
                     .and_modify(|f| *f = f.min(threshold))
                     .or_insert(threshold);
             }
         }
         let with_floor = |mut cfg: InferenceConfig, key: &LayerKey| {
-            if let Some(floor) = floors.get(key) {
+            if let Some(floor) = floors.get(&key.floor_key()) {
                 cfg.model.score_threshold = *floor;
             }
             cfg
@@ -348,7 +362,11 @@ impl InferenceRouter {
             Some(m) if m.kind != "ensemble" => m.score_threshold,
             _ => self.default_threshold,
         };
-        let floor = self.floors.get(key).copied().unwrap_or(requested);
+        let floor = self
+            .floors
+            .get(&key.floor_key())
+            .copied()
+            .unwrap_or(requested);
         Some((requested, requested.max(floor)))
     }
 
@@ -970,6 +988,34 @@ mod tests {
         assert_eq!(
             router.score_thresholds_for_camera(&with_low_res(0.30)),
             Some((0.30, 0.50))
+        );
+    }
+
+    /// `yolo` and its alias `yolo26n` build one model (one cached detector
+    /// on Hailo), so a lower threshold under either name lowers both
+    /// layers' floor.
+    #[test]
+    fn closed_vocab_aliases_share_one_threshold_floor() {
+        let mut cfg = cfg_with_kind("yolo");
+        cfg.model.score_threshold = 0.50;
+        let mut alias = cam(1, None);
+        alias.detector.model_override = Some(ModelConfig {
+            kind: "yolo26n".into(),
+            score_threshold: 0.20,
+            input_width: cfg.model.input_width,
+            input_height: cfg.model.input_height,
+            ..Default::default()
+        });
+        let router = InferenceRouter::build(&cfg, std::slice::from_ref(&alias)).unwrap();
+        let yolo = LayerKey::from_model(&cfg.model);
+        assert_eq!(router.floors.get(&yolo), Some(&0.20));
+        assert_eq!(
+            router.score_thresholds_for_camera(&alias),
+            Some((0.20, 0.20))
+        );
+        assert_eq!(
+            router.score_thresholds_for_camera(&cam(2, None)),
+            Some((0.50, 0.50))
         );
     }
 }
