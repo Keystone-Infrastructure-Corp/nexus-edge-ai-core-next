@@ -1474,6 +1474,17 @@ test.describe("zone application", () => {
       return seen;
     }
 
+    /** Serve camera `id`'s saved settings as an engine without parking does: the zones only. */
+    async function withoutParking(page: Page, id: number) {
+      await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, async (route) => {
+        const res = await route.fetch();
+        const body = (await res.json()) as { settings: Record<string, unknown>; parking_revision?: string };
+        delete body.settings.parking;
+        delete body.parking_revision;
+        await route.fulfill({ response: res, json: body });
+      });
+    }
+
     /** Hold every read of camera `id`'s saved settings until `release`. */
     async function holdSnapshots(page: Page, id: number) {
       let seen = () => {};
@@ -1855,14 +1866,7 @@ test.describe("zone application", () => {
     }) => {
       cameraId = await createCamera(page, [DOOR]);
       const id = cameraId;
-      // An older engine's snapshot: the zones only.
-      await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, async (route) => {
-        const res = await route.fetch();
-        const body = (await res.json()) as { settings: Record<string, unknown>; parking_revision?: string };
-        delete body.settings.parking;
-        delete body.parking_revision;
-        await route.fulfill({ response: res, json: body });
-      });
+      await withoutParking(page, id);
       const receipt = await controlReceipt(page, id);
       receipt.set(applied(1));
       receipt.setParking(() => "missing");
@@ -1890,6 +1894,56 @@ test.describe("zone application", () => {
       expect(body).not.toHaveProperty("parking_policy_v2");
       expect(body.parking_lot_mode).toBe(true);
       await expect(status).toContainText("Applied to camera", POLL);
+    });
+
+    test("a parking edit a rolled-back core no longer reports is refused; saved parking passes through", async ({
+      page,
+    }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const { status } = await openApplied(page, id);
+      await policy(page).dwell.fill("20");
+
+      // The core rolls back to one without parking: the save fails, and the
+      // saved settings read after it carry no parking.
+      await withoutParking(page, id);
+      const rolledBack = cameraPath(id);
+      await page.route(rolledBack, (route) =>
+        route.request().method() === "PUT"
+          ? route.fulfill({ status: 500, json: { error: "e2e: rolled back" } })
+          : route.fallback(),
+      );
+      await save(page);
+      await expect(page.getByText("e2e: rolled back")).toBeVisible();
+      await expect(optIn(page)).toHaveCount(0, POLL);
+      await page.unroute(rolledBack);
+
+      // The policy edit its controls no longer show is not sent.
+      const refused = /^Not saved: this core no longer reports parking zones/;
+      const sent = countPuts(page, id);
+      await save(page);
+      await expect(page.getByText(refused)).toBeVisible();
+
+      // Reloaded, an edit of the saved parking zone is refused too.
+      await page.reload();
+      await expect(status).toContainText("Applied to camera", POLL);
+      await expect(policy(page).dwell).toHaveCount(0);
+      await zoneRow(page, "Stalls").getByRole("textbox").fill("Stalls north");
+      await save(page);
+      await expect(page.getByText(refused)).toBeVisible();
+      await page.waitForTimeout(500);
+      expect(sent.puts).toBe(0);
+
+      // Unchanged, the saved parking zone and policy pass through an unrelated edit.
+      await zoneRow(page, "Stalls north").getByRole("textbox").fill("Stalls");
+      await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
+      const put = page.waitForRequest(isPut(id));
+      await save(page);
+      const body = (await put).postDataJSON() as Record<string, unknown>;
+      expect(body.zones).toEqual([{ ...DOOR, name: "Gate" }, STALLS]);
+      expect(body.parking_policy_v2).toEqual(POLICY_A);
+      expect(body.parking_lot_mode).toBe(true);
+      await expect(page.getByText(refused)).toHaveCount(0);
     });
   });
 });

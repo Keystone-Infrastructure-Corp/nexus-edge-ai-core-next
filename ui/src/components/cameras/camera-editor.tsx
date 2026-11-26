@@ -212,6 +212,13 @@ const tupleOf = (c: ZoneTuple): ZoneTuple => ({ zones: c.zones, ...pickParking(c
 const sameParking = (a: ZoneTuple, b: ZoneTuple) =>
   (a.parking_lot_mode ?? false) === (b.parking_lot_mode ?? false) && a.parking_policy_v2 === b.parking_policy_v2;
 
+/** Whether `draft` holds other Parking zones or another v2 policy than `base`, by value. */
+const parkingEdited = (draft: ZoneTuple, base: ZoneTuple) => {
+  const parking = (t: ZoneTuple) =>
+    JSON.stringify([(t.zones ?? []).filter((z) => z.kind === "parking"), t.parking_policy_v2 ?? null]);
+  return parking(draft) !== parking(base);
+};
+
 /** The zones by reference, as an edit replaces them; parking counts only where reported. */
 const sameTuple = (a: ZoneTuple, b: ZoneTuple, parking: boolean) =>
   a.zones === b.zones && (!parking || sameParking(a, b));
@@ -817,6 +824,13 @@ export function CameraEditor({
     // the existing row. Only URL is operator-required up front.
     if (!draft.url.trim()) {
       setError("URL is required.");
+      return;
+    }
+    // The installed snapshot stopped carrying parking (a core rollback): the
+    // parking controls are gone, so a parking edit made before is not sent.
+    // Unchanged saved parking zones and policy still pass through.
+    if (zoneView.installed && !parkingShown && parkingEdited(draft, zoneView.synced)) {
+      setError("Not saved: this core no longer reports parking zones. Discard the parking changes or reload.");
       return;
     }
     const problem = parkingProblem(draft);
