@@ -10,11 +10,13 @@ use crate::{ClipId, Store, StoreError};
 /// Summaries older than this, before the newest write, are dropped.
 pub const RECORDING_ACTIVITY_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
-/// One camera-minute of one supervisor generation's shadow counters.
+/// One camera-minute of one supervisor generation's shadow counters, under
+/// the policy revision that counted them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordingActivityMinute {
     pub camera_id: CameraId,
     pub generation: i64,
+    pub policy_revision: String,
     /// Index of the generation's monotonic minute.
     pub minute: i64,
     /// Wall clock of the minute's first frame, Unix epoch ms.
@@ -37,19 +39,21 @@ pub struct RecordingActivityEpisode {
 }
 
 impl Store {
-    /// Write one camera-minute (a repeat of the same minute replaces it),
-    /// then prune summaries past retention relative to it.
+    /// Write one camera-minute, then prune summaries past retention relative
+    /// to it. A minute already written is refused, never replaced, so the
+    /// caller reports the gap instead of losing the counters already there.
     pub async fn insert_recording_activity_minute(
         &self,
         row: &RecordingActivityMinute,
     ) -> Result<(), StoreError> {
         sqlx::query(
-            "INSERT OR REPLACE INTO recording_activity_minutes
-                 (camera_id, generation, minute, started_at_ms, counters)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO recording_activity_minutes
+                 (camera_id, generation, policy_revision, minute, started_at_ms, counters)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(row.camera_id)
         .bind(row.generation)
+        .bind(&row.policy_revision)
         .bind(row.minute)
         .bind(row.started_at_ms)
         .bind(&row.counters_json)
@@ -106,11 +110,11 @@ impl Store {
         &self,
         camera_id: CameraId,
     ) -> Result<Vec<RecordingActivityMinute>, StoreError> {
-        let rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
-            "SELECT generation, minute, started_at_ms, counters
+        let rows: Vec<(i64, String, i64, i64, String)> = sqlx::query_as(
+            "SELECT generation, policy_revision, minute, started_at_ms, counters
                FROM recording_activity_minutes
               WHERE camera_id = ?
-              ORDER BY generation, minute",
+              ORDER BY generation, started_at_ms, minute",
         )
         .bind(camera_id)
         .fetch_all(&self.pool)
@@ -118,12 +122,15 @@ impl Store {
         Ok(rows
             .into_iter()
             .map(
-                |(generation, minute, started_at_ms, counters_json)| RecordingActivityMinute {
-                    camera_id,
-                    generation,
-                    minute,
-                    started_at_ms,
-                    counters_json,
+                |(generation, policy_revision, minute, started_at_ms, counters_json)| {
+                    RecordingActivityMinute {
+                        camera_id,
+                        generation,
+                        policy_revision,
+                        minute,
+                        started_at_ms,
+                        counters_json,
+                    }
                 },
             )
             .collect())
@@ -196,6 +203,7 @@ mod tests {
         RecordingActivityMinute {
             camera_id,
             generation: 4,
+            policy_revision: "rev-a".into(),
             minute,
             started_at_ms,
             counters_json: format!("{{\"minute\":{minute}}}"),
@@ -217,7 +225,7 @@ mod tests {
     }
 
     /// The migration applies once, rows survive a restart, a minute written
-    /// again replaces itself, and nothing reads across cameras.
+    /// again is refused and keeps what it had, and nothing reads across cameras.
     #[tokio::test]
     async fn summaries_survive_a_restart_and_a_minute_is_written_once() {
         let dir = tempfile::tempdir().unwrap();
@@ -239,17 +247,17 @@ mod tests {
         let store = open(dir.path()).await;
         let mut again = minute(1, 0, NOW);
         again.counters_json = "{\"minute\":0,\"again\":true}".into();
-        store
+        assert!(store
             .insert_recording_activity_minute(&again)
             .await
-            .unwrap();
+            .is_err());
         store
             .insert_recording_activity_minute(&minute(1, 1, NOW + 60_000))
             .await
             .unwrap();
         assert_eq!(
             store.list_recording_activity_minutes(1).await.unwrap(),
-            vec![again, minute(1, 1, NOW + 60_000)]
+            vec![minute(1, 0, NOW), minute(1, 1, NOW + 60_000)]
         );
         assert_eq!(
             store.list_recording_activity_episodes(1).await.unwrap(),
@@ -318,6 +326,43 @@ mod tests {
                 .await
                 .unwrap(),
             4
+        );
+    }
+
+    /// The real migrations, in an in-memory database.
+    async fn in_memory() -> Store {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        Store::apply_schema(&pool).await.unwrap();
+        Store { pool }
+    }
+
+    /// A live policy change mid-minute: the earlier revision's counters for
+    /// that minute stay beside the new one's.
+    #[tokio::test]
+    async fn each_policy_revision_keeps_its_own_minute() {
+        let store = in_memory().await;
+        let earlier = minute(1, 0, NOW);
+        let later = RecordingActivityMinute {
+            policy_revision: "rev-b".into(),
+            started_at_ms: NOW + 30_000,
+            counters_json: "{\"rev\":\"b\"}".into(),
+            ..minute(1, 0, NOW)
+        };
+        store
+            .insert_recording_activity_minute(&earlier)
+            .await
+            .unwrap();
+        store
+            .insert_recording_activity_minute(&later)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.list_recording_activity_minutes(1).await.unwrap(),
+            vec![earlier, later]
         );
     }
 

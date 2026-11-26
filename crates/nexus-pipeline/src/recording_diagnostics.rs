@@ -759,6 +759,7 @@ impl ShadowRecording {
                 writes.minute = Some(minute_row(
                     self.camera_id,
                     self.generation,
+                    &shared.policy_revision,
                     current,
                     started,
                     &counters,
@@ -825,7 +826,14 @@ impl ShadowRecording {
             )
         });
         writes.minute = self.minute.take().map(|(index, started)| {
-            minute_row(self.camera_id, self.generation, index, started, &minute)
+            minute_row(
+                self.camera_id,
+                self.generation,
+                &shared.policy_revision,
+                index,
+                started,
+                &minute,
+            )
         });
         writes
     }
@@ -839,6 +847,7 @@ impl ShadowRecording {
 fn minute_row(
     camera_id: CameraId,
     generation: u64,
+    policy_revision: &str,
     minute: u64,
     started: DateTime<Utc>,
     counters: &MinuteCounters,
@@ -846,6 +855,7 @@ fn minute_row(
     RecordingActivityMinute {
         camera_id,
         generation: generation as i64,
+        policy_revision: policy_revision.to_owned(),
         minute: minute as i64,
         started_at_ms: started.timestamp_millis(),
         counters_json: to_json(counters),

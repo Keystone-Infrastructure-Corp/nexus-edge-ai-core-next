@@ -1142,6 +1142,29 @@ mod controller {
         );
     }
 
+    /// R-6: a live policy change mid-minute keeps what the earlier policy
+    /// counted in that minute: each revision's minute is a row of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_change_keeps_the_earlier_policys_minute() {
+        let mut c = cam(shadow(1_000), 0, false, false).await;
+        c.frame(0, quiet()).await;
+        c.frame(500, quiet()).await;
+        c.send(
+            RecordingCommand::PolicyChanged(shadow(2_000).policy, "rev-2".into()),
+            LONG,
+        )
+        .await
+        .unwrap();
+        c.frame(1_000, quiet()).await;
+        c.stop().await;
+        let minutes = c.store.list_recording_activity_minutes(1).await.unwrap();
+        let kept: Vec<_> = minutes
+            .iter()
+            .map(|m| (m.minute, m.policy_revision.as_str()))
+            .collect();
+        assert_eq!(kept, [(0, "rev-start"), (0, "rev-2")], "{minutes:#?}");
+    }
+
     /// A slow open is waited for, never raced: the frames behind it time
     /// out where their requester can see it, and the clip they then find is
     /// the one that open produced.

@@ -5,18 +5,21 @@
 -- than seven days are pruned on write (`nexus-store::recording_activity`).
 -- No credentials: counters, clip ids and an opaque policy revision.
 
--- One camera-minute of one supervisor generation. `minute` is the index of
--- the generation's monotonic minute, so a wall-clock step never splits or
+-- One camera-minute of one supervisor generation under one saved policy
+-- revision: a live policy change mid-minute leaves a row per revision, and
+-- a repeated key is refused, never replaced. `minute` is the index of the
+-- generation's monotonic minute, so a wall-clock step never splits or
 -- merges a bucket; `started_at_ms` is the wall clock of its first frame,
 -- for reading and retention. `counters` is the JSON of the pipeline's
 -- `MinuteCounters`.
 CREATE TABLE IF NOT EXISTS recording_activity_minutes (
-    camera_id     INTEGER NOT NULL,
-    generation    INTEGER NOT NULL,
-    minute        INTEGER NOT NULL,
-    started_at_ms INTEGER NOT NULL,
-    counters      TEXT    NOT NULL,
-    PRIMARY KEY (camera_id, generation, minute)
+    camera_id       INTEGER NOT NULL,
+    generation      INTEGER NOT NULL,
+    policy_revision TEXT    NOT NULL,
+    minute          INTEGER NOT NULL,
+    started_at_ms   INTEGER NOT NULL,
+    counters        TEXT    NOT NULL,
+    PRIMARY KEY (camera_id, generation, policy_revision, minute)
 );
 
 CREATE INDEX IF NOT EXISTS idx_recording_activity_minutes_started
