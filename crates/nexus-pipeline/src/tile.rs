@@ -281,12 +281,15 @@ pub fn merge_stage2(
     stage2: Vec<Detection>,
     top_k: Option<usize>,
 ) -> Vec<Detection> {
-    let mut stage2 = nexus_inference::nms::nms_per_label(stage2, MERGE_IOU, None);
+    // Stage-1 duplicates go first: one must not suppress a neighbour in
+    // the NMS below and then be dropped itself.
+    let mut stage2 = stage2;
     stage2.retain(|d| {
         !stage1
             .iter()
             .any(|s| s.label == d.label && nexus_inference::nms::iou(&s.bbox, &d.bbox) > MERGE_IOU)
     });
+    let stage2 = nexus_inference::nms::nms_per_label(stage2, MERGE_IOU, None);
     let mut merged = stage1;
     merged.extend(stage2);
     if let Some(k) = top_k {
@@ -866,6 +869,23 @@ mod tests {
             labelled("person", 603.0, 0.5),
         ];
         assert_eq!(merge_stage2(stage1, Vec::new(), None).len(), 2);
+    }
+
+    /// A stage-2 box that duplicates stage-1 must not first suppress its
+    /// stage-2 neighbour: 605 overlaps both 600 and 610, but 610 does not
+    /// overlap 600 (IoU 0.33) and is a second object.
+    #[test]
+    fn merge_keeps_a_tile_box_whose_only_suppressor_was_a_stage1_duplicate() {
+        let merged = merge_stage2(
+            vec![labelled("person", 600.0, 0.6)],
+            vec![
+                labelled("person", 605.0, 0.9),
+                labelled("person", 610.0, 0.8),
+            ],
+            None,
+        );
+        let xs: Vec<f32> = merged.iter().map(|d| d.bbox.x1).collect();
+        assert_eq!(xs, vec![600.0, 610.0]);
     }
 
     /// With no stage-1 detections at all, configured discovery cells are
