@@ -598,7 +598,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(res.evicted, 2);
         let snap = store
-            .recording_delivery_stats(Utc::now() + chrono::Duration::minutes(2), None)
+            .recording_delivery_stats(|| Utc::now() + chrono::Duration::minutes(2), None)
             .await
             .unwrap();
         let lost = snap.windows[0].core.ordinary;

@@ -3956,7 +3956,7 @@ async fn get_storage(State(s): State<ApiState>) -> Result<Json<StorageResponse>,
         Ok(enrollment) => s
             .store
             .recording_delivery_stats(
-                chrono::Utc::now(),
+                chrono::Utc::now,
                 crate::cold_replicator::upload_floor(enrollment.as_ref()),
             )
             .await

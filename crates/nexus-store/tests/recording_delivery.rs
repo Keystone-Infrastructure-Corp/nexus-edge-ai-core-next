@@ -287,7 +287,7 @@ async fn recording_delivery_partitions_match_uploader_selection() {
 
     // The snapshot aggregates the same partitions in one read.
     let snap = store
-        .recording_delivery_stats(now, Some(floor))
+        .recording_delivery_stats(|| now, Some(floor))
         .await
         .unwrap();
     assert_eq!(snap.schema_version, 1);
@@ -401,7 +401,7 @@ async fn recording_delivery_counts_delivery_once_across_duplicate_and_overwritte
     );
 
     let snap = store
-        .recording_delivery_stats(at(10, 30, 0), None)
+        .recording_delivery_stats(|| at(10, 30, 0), None)
         .await
         .unwrap();
     let ord = hour(&snap).core.ordinary;
@@ -410,11 +410,11 @@ async fn recording_delivery_counts_delivery_once_across_duplicate_and_overwritte
     assert_eq!(ord.delivered_bytes, 1_000, "delivered once");
     assert_eq!(hour(&snap).core.alert, DeliveryCounters::default());
     let at_overwrite = store
-        .recording_delivery_stats(at(10, 8, 0), None)
+        .recording_delivery_stats(|| at(10, 8, 0), None)
         .await
         .unwrap();
     let late = store
-        .recording_delivery_stats(at(10, 6, 0), None)
+        .recording_delivery_stats(|| at(10, 6, 0), None)
         .await
         .unwrap();
     assert_eq!(
@@ -463,7 +463,7 @@ async fn recording_delivery_survives_restart_without_double_counting() {
         .unwrap();
 
     let snap = store
-        .recording_delivery_stats(at(10, 30, 0), None)
+        .recording_delivery_stats(|| at(10, 30, 0), None)
         .await
         .unwrap();
     let ord = hour(&snap).core.ordinary;
@@ -507,7 +507,7 @@ async fn recording_delivery_counts_every_retry_attempt_and_failure() {
 
     let ord = hour(
         &store
-            .recording_delivery_stats(at(10, 30, 0), None)
+            .recording_delivery_stats(|| at(10, 30, 0), None)
             .await
             .unwrap(),
     )
@@ -536,7 +536,7 @@ async fn recording_delivery_counts_every_retry_attempt_and_failure() {
         .await
         .unwrap();
     let snap = store
-        .recording_delivery_stats(at(10, 30, 0), None)
+        .recording_delivery_stats(|| at(10, 30, 0), None)
         .await
         .unwrap();
     let a = hour(&snap).core.alert;
@@ -610,7 +610,7 @@ async fn recording_delivery_counts_eviction_before_upload() {
     }
 
     let snap = store
-        .recording_delivery_stats(Utc::now() + Duration::minutes(2), None)
+        .recording_delivery_stats(|| Utc::now() + Duration::minutes(2), None)
         .await
         .unwrap();
     let w = hour(&snap);
@@ -653,7 +653,7 @@ async fn recording_delivery_counts_camera_deletion_as_eviction_before_upload() {
     store.delete_camera(1).await.unwrap();
 
     let snap = store
-        .recording_delivery_stats(Utc::now() + Duration::minutes(2), None)
+        .recording_delivery_stats(|| Utc::now() + Duration::minutes(2), None)
         .await
         .unwrap();
     let w = hour(&snap);
@@ -692,7 +692,10 @@ async fn recording_delivery_reports_loss_since_the_window_end() {
     .unwrap();
     let sampled = Utc.timestamp_opt(minute + 20, 0).unwrap();
 
-    let snap = store.recording_delivery_stats(sampled, None).await.unwrap();
+    let snap = store
+        .recording_delivery_stats(|| sampled, None)
+        .await
+        .unwrap();
     assert_eq!(
         snap.ordinary.ready.count, 0,
         "the queue already reads empty"
@@ -711,6 +714,53 @@ async fn recording_delivery_reports_loss_since_the_window_end() {
     assert_eq!(snap.since_window_end.alert, DeliveryCounters::default());
 }
 
+/// The review's boundary race: the sample is read at 18:00:59.999 and an
+/// eviction commits at 18:01 before the snapshot's first read. The sample
+/// time is read after the snapshot is pinned, so the clip is still queued
+/// there or its loss is counted, never neither (an empty queue with no
+/// loss reads "No backlog"); a later sample counts the loss in
+/// `since_window_end`.
+#[tokio::test(flavor = "multi_thread")]
+async fn recording_delivery_samples_after_pinning_its_snapshot() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let id = closed_clip(&store, 1, Utc::now() - Duration::hours(1), 500, true).await;
+    let rt = tokio::runtime::Handle::current();
+    let clock = || {
+        let minute = Utc::now().timestamp().div_euclid(60) * 60;
+        let sampled = Utc.timestamp_opt(minute, 0).unwrap() - Duration::milliseconds(1);
+        // Commits right after the clock read, in a later minute than it.
+        tokio::task::block_in_place(|| rt.block_on(store.cascade_delete_clip_metadata(id)))
+            .unwrap();
+        sampled
+    };
+    let snap = store.recording_delivery_stats(clock, None).await.unwrap();
+    let lost = snap.since_window_end.ordinary.evicted_before_upload_count
+        + hour(&snap).core.ordinary.evicted_before_upload_count;
+    assert_eq!(
+        snap.ordinary.ready.count + lost,
+        1,
+        "the clip is queued or lost in the snapshot, never neither"
+    );
+
+    let minute: i64 = sqlx::query_scalar(
+        "SELECT minute_utc FROM recording_minute_buckets WHERE evicted_before_upload_count > 0",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let last_ms = Utc.timestamp_opt(minute + 60, 0).unwrap() - Duration::milliseconds(1);
+    let snap = store
+        .recording_delivery_stats(|| last_ms, None)
+        .await
+        .unwrap();
+    assert_eq!(snap.ordinary.ready.count, 0);
+    assert_eq!(
+        snap.since_window_end.ordinary.evicted_before_upload_count,
+        1
+    );
+}
+
 /// A row being transferred is a marked subset of the partition it was
 /// selected from, never an extra total: it stays there until its
 /// completion commits. `in_flight` is null until the queue's uploader is
@@ -724,7 +774,7 @@ async fn recording_delivery_marks_in_flight_rows_without_moving_totals() {
     let unknown = closed_clip(&store, 1, at(11, 10, 0), 0, true).await;
     closed_clip(&store, 2, at(11, 20, 0), 2_000, true).await;
     let snap =
-        |store: Store| async move { store.recording_delivery_stats(now, None).await.unwrap() };
+        |store: Store| async move { store.recording_delivery_stats(|| now, None).await.unwrap() };
 
     let before = snap(store.clone()).await;
     assert_eq!(before.ordinary.in_flight, None, "no uploader: cannot tell");
@@ -772,7 +822,7 @@ async fn recording_delivery_windows_align_to_minute_and_hour_boundaries() {
 
     let gen = |snap: &RecordingDeliverySnapshot| hour(snap).core.ordinary.generated_bytes;
     let snap = store
-        .recording_delivery_stats(at(11, 0, 30), None)
+        .recording_delivery_stats(|| at(11, 0, 30), None)
         .await
         .unwrap();
     assert_eq!(
@@ -781,17 +831,17 @@ async fn recording_delivery_windows_align_to_minute_and_hour_boundaries() {
     );
     assert_eq!(gen(&snap), 100, "the current minute is excluded");
     let snap = store
-        .recording_delivery_stats(at(11, 0, 59), None)
+        .recording_delivery_stats(|| at(11, 0, 59), None)
         .await
         .unwrap();
     assert_eq!(gen(&snap), 100);
     let snap = store
-        .recording_delivery_stats(at(11, 59, 59) + Duration::milliseconds(999), None)
+        .recording_delivery_stats(|| at(11, 59, 59) + Duration::milliseconds(999), None)
         .await
         .unwrap();
     assert_eq!(gen(&snap), 120);
     let snap = store
-        .recording_delivery_stats(at(12, 0, 0), None)
+        .recording_delivery_stats(|| at(12, 0, 0), None)
         .await
         .unwrap();
     assert_eq!(gen(&snap), 20);
@@ -802,7 +852,10 @@ async fn recording_delivery_windows_align_to_minute_and_hour_boundaries() {
     );
 
     let later = snap.accounting_since + Duration::minutes(61);
-    let snap = store.recording_delivery_stats(later, None).await.unwrap();
+    let snap = store
+        .recording_delivery_stats(|| later, None)
+        .await
+        .unwrap();
     assert!(hour(&snap).complete);
     assert!(!day(&snap).complete);
 }
@@ -835,7 +888,7 @@ async fn recording_delivery_totals_two_cameras_and_keeps_alert_separate() {
         .unwrap();
 
     let snap = store
-        .recording_delivery_stats(at(10, 30, 0), None)
+        .recording_delivery_stats(|| at(10, 30, 0), None)
         .await
         .unwrap();
     let w = hour(&snap);
@@ -849,7 +902,7 @@ async fn recording_delivery_totals_two_cameras_and_keeps_alert_separate() {
     assert_eq!(w.cameras[1].counters.ordinary.delivered_bytes, 0);
 
     let snap = store
-        .recording_delivery_stats(ready_at + Duration::minutes(1), None)
+        .recording_delivery_stats(|| ready_at + Duration::minutes(1), None)
         .await
         .unwrap();
     let w = hour(&snap);
@@ -1006,7 +1059,7 @@ async fn recording_delivery_baselines_existing_rows_without_history() {
         .unwrap();
 
     let snap = store
-        .recording_delivery_stats(at(10, 30, 0), None)
+        .recording_delivery_stats(|| at(10, 30, 0), None)
         .await
         .unwrap();
     let w = hour(&snap);

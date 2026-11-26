@@ -2600,7 +2600,7 @@ mod tests {
     /// Core counters of the 1 h window just after the real clock.
     async fn hour_counters(store: &Store) -> nexus_store::SourceCounters {
         let snap = store
-            .recording_delivery_stats(Utc::now() + ChronoDuration::minutes(2), None)
+            .recording_delivery_stats(|| Utc::now() + ChronoDuration::minutes(2), None)
             .await
             .unwrap();
         snap.windows[0].core
@@ -2718,7 +2718,7 @@ mod tests {
         assert_eq!(backend.put_paths.lock().len(), 1, "motion put in flight");
 
         let snap = store
-            .recording_delivery_stats(Utc::now(), None)
+            .recording_delivery_stats(Utc::now, None)
             .await
             .unwrap();
         let f = snap
@@ -2731,7 +2731,7 @@ mod tests {
         release.notify_one();
         tick_task.await.unwrap();
         let snap = store
-            .recording_delivery_stats(Utc::now(), None)
+            .recording_delivery_stats(Utc::now, None)
             .await
             .unwrap();
         assert_eq!(snap.ordinary.in_flight.unwrap().count, 0);

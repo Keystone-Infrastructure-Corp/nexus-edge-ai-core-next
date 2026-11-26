@@ -628,11 +628,14 @@ impl Store {
         Ok(())
     }
 
-    /// SPEC-090 — the versioned `recording_delivery` snapshot at `now`
-    /// for enrollment `floor`, read in one transaction.
+    /// SPEC-090 — the versioned `recording_delivery` snapshot for
+    /// enrollment `floor`, read in one transaction and sampled at the
+    /// time `clock` returns. `clock` is read once the transaction has
+    /// pinned its snapshot, so every change the snapshot shows (an
+    /// eviction emptying the queue) is counted at or before `sampled_at`.
     pub async fn recording_delivery_stats(
         &self,
-        now: DateTime<Utc>,
+        clock: impl FnOnce() -> DateTime<Utc>,
         floor: Option<DateTime<Utc>>,
     ) -> Result<RecordingDeliverySnapshot, StoreError> {
         let floor = floor.map(|f| f.to_rfc3339());
@@ -651,6 +654,8 @@ impl Store {
         )
         .fetch_one(&mut *tx)
         .await?;
+        // WAL pins the read snapshot at the first read, just above.
+        let now = clock();
         let accounting_since = crate::motion::parse_ts(&since)?;
         let ordinary = queue_totals(
             &mut tx,
@@ -902,7 +907,10 @@ mod tests {
         let lost = closed(&store, t0 - Duration::minutes(20), 500).await;
         store.cascade_delete_clip_metadata(lost).await.unwrap();
         let sample = t0 + Duration::minutes(2);
-        let before = store.recording_delivery_stats(sample, None).await.unwrap();
+        let before = store
+            .recording_delivery_stats(|| sample, None)
+            .await
+            .unwrap();
         assert!(before.windows.iter().all(|w| w.complete));
         assert_eq!(before.windows[0].core.ordinary.generated_bytes, 3_600_500);
 
@@ -913,7 +921,7 @@ mod tests {
             .await
             .unwrap();
         let during = store
-            .recording_delivery_stats(jumped + Duration::minutes(2), None)
+            .recording_delivery_stats(|| jumped + Duration::minutes(2), None)
             .await
             .unwrap();
         assert!(
@@ -927,7 +935,10 @@ mod tests {
             .record_upload_attempt(RecordingSource::Ordinary, generated, corrected, 1)
             .await
             .unwrap();
-        let after = store.recording_delivery_stats(sample, None).await.unwrap();
+        let after = store
+            .recording_delivery_stats(|| sample, None)
+            .await
+            .unwrap();
         for w in &after.windows {
             assert!(
                 !w.complete,
@@ -945,7 +956,10 @@ mod tests {
 
         store.pool.close().await;
         let store = open(dir.path()).await;
-        let reopened = store.recording_delivery_stats(sample, None).await.unwrap();
+        let reopened = store
+            .recording_delivery_stats(|| sample, None)
+            .await
+            .unwrap();
         assert_eq!(reopened.accounting_since, after.accounting_since);
     }
 
@@ -960,7 +974,7 @@ mod tests {
         set_wall(&store, t0 - Duration::minutes(30));
         closed(&store, t0 - Duration::minutes(31), 1_000).await;
         let since = store
-            .recording_delivery_stats(t0, None)
+            .recording_delivery_stats(|| t0, None)
             .await
             .unwrap()
             .accounting_since;
@@ -969,7 +983,7 @@ mod tests {
         let store = open(dir.path()).await;
         set_wall(&store, t0 - Duration::minutes(10));
         closed(&store, t0 - Duration::minutes(11), 2_000).await;
-        let snap = store.recording_delivery_stats(t0, None).await.unwrap();
+        let snap = store.recording_delivery_stats(|| t0, None).await.unwrap();
         assert_eq!(snap.accounting_since, since);
         assert!(snap.windows.iter().all(|w| w.complete));
         assert_eq!(snap.windows[0].core.ordinary.generated_bytes, 3_000);
