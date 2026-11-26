@@ -223,7 +223,15 @@ impl Store {
             StoreError::NotFound(format!("alert_clip id={id} not in 'building' state"))
         })?;
         let generated = DeliveryCounters::generated(size_bytes, duration_ms);
-        add_to_bucket(&mut tx, camera_id, RecordingSource::Alert, now, &generated).await?;
+        add_to_bucket(
+            self,
+            &mut tx,
+            camera_id,
+            RecordingSource::Alert,
+            now,
+            &generated,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -273,6 +281,7 @@ impl Store {
         if let Some(r) = row.filter(|r| r.get::<bool, _>(2)) {
             let evicted = DeliveryCounters::evicted(r.get(1));
             add_to_bucket(
+                self,
                 &mut tx,
                 r.get(0),
                 RecordingSource::Alert,
@@ -336,6 +345,7 @@ impl Store {
                 ..DeliveryCounters::default()
             };
             add_to_bucket(
+                self,
                 &mut tx,
                 r.get(0),
                 RecordingSource::Alert,
@@ -476,7 +486,15 @@ impl Store {
                 failure_count: 1,
                 ..DeliveryCounters::default()
             };
-            add_to_bucket(&mut tx, camera_id, RecordingSource::Alert, now, &failed).await?;
+            add_to_bucket(
+                self,
+                &mut tx,
+                camera_id,
+                RecordingSource::Alert,
+                now,
+                &failed,
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(())

@@ -17,10 +17,16 @@
 //!   idempotent marker or a one-way state change, so a duplicate close or
 //!   completion, a retry or a restart never counts twice. Rows that
 //!   predate the migration are a baseline and never land in a bucket.
+//! * **Clock discontinuities.** Buckets are placed and pruned by the wall
+//!   clock. When it jumps (see [`Store::check_clock`]), `accounting_since`
+//!   moves past the jump so no window overlapping it reads complete, and
+//!   pruning follows monotonic time so a forward jump deletes no history.
 
 use std::collections::BTreeMap;
+use std::sync::{Mutex, PoisonError};
+use std::time::Instant;
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use nexus_types::CameraId;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection};
@@ -38,8 +44,60 @@ const SCHEMA_VERSION: u32 = 1;
 /// Minute buckets older than this, relative to the newest write, are pruned.
 const BUCKET_RETENTION_SECS: i64 = 7 * 24 * 60 * 60;
 
+/// How far the wall clock may move apart from monotonic time between two
+/// accounting reads or writes, or fall behind a written bucket, before it
+/// counts as a discontinuity.
+const CLOCK_TOLERANCE_SECS: i64 = 60;
+
 /// Aligned windows reported in the snapshot.
 const WINDOW_SECONDS: [i64; 2] = [60 * 60, 24 * 60 * 60];
+
+/// SPEC-090 state that lives only in this process, shared by every clone
+/// of a [`Store`].
+#[derive(Debug, Default)]
+pub(crate) struct DeliveryState {
+    clock: Mutex<DeliveryClock>,
+}
+
+/// Wall-clock readings paired with the monotonic clock, to notice a
+/// wall-clock discontinuity.
+#[derive(Debug, Default)]
+struct DeliveryClock {
+    /// At this process's first accounting read or write.
+    first: Option<(DateTime<Utc>, Instant)>,
+    /// At the previous one.
+    last: Option<(DateTime<Utc>, Instant)>,
+    /// Test seam: the wall clock read instead of `Utc::now()`.
+    #[cfg(test)]
+    test_wall: Option<DateTime<Utc>>,
+}
+
+impl DeliveryState {
+    /// Read the clocks: the wall time, whether it moved more than
+    /// [`CLOCK_TOLERANCE_SECS`] apart from monotonic time since the
+    /// previous reading, and the latest wall time monotonic time vouches
+    /// for since the first reading (the prune horizon).
+    fn observe_clock(&self) -> (DateTime<Utc>, bool, DateTime<Utc>) {
+        let mut c = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        let wall = c.test_wall.unwrap_or_else(Utc::now);
+        #[cfg(not(test))]
+        let wall = Utc::now();
+        let mono = Instant::now();
+        let advanced = |(w, m): (DateTime<Utc>, Instant)| {
+            w + Duration::from_std(mono.duration_since(m)).unwrap_or(Duration::zero())
+        };
+        let jumped = c
+            .last
+            .is_some_and(|l| (wall - advanced(l)).num_seconds().abs() > CLOCK_TOLERANCE_SECS);
+        let first = *c.first.get_or_insert((wall, mono));
+        c.last = Some((wall, mono));
+        // shortcut: after a forward jump the horizon trails the wall clock by
+        // the jump until the engine restarts (extra rows, never lost ones);
+        // re-anchor once a jump is confirmed if that row growth matters.
+        (wall, jumped, wall.min(advanced(first)))
+    }
+}
 
 /// Which upload queue a clip belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,7 +332,8 @@ pub struct DeliveryWindow {
     /// Start of the minute holding `sampled_at`; that minute is excluded.
     pub end: DateTime<Utc>,
     /// False when the window starts before accounting began on this core,
-    /// so its counters cover only part of it.
+    /// or before it restarted after a clock discontinuity, so its counters
+    /// cover only part of it.
     pub complete: bool,
     /// The whole core.
     pub core: SourceCounters,
@@ -287,7 +346,8 @@ pub struct DeliveryWindow {
 pub struct RecordingDeliverySnapshot {
     pub schema_version: u32,
     pub sampled_at: DateTime<Utc>,
-    /// When accounting began on this core (migration 0041).
+    /// When accounting began on this core (migration 0041), moved forward
+    /// past each wall-clock discontinuity.
     pub accounting_since: DateTime<Utc>,
     pub ordinary: DeliveryQueue,
     pub alert: DeliveryQueue,
@@ -300,15 +360,18 @@ pub struct RecordingDeliverySnapshot {
 }
 
 /// Add `d` to the `(minute of at, camera, source)` bucket and prune buckets
-/// more than [`BUCKET_RETENTION_SECS`] older than it. Callers run it in
+/// more than [`BUCKET_RETENTION_SECS`] older than it, or than the prune
+/// horizon of [`Store::check_clock`] if that is earlier. Callers run it in
 /// the transaction of the transition being counted.
 pub(crate) async fn add_to_bucket(
+    store: &Store,
     conn: &mut SqliteConnection,
     camera_id: CameraId,
     source: RecordingSource,
     at: DateTime<Utc>,
     d: &DeliveryCounters,
 ) -> Result<(), StoreError> {
+    let horizon = store.check_clock(conn).await?;
     let minute = at.timestamp().div_euclid(60) * 60;
     sqlx::query(
         "INSERT INTO recording_minute_buckets
@@ -346,7 +409,7 @@ pub(crate) async fn add_to_bucket(
     .execute(&mut *conn)
     .await?;
     sqlx::query("DELETE FROM recording_minute_buckets WHERE minute_utc < ?")
-        .bind(minute - BUCKET_RETENTION_SECS)
+        .bind(minute.min(horizon.timestamp().div_euclid(60) * 60) - BUCKET_RETENTION_SECS)
         .execute(&mut *conn)
         .await?;
     Ok(())
@@ -357,6 +420,39 @@ const COUNTER_SUMS: &str = "SUM(generated_bytes), SUM(generated_unknown_size_cou
     SUM(failure_count), SUM(evicted_before_upload_bytes), SUM(evicted_before_upload_count)";
 
 impl Store {
+    /// SPEC-090 — notice a wall-clock discontinuity: the wall clock moved
+    /// apart from monotonic time since this process's previous accounting
+    /// read or write, or it is behind a bucket already written. Either
+    /// moves `accounting_since` (persisted, never backward) past the
+    /// detection time and every written bucket, so no window overlapping
+    /// the discontinuity reads complete. Returns the prune horizon.
+    async fn check_clock(&self, conn: &mut SqliteConnection) -> Result<DateTime<Utc>, StoreError> {
+        let (wall, jumped, horizon) = self.delivery.observe_clock();
+        let newest: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(minute_utc) FROM recording_minute_buckets")
+                .fetch_one(&mut *conn)
+                .await?;
+        let behind = newest.is_some_and(|m| wall.timestamp() + CLOCK_TOLERANCE_SECS < m);
+        if jumped || behind {
+            let past_buckets = newest
+                .and_then(|m| DateTime::from_timestamp(m + 60, 0))
+                .unwrap_or(wall);
+            let restart = wall.max(past_buckets);
+            // Same text shape as the migration's, so the comparison is by time.
+            let moved = sqlx::query(
+                "UPDATE recording_delivery_baseline SET accounting_since = ?1
+                  WHERE id = 1 AND accounting_since < ?1",
+            )
+            .bind(restart.to_rfc3339_opts(SecondsFormat::Millis, true))
+            .execute(&mut *conn)
+            .await?;
+            if moved.rows_affected() > 0 {
+                tracing::warn!(%wall, %restart, "recording delivery: wall clock discontinuity; accounting restarts");
+            }
+        }
+        Ok(horizon)
+    }
+
     /// Every finalized, undelivered row of `source`'s queue with its
     /// partition at `now` and enrollment `floor`, by id. The snapshot
     /// aggregates the same classification.
@@ -406,7 +502,7 @@ impl Store {
             retry_count: i64::from(row.get::<i64, _>(1) > 0),
             ..DeliveryCounters::default()
         };
-        add_to_bucket(&mut conn, row.get(0), source, at, &counters).await
+        add_to_bucket(self, &mut conn, row.get(0), source, at, &counters).await
     }
 
     /// The enrolled core's upload floor, for eviction accounting. A failed
@@ -447,7 +543,7 @@ impl Store {
                     evicted_before_upload_count: count,
                     ..DeliveryCounters::default()
                 };
-                add_to_bucket(conn, camera_id, source, Utc::now(), &lost).await?;
+                add_to_bucket(self, conn, camera_id, source, Utc::now(), &lost).await?;
             }
         }
         Ok(())
@@ -461,6 +557,9 @@ impl Store {
         floor: Option<DateTime<Utc>>,
     ) -> Result<RecordingDeliverySnapshot, StoreError> {
         let floor = floor.map(|f| f.to_rfc3339());
+        // A jump with no write since must not leave its windows complete;
+        // checked outside the read transaction, which then never writes.
+        self.check_clock(&mut *self.pool.acquire().await?).await?;
         let mut tx = self.pool.begin().await?;
         let since: String = sqlx::query_scalar(
             "SELECT accounting_since FROM recording_delivery_baseline WHERE id = 1",
@@ -607,4 +706,154 @@ async fn bucket_sums(
         })
         .collect();
     Ok((core, cameras))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ClipClose, NewClip};
+    use chrono::SecondsFormat;
+    use nexus_config::StoreConfig;
+
+    async fn open(dir: &std::path::Path) -> Store {
+        Store::open(&StoreConfig {
+            url: format!("sqlite://{}/store.db?mode=rwc", dir.display()),
+            ..StoreConfig::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Camera 1, with accounting begun two days before `t0`.
+    async fn store_since(dir: &std::path::Path, t0: DateTime<Utc>) -> Store {
+        let store = open(dir).await;
+        sqlx::query(
+            "INSERT INTO cameras (id, name, url, config_json) VALUES (1, 'c', 'rtsp://h/s', '{}')",
+        )
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE recording_delivery_baseline SET accounting_since = ?")
+            .bind((t0 - Duration::days(2)).to_rfc3339_opts(SecondsFormat::Millis, true))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store
+    }
+
+    async fn closed(store: &Store, started: DateTime<Utc>, size_bytes: i64) -> i64 {
+        let id = store
+            .open_clip(&NewClip {
+                camera_id: 1,
+                started_at: started,
+                hot_path: format!("1/{}.mp4", started.timestamp_millis()),
+                codec: "h264".into(),
+                container: "mp4".into(),
+                hot_handle: "local".into(),
+                frame_width: 960,
+                frame_height: 540,
+            })
+            .await
+            .unwrap();
+        let close = ClipClose {
+            ended_at: started + Duration::seconds(30),
+            duration_ms: 30_000,
+            size_bytes,
+            hot_path: None,
+            sha256: Some("a".repeat(64)),
+        };
+        store.close_clip(id, &close).await.unwrap();
+        id
+    }
+
+    fn set_wall(store: &Store, wall: DateTime<Utc>) {
+        store.delivery.clock.lock().unwrap().test_wall = Some(wall);
+    }
+
+    /// The review's reproduction: an hour holding 3.6 MB generated and an
+    /// eviction, then the wall clock jumps ten days forward, a write lands
+    /// there, and the clock is corrected. No window overlapping the jump
+    /// reads complete, the hour's history is not pruned, and the moved
+    /// `accounting_since` survives a restart.
+    #[tokio::test]
+    async fn recording_delivery_clock_jump_forward_then_back_leaves_no_complete_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let store = store_since(dir.path(), t0).await;
+        let generated = closed(&store, t0 - Duration::minutes(30), 3_600_000).await;
+        let lost = closed(&store, t0 - Duration::minutes(20), 500).await;
+        store.cascade_delete_clip_metadata(lost).await.unwrap();
+        let sample = t0 + Duration::minutes(2);
+        let before = store.recording_delivery_stats(sample, None).await.unwrap();
+        assert!(before.windows.iter().all(|w| w.complete));
+        assert_eq!(before.windows[0].core.ordinary.generated_bytes, 3_600_500);
+
+        let jumped = t0 + Duration::days(10);
+        set_wall(&store, jumped);
+        store
+            .record_upload_attempt(RecordingSource::Ordinary, generated, jumped, 1)
+            .await
+            .unwrap();
+        let during = store
+            .recording_delivery_stats(jumped + Duration::minutes(2), None)
+            .await
+            .unwrap();
+        assert!(
+            during.windows.iter().all(|w| !w.complete),
+            "on the jumped clock"
+        );
+
+        let corrected = t0 + Duration::minutes(1);
+        set_wall(&store, corrected);
+        store
+            .record_upload_attempt(RecordingSource::Ordinary, generated, corrected, 1)
+            .await
+            .unwrap();
+        let after = store.recording_delivery_stats(sample, None).await.unwrap();
+        for w in &after.windows {
+            assert!(
+                !w.complete,
+                "the {} s window overlaps the jump",
+                w.window_seconds
+            );
+        }
+        let o = after.windows[0].core.ordinary;
+        assert_eq!(
+            (o.generated_bytes, o.evicted_before_upload_count),
+            (3_600_500, 1),
+            "the jump did not prune the hour away"
+        );
+        assert!(after.accounting_since > jumped, "past every jumped bucket");
+
+        store.pool.close().await;
+        let store = open(dir.path()).await;
+        let reopened = store.recording_delivery_stats(sample, None).await.unwrap();
+        assert_eq!(reopened.accounting_since, after.accounting_since);
+    }
+
+    /// A restart after twenty minutes down is not a discontinuity: the new
+    /// process has no earlier reading to drift from, and the wall clock is
+    /// past every bucket.
+    #[tokio::test]
+    async fn recording_delivery_restart_without_clock_jump_keeps_windows_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let store = store_since(dir.path(), t0).await;
+        set_wall(&store, t0 - Duration::minutes(30));
+        closed(&store, t0 - Duration::minutes(31), 1_000).await;
+        let since = store
+            .recording_delivery_stats(t0, None)
+            .await
+            .unwrap()
+            .accounting_since;
+        store.pool.close().await;
+
+        let store = open(dir.path()).await;
+        set_wall(&store, t0 - Duration::minutes(10));
+        closed(&store, t0 - Duration::minutes(11), 2_000).await;
+        let snap = store.recording_delivery_stats(t0, None).await.unwrap();
+        assert_eq!(snap.accounting_since, since);
+        assert!(snap.windows.iter().all(|w| w.complete));
+        assert_eq!(snap.windows[0].core.ordinary.generated_bytes, 3_000);
+    }
 }

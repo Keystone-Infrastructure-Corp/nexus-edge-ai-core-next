@@ -273,6 +273,8 @@ pub trait EventStore: Send + Sync {
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+    /// SPEC-090 accounting state that lives only in this process.
+    delivery: Arc<recording_delivery::DeliveryState>,
 }
 
 impl Store {
@@ -304,7 +306,10 @@ impl Store {
             pool
         };
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            delivery: Arc::default(),
+        })
     }
 
     async fn build_pool(opts: SqliteConnectOptions) -> Result<SqlitePool, StoreError> {

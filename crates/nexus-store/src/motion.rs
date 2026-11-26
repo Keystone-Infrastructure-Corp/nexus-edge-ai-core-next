@@ -423,7 +423,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
-        Self::close_clip_on(&mut *tx, clip_id, close).await?;
+        self.close_clip_on(&mut *tx, clip_id, close).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -437,13 +437,14 @@ impl Store {
     /// this being non-NULL.
     pub async fn close_clip(&self, clip_id: ClipId, close: &ClipClose) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        Self::close_clip_on(&mut *tx, clip_id, close).await?;
+        self.close_clip_on(&mut *tx, clip_id, close).await?;
         tx.commit().await?;
         Ok(())
     }
 
     /// Close stamp plus SPEC-090 generation accounting, inside the caller's transaction.
     async fn close_clip_on(
+        &self,
         conn: &mut sqlx::SqliteConnection,
         clip_id: ClipId,
         close: &ClipClose,
@@ -526,6 +527,7 @@ impl Store {
         if let Some(r) = counted {
             let generated = DeliveryCounters::generated(r.get(1), r.get(2));
             add_to_bucket(
+                self,
                 conn,
                 r.get(0),
                 RecordingSource::Ordinary,
@@ -674,6 +676,7 @@ impl Store {
         if row.get::<bool, _>(2) {
             let evicted = DeliveryCounters::evicted(row.get(1));
             add_to_bucket(
+                self,
                 &mut tx,
                 row.get(0),
                 RecordingSource::Ordinary,
@@ -1227,6 +1230,7 @@ impl Store {
                 ..DeliveryCounters::default()
             };
             add_to_bucket(
+                self,
                 &mut tx,
                 r.get(0),
                 RecordingSource::Ordinary,
@@ -1420,7 +1424,15 @@ impl Store {
             failure_count: 1,
             ..DeliveryCounters::default()
         };
-        add_to_bucket(&mut tx, camera_id, RecordingSource::Ordinary, now, &failed).await?;
+        add_to_bucket(
+            self,
+            &mut tx,
+            camera_id,
+            RecordingSource::Ordinary,
+            now,
+            &failed,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
