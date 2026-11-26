@@ -265,6 +265,9 @@ impl EntryKey {
 fn changed_behavior_field(started: &CameraBehavior, want: &CameraBehavior) -> Option<&'static str> {
     let CameraBehavior {
         parking_lot_mode,
+        // SPEC-077: the whole optional policy, so a value edit, enable or
+        // disable restarts the camera; no part of it is hot-applied.
+        parking_policy_v2,
         anchor_ttl_secs,
         detector_skip_crowded_threshold,
         detector_skip_every_n_frames,
@@ -293,6 +296,8 @@ fn changed_behavior_field(started: &CameraBehavior, want: &CameraBehavior) -> Op
 
     if *parking_lot_mode != started.parking_lot_mode {
         Some("parking_lot_mode")
+    } else if *parking_policy_v2 != started.parking_policy_v2 {
+        Some("parking_policy_v2")
     } else if *anchor_ttl_secs != started.anchor_ttl_secs {
         Some("anchor_ttl_secs")
     } else if *detector_skip_crowded_threshold != started.detector_skip_crowded_threshold {
@@ -1346,8 +1351,8 @@ pub(crate) fn spawn_supervisor(
 mod tests {
     use super::*;
     use nexus_config::{
-        CameraBehavior, CameraDetector, CameraIngest, CameraOnvif, CameraTalkDown, RecorderKind,
-        TileGridConfig, ZoneKind,
+        CameraBehavior, CameraDetector, CameraIngest, CameraOnvif, CameraTalkDown, ParkingPolicyV2,
+        RecorderKind, TileGridConfig, ZoneKind,
     };
     use nexus_pipeline::zone_application::{
         zone_revision, ZoneApplicationError, ZoneApplicationState, ZonesRuntime,
@@ -3231,6 +3236,139 @@ mod tests {
         );
     }
 
+    /// SPEC-077 — candidate values from the plan's calibration grid.
+    fn parking_policy() -> ParkingPolicyV2 {
+        ParkingPolicyV2 {
+            dwell_secs: 10.0,
+            max_speed_box_diagonals_per_sec: 0.05,
+            max_displacement_box_diagonals: 0.10,
+            max_observation_gap_secs: 3.0,
+        }
+    }
+
+    /// One save that changes only camera 7's `parking_policy_v2`.
+    type PolicyEdit = (&'static str, fn(&mut Option<ParkingPolicyV2>));
+
+    /// SPEC-077 — `run_camera` reads the behavior block once, so a policy the
+    /// key left out would keep running its old thresholds until the engine
+    /// restarted, as `parking_lot_mode` did (BUG-285). Each save changes one
+    /// policy value, or enables or disables v2, and never the polygons. The
+    /// store keeps each row as written, so the reconciler does not rely on the
+    /// API refusing a parking zone without v2. Camera 8 must not notice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parking_policy_only_save_restarts_only_affected_camera_and_finalizes_clip() {
+        let edits: [PolicyEdit; 6] = [
+            ("change dwell_secs", |p| {
+                p.as_mut().expect("v2").dwell_secs = 20.0
+            }),
+            ("change max_speed_box_diagonals_per_sec", |p| {
+                p.as_mut().expect("v2").max_speed_box_diagonals_per_sec = 0.02
+            }),
+            ("change max_displacement_box_diagonals", |p| {
+                p.as_mut().expect("v2").max_displacement_box_diagonals = 0.20
+            }),
+            ("change max_observation_gap_secs", |p| {
+                p.as_mut().expect("v2").max_observation_gap_secs = 6.0
+            }),
+            ("disable v2", |p| *p = None),
+            ("enable v2", |p| *p = Some(parking_policy())),
+        ];
+        let mut camera = cam(None);
+        camera.behavior.parking_lot_mode = true;
+        camera.behavior.parking_policy_v2 = Some(parking_policy());
+        camera.zones = vec![ZoneConfig {
+            kind: ZoneKind::Parking,
+            ..corner()
+        }];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(
+            recorder.clone(),
+            dir.path(),
+            &[camera.clone(), cam_with_id(8)],
+        )
+        .await;
+        reconcile(&args).await.expect("initial pass");
+        // The mock detector's person opens a clip, which each restart must
+        // finalize before the replacement opens the next one.
+        wait_until("precondition: both cameras opened a clip", || {
+            recorder.opens_of(7) == 1 && recorder.opens_of(8) == 1
+        })
+        .await;
+        let neighbour = entry_of(&args.handles, 8);
+
+        for (what, edit) in edits {
+            let before = entry_of(&args.handles, 7);
+            let logged = recorder.calls_of(7).len();
+            let opens = recorder.opens_of(7) as i64;
+            let sources = recorder.sources_built(7);
+            assert_eq!(
+                recorder.calls_of(7).last(),
+                Some(&ClipCall::Open(opens)),
+                "{what}: precondition: camera 7 has a clip open"
+            );
+            edit(&mut camera.behavior.parking_policy_v2);
+            args.store.upsert_camera(&camera).await.expect(what);
+            reconcile(&args).await.expect(what);
+
+            let now = entry_of(&args.handles, 7);
+            if Arc::ptr_eq(&now.task, &before.task) {
+                abort_all(&args.handles);
+                panic!(
+                    "{what}: the saved parking policy did not restart camera 7, so it keeps \
+                     its old thresholds until the engine restarts"
+                );
+            }
+            assert_eq!(
+                (&now.key.behavior.parking_policy_v2, &now.key.zones),
+                (&camera.behavior.parking_policy_v2, &camera.zones),
+                "{what}: the new supervisor runs exactly the saved policy and the same zones"
+            );
+            wait_until(&format!("{what}: the replacement must open a clip"), || {
+                recorder.opens_of(7) as i64 == opens + 1
+            })
+            .await;
+            assert_eq!(
+                recorder.calls_of(7)[logged..],
+                [
+                    ClipCall::Close(opens),
+                    ClipCall::IngesterRemoved,
+                    ClipCall::Open(opens + 1)
+                ],
+                "{what}: one stop that finalizes the open clip while its ingester exists, \
+                 then one start"
+            );
+            assert_eq!(recorder.sources_built(7), sources + 1, "{what}: one start");
+        }
+
+        // Saving the same policy again is not an edit.
+        let before = entry_of(&args.handles, 7);
+        let logged = recorder.calls_of(7).len();
+        args.store
+            .upsert_camera(&camera)
+            .await
+            .expect("identical save");
+        reconcile(&args)
+            .await
+            .expect("pass after an identical save");
+        let unchanged = Arc::ptr_eq(&entry_of(&args.handles, 7).task, &before.task);
+        let now_neighbour = entry_of(&args.handles, 8);
+        abort_all(&args.handles);
+        assert!(unchanged, "an identical save restarted camera 7");
+        assert_eq!(
+            recorder.calls_of(7).len(),
+            logged,
+            "an identical save stopped or reopened camera 7's recording"
+        );
+        assert!(
+            Arc::ptr_eq(&now_neighbour.task, &neighbour.task)
+                && !recorder.calls_of(8).contains(&ClipCall::IngesterRemoved)
+                && recorder.sources_built(8) == 1,
+            "camera 7's policy saves stopped or restarted camera 8"
+        );
+    }
+
     /// Camera `id`'s zone status as the stats read builds it: the revision
     /// and enabled flag saved now against what its generations acknowledged.
     async fn zones_status(
@@ -4403,6 +4541,9 @@ mod tests {
         let before = CameraBehavior::default();
         let mutations: Vec<BehaviorMutation> = vec![
             ("parking_lot_mode", |b| b.parking_lot_mode = true),
+            ("parking_policy_v2", |b| {
+                b.parking_policy_v2 = Some(parking_policy())
+            }),
             ("anchor_ttl_secs", |b| b.anchor_ttl_secs = Some(900)),
             ("detector_skip_crowded_threshold", |b| {
                 b.detector_skip_crowded_threshold = Some(25)
