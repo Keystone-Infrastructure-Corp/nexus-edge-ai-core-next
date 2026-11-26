@@ -143,6 +143,9 @@ export interface CameraConfig {
   visual_prompts?: VisualPromptRef[];
   model_override?: ModelOverride | null;
   parking_lot_mode?: boolean;
+  /// SPEC-077 — the explicit parking stillness policy; absent is the legacy
+  /// static filter. Sent only when set: an engine without it rejects the key.
+  parking_policy_v2?: ParkingPolicyV2;
   // Per-camera override for the engine-wide `tracker.static_object.anchor_ttl_secs`.
   // Anchors with no matching observation older than this many seconds get
   // swept on the next classify tick. Leave undefined to inherit the engine
@@ -804,13 +807,27 @@ export interface HealthResponse {
 // Rust side hasn't grown a ts-rs derive yet.
 // ---------------------------------------------------------------------------
 
-export type ZoneKind = "inclusion" | "exclusion" | "dwell";
+/** `parking` (SPEC-077) only where the engine reports parking; it filters no detection. */
+export type ZoneKind = "inclusion" | "exclusion" | "dwell" | "parking";
 
 export interface ZoneConfig {
   id: string;
   name: string;
   polygon: Array<[number, number]>;
   kind: ZoneKind;
+  /** Not edited here; a parking zone cannot keep one. */
+  min_bbox_area_px_override?: number | null;
+}
+
+/**
+ * SPEC-077 `parking_policy_v2`, hand-mirrored from `nexus_config::ParkingPolicyV2`.
+ * Every value is required, finite and above 0; there is no default.
+ */
+export interface ParkingPolicyV2 {
+  dwell_secs: number;
+  max_speed_box_diagonals_per_sec: number;
+  max_displacement_box_diagonals: number;
+  max_observation_gap_secs: number;
 }
 
 // SPEC-088 zone application, hand-mirrored from `CameraConfigSnapshot`
@@ -825,11 +842,19 @@ export interface ZoneConfig {
 export interface CameraConfigSnapshot {
   schema_version: 1;
   camera_id: number;
-  settings: { zones: ZoneConfig[] };
+  settings: {
+    zones: ZoneConfig[];
+    /**
+     * SPEC-077, with `parking_revision` (the digest of the zones, the mode
+     * and the policy): absent from an engine without parking.
+     */
+    parking?: { parking_lot_mode: boolean; parking_policy_v2: ParkingPolicyV2 | null };
+  };
   zones_revision: string;
+  parking_revision?: string;
 }
 
-/** The optional `zones_runtime` receipt on a camera-stats read. */
+/** The optional `zones_runtime` receipt on a camera-stats read; `parking_runtime` (SPEC-077) has its shape. */
 export interface ZonesRuntime {
   schema_version: 1;
   desired_revision: string;

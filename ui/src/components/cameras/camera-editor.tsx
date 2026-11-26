@@ -204,8 +204,10 @@ function restartQuery(
  * save (`base` = null): the draft's zones are dirty when they are another
  * array. `installed` is the snapshot shown, with the acceptance seq of its
  * installation; `awaiting` a settled save whose snapshot is not installed
- * yet; `generation` the newest supervisor generation read here. The latest
- * save start or end is per camera, outside the editor (`zoneSaveSeq`).
+ * yet; `generation` the newest supervisor generation read here, and
+ * `parkingGeneration` the newest of the parking receipt's own (SPEC-077).
+ * The latest save start or end is per camera, outside the editor
+ * (`zoneSaveSeq`).
  */
 type ZoneView = {
   synced: ZoneConfig[] | undefined;
@@ -214,6 +216,7 @@ type ZoneView = {
   savedAt: number | null;
   awaiting: boolean;
   generation: number;
+  parkingGeneration: number;
 };
 
 type Saved = { camera: CameraConfig; zones: ZoneConfig[] | undefined; revision: string | null };
@@ -264,6 +267,7 @@ const unreadZoneView = (zones: ZoneConfig[] | undefined): ZoneView => ({
   savedAt: null,
   awaiting: false,
   generation: -1,
+  parkingGeneration: -1,
 });
 
 const APPLICATION_BADGE: Record<
@@ -548,6 +552,7 @@ export function CameraEditor({
   const epoch: AcceptanceEpoch = {
     seq: Math.max(zoneSaveSeq(camera.id), zoneView.installed?.seq ?? 0),
     generation: zoneView.generation,
+    parkingGeneration: zoneView.parkingGeneration,
   };
   const zonePollMs = (read: ReceiptRead & { error: unknown }) =>
     zoneApplicationPollMs(
@@ -572,10 +577,15 @@ export function CameraEditor({
     retry: false,
     refetchOnWindowFocus: (q) => (zonePollMs(q.state) === false ? false : "always"),
   });
-  const readGeneration =
-    statsQ.data?.body.camera_id === camera.id ? receiptGeneration(statsQ.data.body) : undefined;
-  if (readGeneration !== undefined && readGeneration > zoneView.generation) {
-    setZoneView((v) => (readGeneration > v.generation ? { ...v, generation: readGeneration } : v));
+  const readBody = statsQ.data?.body.camera_id === camera.id ? statsQ.data.body : undefined;
+  const readGeneration = receiptGeneration(readBody) ?? -1;
+  const readParkingGeneration = receiptGeneration(readBody, "parking_runtime") ?? -1;
+  if (readGeneration > zoneView.generation || readParkingGeneration > zoneView.parkingGeneration) {
+    setZoneView((v) => ({
+      ...v,
+      generation: Math.max(v.generation, readGeneration),
+      parkingGeneration: Math.max(v.parkingGeneration, readParkingGeneration),
+    }));
   }
   const application = deriveZoneApplication(saved, statsQ, zoneDraft, epoch);
   const pollMs = zoneApplicationPollMs(application, [statsQ.error, snapQ.error], zoneView.savedAt);
