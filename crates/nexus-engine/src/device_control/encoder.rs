@@ -99,6 +99,7 @@ pub struct EncoderPut {
 /// `PUT /v1/admin/cameras/{id}/encoder` — write one encoder config.
 /// The token must be one the camera lists and every changed value must
 /// fit *that* configuration's options; otherwise nothing is written.
+/// Fields the request omits keep the camera's current values.
 pub async fn encoder_put(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
@@ -110,21 +111,24 @@ pub async fn encoder_put(
     rbac(&ctx, Role::Admin)?;
     const ACTION: &str = "camera.onvif.encoder.set";
     let t = onvif_target(&s, id).await?;
-    if let Err(ApiError(status, e)) = preflight(&t, &req.config, PUT_READ_BUDGET).await {
-        audit(
-            &s,
-            &ctx,
-            &headers,
-            peer.ip(),
-            ACTION,
-            id,
-            AuditOutcome::Failure,
-            Some(&e),
-        )
-        .await;
-        return Err(ApiError(status, e));
-    }
-    let res = set_config(&t, &req.config, req.force_persistence).await;
+    let config = match preflight(&t, req.config, PUT_READ_BUDGET).await {
+        Ok(config) => config,
+        Err(ApiError(status, e)) => {
+            audit(
+                &s,
+                &ctx,
+                &headers,
+                peer.ip(),
+                ACTION,
+                id,
+                AuditOutcome::Failure,
+                Some(&e),
+            )
+            .await;
+            return Err(ApiError(status, e));
+        }
+    };
+    let res = set_config(&t, &config, req.force_persistence).await;
     finish_void(&s, &ctx, &headers, peer.ip(), ACTION, id, res).await
 }
 
@@ -166,17 +170,21 @@ fn unknown_token() -> ApiError {
 /// write, so nothing is written.
 async fn preflight(
     t: &OnvifTarget,
-    new: &VideoEncoderConfig,
+    new: VideoEncoderConfig,
     budget: Duration,
-) -> Result<(), ApiError> {
+) -> Result<VideoEncoderConfig, ApiError> {
     tokio::time::timeout(budget, check_selected(t, new))
         .await
         .unwrap_or_else(|_| Err(enc_err("encoder read timed out; nothing written".into())))
 }
 
 /// Read the camera's current config for `new.token` and that
-/// configuration's options, then [`check_write`].
-async fn check_selected(t: &OnvifTarget, new: &VideoEncoderConfig) -> Result<(), ApiError> {
+/// configuration's options, [`merge`] `new` onto it and [`check_write`]
+/// the result, which is the configuration to write.
+async fn check_selected(
+    t: &OnvifTarget,
+    new: VideoEncoderConfig,
+) -> Result<VideoEncoderConfig, ApiError> {
     let configs =
         onvif_encoder::get_video_encoder_configurations(&t.endpoint, &t.username, &t.password)
             .await
@@ -185,19 +193,41 @@ async fn check_selected(t: &OnvifTarget, new: &VideoEncoderConfig) -> Result<(),
         .iter()
         .find(|c| c.token == new.token)
         .ok_or_else(unknown_token)?;
+    let merged = merge(new, current);
     // Judged by the codec being written: a camera may list every codec's.
-    let encoding = new.encoding.as_deref().or(current.encoding.as_deref());
     let options = onvif_encoder::get_video_encoder_configuration_options(
         &t.endpoint,
         &t.username,
         &t.password,
-        Some(&new.token),
+        Some(&merged.token),
         None,
-        encoding,
+        merged.encoding.as_deref(),
     )
     .await
     .map_err(enc_err)?;
-    check_write(new, current, &options).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))
+    check_write(&merged, current, &options).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    Ok(merged)
+}
+
+/// `new`'s set fields over the camera's `current` values. The write sends
+/// a whole configuration, so a field the request omits keeps the camera's
+/// value (SPEC-090 D-6) instead of dropping out of the SOAP body.
+fn merge(new: VideoEncoderConfig, current: &VideoEncoderConfig) -> VideoEncoderConfig {
+    let cur = current.clone();
+    VideoEncoderConfig {
+        token: new.token,
+        name: new.name.or(cur.name),
+        use_count: new.use_count.or(cur.use_count),
+        encoding: new.encoding.or(cur.encoding),
+        width: new.width.or(cur.width),
+        height: new.height.or(cur.height),
+        quality: new.quality.or(cur.quality),
+        frame_rate_limit: new.frame_rate_limit.or(cur.frame_rate_limit),
+        encoding_interval: new.encoding_interval.or(cur.encoding_interval),
+        bitrate_limit: new.bitrate_limit.or(cur.bitrate_limit),
+        gov_length: new.gov_length.or(cur.gov_length),
+        profile: new.profile.or(cur.profile),
+    }
 }
 
 /// Every field the write changes must fit the selected configuration's
@@ -635,7 +665,7 @@ mod tests {
     #[tokio::test]
     async fn options_fault_with_credential_uri_is_sanitized() {
         let t = fault_camera().await;
-        let ApiError(_, e) = check_selected(&t, &cfg("VE")).await.unwrap_err();
+        let ApiError(_, e) = check_selected(&t, cfg("VE")).await.unwrap_err();
         assert_clean(&e);
     }
 
@@ -869,7 +899,9 @@ mod tests {
                     ..sub.clone()
                 },
             ] {
-                let got = check_selected(&t, &bad).await.map_err(|ApiError(s, _)| s);
+                let got = check_selected(&t, bad.clone())
+                    .await
+                    .map_err(|ApiError(s, _)| s);
                 assert_eq!(got, Err(StatusCode::BAD_REQUEST), "{bad:?}");
             }
             for ok in [
@@ -886,8 +918,10 @@ mod tests {
                     ..jpeg.clone()
                 },
             ] {
-                let got = check_selected(&t, &ok).await.map_err(|ApiError(_, e)| e);
-                assert_eq!(got, Ok(()), "{ok:?}");
+                let got = check_selected(&t, ok.clone())
+                    .await
+                    .map_err(|ApiError(_, e)| e);
+                assert_eq!(got, Ok(ok.clone()), "a full config is written as sent");
             }
         }
     }
@@ -904,7 +938,7 @@ mod tests {
         // Two reads of 300 ms each: past a 450 ms budget, inside a 3 s one.
         let t = camera(&[H264_OPTS], Duration::from_millis(300)).await;
         let started = std::time::Instant::now();
-        let ApiError(status, e) = preflight(&t, &cfg("VE_sub"), Duration::from_millis(450))
+        let ApiError(status, e) = preflight(&t, cfg("VE_sub"), Duration::from_millis(450))
             .await
             .unwrap_err();
         assert_eq!(
@@ -915,9 +949,87 @@ mod tests {
             )
         );
         assert!(started.elapsed() < Duration::from_secs(1));
-        let got = preflight(&t, &cfg("VE_sub"), Duration::from_secs(3))
+        let got = preflight(&t, cfg("VE_sub"), Duration::from_secs(3))
             .await
+            .map(drop)
             .map_err(|ApiError(_, e)| e);
         assert_eq!(got, Ok(()));
+    }
+
+    /// An H265 configuration reporting every field the write carries.
+    const FULL_H265: &str = concat!(
+        r#"<trt:Configurations token="VE_sub"><tt:Name>sub</tt:Name><tt:UseCount>2</tt:UseCount><tt:Encoding>H265</tt:Encoding>"#,
+        r#"<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution><tt:Quality>4</tt:Quality>"#,
+        r#"<tt:RateControl><tt:FrameRateLimit>15</tt:FrameRateLimit><tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>2048</tt:BitrateLimit></tt:RateControl>"#,
+        r#"<tt:H265><tt:GovLength>30</tt:GovLength><tt:H265Profile>Main</tt:H265Profile></tt:H265></trt:Configurations>"#,
+    );
+
+    /// SPEC-090 D-6: a PUT carrying only the changed field writes the
+    /// camera's configuration with just that field changed, and the change
+    /// is still judged by that configuration's options.
+    #[tokio::test]
+    async fn a_partial_write_keeps_every_untouched_field() {
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let srv = MockServer::start().await;
+        for (action, inner) in [
+            (
+                "GetVideoEncoderConfigurations",
+                format!("<trt:GetVideoEncoderConfigurationsResponse>{FULL_H265}</trt:GetVideoEncoderConfigurationsResponse>"),
+            ),
+            (
+                "GetVideoEncoderConfigurationOptions",
+                "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options><tt:Extension><tt:H265><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>4096</tt:Max></tt:BitrateRange></tt:H265></tt:Extension></trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>".into(),
+            ),
+            (
+                "SetVideoEncoderConfiguration",
+                "<trt:SetVideoEncoderConfigurationResponse/>".into(),
+            ),
+        ] {
+            Mock::given(body_string_contains(action))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body>{inner}</s:Body></s:Envelope>"#
+                )))
+                .mount(&srv)
+                .await;
+        }
+        let t = OnvifTarget {
+            endpoint: format!("{}/onvif/device_service", srv.uri()),
+            username: "admin".into(),
+            password: test_secret("pw"),
+        };
+        let partial = |bitrate| VideoEncoderConfig {
+            bitrate_limit: Some(bitrate),
+            ..cfg("VE_sub")
+        };
+        let got = preflight(&t, partial(8000), PUT_READ_BUDGET)
+            .await
+            .map_err(|ApiError(s, _)| s);
+        assert_eq!(got, Err(StatusCode::BAD_REQUEST));
+        let config = preflight(&t, partial(1536), PUT_READ_BUDGET).await.unwrap();
+        set_config(&t, &config, false).await.unwrap();
+        let sets: Vec<String> = srv
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("SetVideoEncoderConfiguration"))
+            .collect();
+        assert_eq!(sets.len(), 1, "only the valid write is sent: {sets:?}");
+        for field in [
+            r#"token="VE_sub""#,
+            "<tt:Name>sub</tt:Name>",
+            "<tt:UseCount>2</tt:UseCount>",
+            "<tt:Encoding>H265</tt:Encoding>",
+            "<tt:Width>1280</tt:Width><tt:Height>720</tt:Height>",
+            "<tt:Quality>4</tt:Quality>",
+            "<tt:FrameRateLimit>15</tt:FrameRateLimit>",
+            "<tt:EncodingInterval>1</tt:EncodingInterval>",
+            "<tt:BitrateLimit>1536</tt:BitrateLimit>",
+            "<tt:H265><tt:GovLength>30</tt:GovLength><tt:H265Profile>Main</tt:H265Profile></tt:H265>",
+        ] {
+            assert!(sets[0].contains(field), "{field} missing: {}", sets[0]);
+        }
     }
 }
