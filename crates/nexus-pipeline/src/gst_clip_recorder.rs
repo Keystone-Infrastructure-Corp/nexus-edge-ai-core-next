@@ -7219,6 +7219,101 @@ mod epoch_tests {
         );
     }
 
+    /// Time out a drain of camera 1, as a reconciler stop pass does, on its
+    /// clip's close blocked at the row step on a store with no free
+    /// connection, then free the store. Each later pass drains the camera
+    /// with no wait, polled once: do so every 50 ms, at most 100 times, until
+    /// one succeeds. Whether the first drain timed out, and the answers.
+    async fn zero_bound_drains_after_a_timed_out_one(
+        rec: &GstClipRecorder,
+        store: &Store,
+        clips_dir: &Path,
+    ) -> (bool, Vec<bool>) {
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        register_clip(rec, store, clips_dir, 1, started_at, None).await;
+        let mut held = Vec::new();
+        for _ in 0..store.pool().options().get_max_connections() {
+            held.push(store.pool().acquire().await.unwrap());
+        }
+        let timed_out = tokio::time::timeout(Duration::from_millis(500), rec.drain_camera(1))
+            .await
+            .is_err();
+        drop(held);
+        let mut answers = Vec::new();
+        for _ in 0..100 {
+            let drained = tokio::time::timeout(Duration::ZERO, rec.drain_camera(1)).await;
+            answers.push(matches!(drained, Ok(Ok(()))));
+            if answers.last() == Some(&true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        (timed_out, answers)
+    }
+
+    /// PR #405 review (reconciler): the close that timed a drain out ends
+    /// shortly after, and finalizes the clip; the next zero-bound drain
+    /// succeeds, so the camera does not stay stopping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_bound_drain_succeeds_once_the_timed_out_close_ends() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+
+        let (timed_out, answers) =
+            zero_bound_drains_after_a_timed_out_one(&rec, &store, &clips_dir).await;
+
+        assert!(timed_out, "precondition: the first drain timed out");
+        assert_eq!(
+            answers.last(),
+            Some(&true),
+            "no drain succeeded: {answers:?}"
+        );
+        assert!(rec.unfinalized.lock().is_empty(), "the clip is retained");
+    }
+
+    /// PR #405 review (reconciler): the close that timed a drain out fails at
+    /// its row step, the store rejecting writes. Zero-bound drains keep the
+    /// camera stopping while the clip has failed fewer than `FINALIZE_DRAINS`
+    /// attempts, each starting the clip's next retry, and the drain that
+    /// releases it succeeds: the hold ends, polled once per pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_bound_drains_hold_a_failed_clip_for_its_attempts_then_release_it() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        fail_clip_writes(&store).await;
+
+        let (timed_out, answers) =
+            zero_bound_drains_after_a_timed_out_one(&rec, &store, &clips_dir).await;
+        let attempted: Vec<u32> = rec
+            .unfinalized
+            .lock()
+            .values()
+            .map(|u| u.attempts)
+            .collect();
+
+        assert!(timed_out, "precondition: the first drain timed out");
+        assert!(
+            answers.len() > 1 && answers.last() == Some(&true),
+            "the clip did not hold the camera, or never released it: {answers:?}"
+        );
+        assert!(
+            matches!(attempted[..], [n] if n >= FINALIZE_DRAINS),
+            "released after {attempted:?} attempts"
+        );
+    }
+
     /// SPEC-088 review 10: deleting a recording camera cascades its clip rows
     /// before the reconciler stops it, so its clip's close, the supervisor's
     /// or the drain's, finds no row to stamp, nor to discard (camera 3's clip

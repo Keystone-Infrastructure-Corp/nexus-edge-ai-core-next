@@ -2076,12 +2076,15 @@ mod tests {
         }
     }
 
-    /// A [`ClipLogRecorder`] drain that does not succeed.
+    /// A [`ClipLogRecorder`] drain that does not succeed at once.
     enum Drain {
         /// Never finishes, as a close or open stalled in the recorder.
         Stalls,
         /// Reports a clip it could not finalize.
         Fails,
+        /// Succeeds once this reads true: the recorder's own tasks run its
+        /// work on whether or not a drain waits for them.
+        Until(tokio::sync::watch::Receiver<bool>),
     }
 
     impl ClipLogRecorder {
@@ -2200,19 +2203,23 @@ mod tests {
         async fn drain_camera(&self, camera_id: CameraId) -> Result<(), RecorderError> {
             let next = self.drains.lock().pop_front();
             match next {
-                Some(Drain::Stalls) => std::future::pending().await,
-                Some(Drain::Fails) => Err(RecorderError::Io(std::io::Error::other(
-                    "a clip could not be finalized",
-                ))),
-                None => {
-                    for clip_id in self.open_clips(camera_id) {
-                        self.calls
-                            .lock()
-                            .push((camera_id, ClipCall::Close(clip_id)));
-                    }
-                    Ok(())
+                Some(Drain::Stalls) => std::future::pending::<()>().await,
+                Some(Drain::Fails) => {
+                    return Err(RecorderError::Io(std::io::Error::other(
+                        "a clip could not be finalized",
+                    )))
                 }
+                Some(Drain::Until(mut done)) => {
+                    let _ = done.wait_for(|done| *done).await;
+                }
+                None => {}
             }
+            for clip_id in self.open_clips(camera_id) {
+                self.calls
+                    .lock()
+                    .push((camera_id, ClipCall::Close(clip_id)));
+            }
+            Ok(())
         }
         fn remove_camera_ingester(&self, camera_id: CameraId) {
             self.calls
@@ -2602,6 +2609,137 @@ mod tests {
                 ClipCall::Open(2),
             ],
             "once the drain succeeded, one pass tears the camera down and starts one replacement"
+        );
+    }
+
+    /// PR #405 review: once a stop pass timed out on the camera's drain, a
+    /// later pass drains it with no wait. The recorder work runs on in the
+    /// recorder's own tasks meanwhile, so work that finishes shortly after
+    /// the timed-out pass lets the next pass tear the camera down and start
+    /// one replacement: the camera does not stay stopping.
+    #[tokio::test]
+    async fn a_drain_finishing_after_its_pass_timed_out_lets_the_next_pass_restart_the_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: the supervisor opened a clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        let original = entry_of(&args.handles, 7);
+        let (finish, work) = tokio::sync::watch::channel(false);
+        recorder
+            .drains
+            .lock()
+            .extend([Drain::Until(work.clone()), Drain::Until(work)]);
+
+        // The drain's bound elapses on the paused clock.
+        tokio::time::pause();
+        let stopped = stop_camera(&args, 7).await;
+        tokio::time::resume();
+        finish.send_replace(true);
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), reconcile(&args)).await;
+        wait_until("the replacement opened a clip", || recorder.opens() == 2).await;
+        let replacement = entry_of(&args.handles, 7);
+        abort_all(&args.handles);
+
+        assert!(
+            !stopped,
+            "precondition: the first pass timed out on the drain"
+        );
+        assert!(
+            matches!(next, Ok(Ok(()))),
+            "the next pass waited on the drain"
+        );
+        assert!(!Arc::ptr_eq(&replacement.task, &original.task));
+        assert_eq!(
+            recorder.calls_of(7),
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved,
+                ClipCall::Open(2),
+            ],
+            "the next pass did not tear the camera down and start one replacement"
+        );
+    }
+
+    /// PR #405 review: work still in flight keeps the camera stopping across
+    /// every pass that checks it, none of them waiting on it. Once it ends
+    /// with a clip not finalized, the clip holds the camera stopping for its
+    /// remaining attempts (SPEC-088: three in all), and the drain that
+    /// releases it lets that pass restart the camera, once.
+    #[tokio::test]
+    async fn a_camera_stays_stopping_while_its_work_is_in_flight_and_its_clip_holds_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: the supervisor opened a clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        let original = entry_of(&args.handles, 7);
+        let is_original = |h: &HandleMap| {
+            h.lock()
+                .get(&7)
+                .is_some_and(|e| Arc::ptr_eq(&e.task, &original.task))
+        };
+        let (finish, work) = tokio::sync::watch::channel(false);
+        recorder.drains.lock().extend([
+            Drain::Until(work.clone()),
+            Drain::Until(work.clone()),
+            Drain::Until(work),
+            Drain::Fails,
+            Drain::Fails,
+        ]);
+
+        tokio::time::pause();
+        let stopped = stop_camera(&args, 7).await;
+        tokio::time::resume();
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let pass =
+                tokio::time::timeout(std::time::Duration::from_secs(5), reconcile(&args)).await;
+            held.push(matches!(pass, Ok(Ok(()))) && is_original(&args.handles));
+        }
+        finish.send_replace(true);
+        for _ in 0..2 {
+            reconcile(&args).await.expect("pass whose drain fails");
+            held.push(is_original(&args.handles));
+        }
+        let before_release = recorder.calls_of(7);
+        reconcile(&args)
+            .await
+            .expect("pass whose drain releases the clip");
+        wait_until("the replacement opened a clip", || recorder.opens() == 2).await;
+        let replacement = entry_of(&args.handles, 7);
+        abort_all(&args.handles);
+
+        assert!(
+            !stopped,
+            "precondition: the first pass timed out on the drain"
+        );
+        assert_eq!(
+            held, [true; 4],
+            "a pass waited on the drain or replaced the camera before its drain succeeded"
+        );
+        assert_eq!(
+            before_release,
+            [ClipCall::Open(1), ClipCall::Close(1)],
+            "the camera was torn down before its drain succeeded"
+        );
+        assert!(!Arc::ptr_eq(&replacement.task, &original.task));
+        assert_eq!(
+            recorder.calls_of(7),
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved,
+                ClipCall::Open(2),
+            ],
+            "the releasing pass did not tear the camera down and start one replacement"
         );
     }
 
