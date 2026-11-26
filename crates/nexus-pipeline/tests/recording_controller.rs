@@ -784,6 +784,7 @@ mod controller {
             camera_id: 1,
             generation: 6,
             policy,
+            policy_revision: "rev-start".into(),
             tracker: "bytetrack".into(),
             post_roll_secs: 1,
             pre_roll_secs: 0,
@@ -1394,7 +1395,10 @@ mod controller {
             Some(1)
         );
         let receipt = c
-            .send(RecordingCommand::PolicyChanged(None), LONG)
+            .send(
+                RecordingCommand::PolicyChanged(None, "rev-legacy".into()),
+                LONG,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1429,5 +1433,52 @@ mod controller {
             Some(1),
             "the link survived the rollback"
         );
+    }
+
+    /// SPEC-089 — the runtime reports the revision of the saved policy the
+    /// controller applied: the one it started with, then each live change's,
+    /// including a new revision of an unchanged policy (an ABA saved between
+    /// two passes), without a restart of the measurement's generation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_runtime_reports_the_policy_revision_the_controller_applied() {
+        let shadow = Some(RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 1_000,
+        });
+        let c = cam(config(shadow), 0, false, false).await;
+        let applied = |c: &Cam| c.runtime().map(|r| (r.mode, r.policy_revision));
+        assert_eq!(
+            applied(&c),
+            Some((RecordingPolicyMode::Shadow, "rev-start".to_owned()))
+        );
+        c.send(
+            RecordingCommand::PolicyChanged(shadow, "rev-aba".into()),
+            LONG,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            applied(&c),
+            Some((RecordingPolicyMode::Shadow, "rev-aba".to_owned()))
+        );
+        let observed = Some(RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Observed,
+            analysis_stale_after_ms: 1_000,
+        });
+        c.send(
+            RecordingCommand::PolicyChanged(observed, "rev-3".into()),
+            LONG,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            applied(&c),
+            Some((RecordingPolicyMode::Shadow, "rev-3".to_owned())),
+            "observed runs as shadow in this build, under its own revision"
+        );
+        c.send(RecordingCommand::PolicyChanged(None, "rev-4".into()), LONG)
+            .await
+            .unwrap();
+        assert_eq!(applied(&c), None, "legacy reports no runtime");
     }
 }

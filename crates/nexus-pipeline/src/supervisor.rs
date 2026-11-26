@@ -316,6 +316,7 @@ pub fn spawn_camera(
             camera_id,
             generation: zone_generation,
             policy: cfg.behavior.recording_policy,
+            policy_revision: cfg.behavior.recording_policy_revision.clone(),
             tracker: tracker.name().to_owned(),
             post_roll_secs: clips_cfg.post_roll_secs,
             pre_roll_secs: clips_cfg.pre_roll_secs,

@@ -6418,6 +6418,7 @@ mod epoch_tests {
                 camera_id: 1,
                 generation: 1,
                 policy: None,
+                policy_revision: String::new(),
                 tracker: "bytetrack".into(),
                 post_roll_secs: 10,
                 pre_roll_secs: 10,

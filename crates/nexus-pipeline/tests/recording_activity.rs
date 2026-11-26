@@ -995,6 +995,7 @@ mod supervisor_shadow {
             },
             behavior: CameraBehavior {
                 recording_policy,
+                recording_policy_revision: "rev-saved".into(),
                 ..Default::default()
             },
             onvif: Default::default(),
@@ -1161,7 +1162,10 @@ mod supervisor_shadow {
         assert!(legacy.minutes.is_empty() && legacy.episodes.is_empty());
         let runtime = shadow.runtime.expect("shadow reports its runtime");
         assert_eq!(runtime.mode, RecordingPolicyMode::Shadow);
-        assert!(runtime.policy_revision.starts_with("sha256:"));
+        assert_eq!(
+            runtime.policy_revision, "rev-saved",
+            "the runtime names the saved revision it runs"
+        );
         assert!(runtime.diagnostics.last_failure_age_ms.is_some());
         assert!(!runtime.diagnostics.trace_incomplete);
         assert_eq!(runtime.diagnostics.collector_error, None);
@@ -1185,10 +1189,13 @@ mod supervisor_shadow {
             elapsed["degraded_coverage"].as_u64().unwrap() > 0,
             "{elapsed}"
         );
-        assert!(shadow
-            .episodes
-            .iter()
-            .all(|e| e.generation == runtime.generation as i64));
+        assert!(
+            shadow
+                .episodes
+                .iter()
+                .all(|e| e.generation == runtime.generation as i64
+                    && e.policy_revision == "rev-saved")
+        );
 
         assert_eq!(
             shadow.minutes.len(),

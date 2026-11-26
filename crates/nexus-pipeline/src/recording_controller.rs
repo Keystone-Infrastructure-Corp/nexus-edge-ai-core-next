@@ -87,6 +87,9 @@ pub struct ControllerConfig {
     /// The supervisor generation it serves; a command for another is refused.
     pub generation: u64,
     pub policy: Option<RecordingPolicyConfig>,
+    /// The camera's saved `recording_policy_revision` of `policy`, which its
+    /// stats report as applied.
+    pub policy_revision: String,
     /// `nexus_tracker`'s name for the camera's tracker.
     pub tracker: String,
     pub post_roll_secs: u32,
@@ -229,8 +232,9 @@ pub enum RecordingCommand {
     Evidence(Evidence),
     Alert(Alert),
     StreamEpochChanged(EpochChange),
-    /// The camera's `recording_policy` changed: switch without a restart.
-    PolicyChanged(Option<RecordingPolicyConfig>),
+    /// The camera's `recording_policy`, or its saved revision, changed:
+    /// switch without a restart.
+    PolicyChanged(Option<RecordingPolicyConfig>, String),
     /// Finalize the open clip, reply, and end.
     Stop,
 }
@@ -493,8 +497,8 @@ impl Controller {
                 self.epoch_changed(change).await;
                 None
             }
-            RecordingCommand::PolicyChanged(policy) => {
-                self.policy_changed(policy).await;
+            RecordingCommand::PolicyChanged(policy, revision) => {
+                self.policy_changed(policy, revision).await;
                 None
             }
             RecordingCommand::Stop => {
@@ -817,12 +821,13 @@ impl Controller {
         }
     }
 
-    async fn policy_changed(&mut self, policy: Option<RecordingPolicyConfig>) {
-        if policy == self.cfg.policy {
+    async fn policy_changed(&mut self, policy: Option<RecordingPolicyConfig>, revision: String) {
+        if policy == self.cfg.policy && revision == self.cfg.policy_revision {
             return;
         }
         let was_observed = self.observed;
         self.cfg.policy = policy;
+        self.cfg.policy_revision = revision;
         self.stale_after = stale_after(policy);
         if let Some(mut old) = self.shadow.take() {
             let writes = old.finish();
@@ -864,6 +869,7 @@ impl Controller {
                 cfg.camera_id,
                 cfg.generation,
                 policy,
+                &cfg.policy_revision,
                 RecordingPolicyMode::Observed,
                 &cfg.tracker,
                 cfg.post_roll_secs,
@@ -874,6 +880,7 @@ impl Controller {
                 cfg.camera_id,
                 cfg.generation,
                 cfg.policy,
+                &cfg.policy_revision,
                 &cfg.tracker,
                 cfg.post_roll_secs,
                 cfg.pre_roll_secs,

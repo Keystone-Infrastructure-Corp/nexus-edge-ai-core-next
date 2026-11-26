@@ -18,7 +18,6 @@ use nexus_store::{ClipId, RecordingActivityEpisode, RecordingActivityMinute};
 use nexus_types::{CameraId, TrackedObject};
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::recording_activity::{
@@ -387,7 +386,7 @@ pub struct RecordingActivityRuntime {
     pub mode: RecordingPolicyMode,
     /// The supervisor generation running it.
     pub generation: u64,
-    /// Content revision of the policy running.
+    /// The camera's saved `recording_policy_revision` the controller applied.
     pub policy_revision: String,
     /// The open motion clip of whichever side writes: legacy, or observed's policy.
     pub active_clip_id: Option<ClipId>,
@@ -529,11 +528,13 @@ impl ShadowRecording {
     /// `None` for legacy, and for a tracker with no observed/predicted
     /// contract. `observed` runs as shadow, so legacy still writes the
     /// footage: nothing activates observed recording yet (SPEC-089 Task 4).
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         registry: &RecordingActivityRegistry,
         camera_id: CameraId,
         generation: u64,
         policy: Option<RecordingPolicyConfig>,
+        policy_revision: &str,
         tracker: &str,
         post_roll_secs: u32,
         pre_roll_secs: u32,
@@ -550,6 +551,7 @@ impl ShadowRecording {
             camera_id,
             generation,
             policy,
+            policy_revision,
             RecordingPolicyMode::Shadow,
             tracker,
             post_roll_secs,
@@ -564,6 +566,7 @@ impl ShadowRecording {
         camera_id: CameraId,
         generation: u64,
         policy: RecordingPolicyConfig,
+        policy_revision: &str,
         mode: RecordingPolicyMode,
         tracker: &str,
         post_roll_secs: u32,
@@ -583,7 +586,7 @@ impl ShadowRecording {
             ShadowState {
                 mode,
                 generation,
-                policy_revision: format!("sha256:{:x}", Sha256::digest(to_json(&policy))),
+                policy_revision: policy_revision.to_owned(),
                 origin: None,
                 active_clip: None,
                 diagnostics: RecordingDiagnostics::new(u64::from(pre_roll_secs) * 1_000),
@@ -987,8 +990,9 @@ mod tests {
                 analysis_stale_after_ms: 10_000,
             })
         };
-        let start =
-            |policy, tracker| ShadowRecording::start(&registry, 3, 9, policy, tracker, 2, 0);
+        let start = |policy, tracker| {
+            ShadowRecording::start(&registry, 3, 9, policy, "rev-9", tracker, 2, 0)
+        };
         assert!(start(None, "bytetrack").is_none());
         assert!(start(mode(RecordingPolicyMode::Legacy), "bytetrack").is_none());
         assert!(
@@ -999,6 +1003,7 @@ mod tests {
         let shadow = start(mode(RecordingPolicyMode::Shadow), "iou-naive").unwrap();
         let runtime = registry.snapshot(3, Instant::now()).unwrap();
         assert_eq!((runtime.generation, runtime.diagnostics.reason), (9, None));
+        assert_eq!(runtime.policy_revision, "rev-9");
         drop(shadow);
         assert!(registry.snapshot(3, Instant::now()).is_none());
     }
@@ -1011,7 +1016,8 @@ mod tests {
             analysis_stale_after_ms: 10_000,
         };
         let mut s =
-            ShadowRecording::start(&registry, 3, 9, Some(policy), "iou-naive", 2, 0).unwrap();
+            ShadowRecording::start(&registry, 3, 9, Some(policy), "rev-9", "iou-naive", 2, 0)
+                .unwrap();
         let (t0, w0) = (Instant::now(), Utc::now());
         let wall = |ms: u64| w0 + chrono::Duration::milliseconds(ms as i64);
         let mut frame = |ms: u64, clip: Option<ClipId>| {

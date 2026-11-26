@@ -1067,25 +1067,31 @@ fn retry_sessions(args: &ReconcilerArgs, cam: &CameraConfig, entry: &RunningCame
     }
 }
 
-/// SPEC-089 — hand a changed `recording_policy` to the running camera's
-/// recording controller, which switches mode without a restart: a restart
-/// would gap the recording it is meant to change, and a rollback to legacy
-/// keeps the open clip and its links. The key records the policy only once
-/// the controller has applied it, so a refused or unanswered change is sent
-/// again on the next pass.
+/// SPEC-089 — hand a changed `recording_policy` (or a new saved revision of
+/// it) to the running camera's recording controller, which switches mode
+/// without a restart: a restart would gap the recording it is meant to
+/// change, and a rollback to legacy keeps the open clip and its links. The
+/// key records the policy and revision only once the controller has applied
+/// them, so a refused or unanswered change is sent again on the next pass.
 async fn apply_recording_policy(
     args: &ReconcilerArgs,
     cam: &CameraConfig,
     entry: &RunningCameraEntry,
 ) {
     let policy = cam.behavior.recording_policy;
-    if entry.key.behavior.recording_policy == policy {
+    let revision = &cam.behavior.recording_policy_revision;
+    if entry.key.behavior.recording_policy == policy
+        && entry.key.behavior.recording_policy_revision == *revision
+    {
         return;
     }
     use nexus_pipeline::recording_controller::{RecordingCommand, COMMAND_TIMEOUT};
     match entry
         .recording
-        .request(RecordingCommand::PolicyChanged(policy), COMMAND_TIMEOUT)
+        .request(
+            RecordingCommand::PolicyChanged(policy, revision.clone()),
+            COMMAND_TIMEOUT,
+        )
         .await
     {
         Ok(_) => {
@@ -1095,6 +1101,7 @@ async fn apply_recording_policy(
             );
             if let Some(live) = args.handles.lock().get_mut(&cam.id) {
                 live.key.behavior.recording_policy = policy;
+                live.key.behavior.recording_policy_revision = revision.clone();
             }
         }
         Err(e) => warn!(
@@ -2804,8 +2811,9 @@ mod tests {
 
     /// SPEC-089 — a `recording_policy` edit goes to the running camera's
     /// recording controller instead of restarting it: shadow starts measuring
-    /// on the same supervisor, and the rollback to legacy keeps that
-    /// supervisor and the clip it has open.
+    /// on the same supervisor, its stats name the saved revision the pass
+    /// applied (a new revision of the same policy too), and the rollback to
+    /// legacy keeps that supervisor and the clip it has open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_recording_policy_change_applies_without_a_restart() {
         use nexus_config::{RecordingPolicyConfig, RecordingPolicyMode};
@@ -2830,18 +2838,30 @@ mod tests {
             mode: RecordingPolicyMode::Shadow,
             analysis_stale_after_ms: 10_000,
         });
+        shadow.behavior.recording_policy_revision = "rev-shadow".into();
         args.store
             .upsert_camera(&shadow)
             .await
             .expect("save shadow");
         reconcile(&args).await.expect("pass after the edit");
         let after_shadow = entry_of(&args.handles, 7);
-        let applied = runtime().map(|r| (r.mode, r.generation));
+        let applied = runtime().map(|r| (r.mode, r.generation, r.policy_revision));
         // The next frame traces the clip legacy holds.
         wait_until("shadow traced the open clip", || {
             runtime().and_then(|r| r.active_clip_id) == Some(1)
         })
         .await;
+
+        // An ABA saved between two passes leaves the policy as it was under a
+        // new revision, which the pass applies too.
+        shadow.behavior.recording_policy_revision = "rev-aba".into();
+        args.store
+            .upsert_camera(&shadow)
+            .await
+            .expect("save the ABA");
+        reconcile(&args).await.expect("pass after the ABA");
+        let after_aba = entry_of(&args.handles, 7);
+        let aba = runtime().map(|r| r.policy_revision);
 
         args.store
             .upsert_camera(&cam(None))
@@ -2855,14 +2875,20 @@ mod tests {
 
         assert!(
             Arc::ptr_eq(&after_shadow.task, &original.task)
+                && Arc::ptr_eq(&after_aba.task, &original.task)
                 && Arc::ptr_eq(&after_rollback.task, &original.task),
             "a policy change must not restart the camera"
         );
         assert_eq!(
             applied,
-            Some((RecordingPolicyMode::Shadow, original.zone_generation)),
+            Some((
+                RecordingPolicyMode::Shadow,
+                original.zone_generation,
+                "rev-shadow".to_owned()
+            )),
             "the pass applied shadow to the running generation"
         );
+        assert_eq!(aba.as_deref(), Some("rev-aba"), "the pass applied the ABA");
         assert!(rolled_back, "the rollback ended the measurement");
         assert_eq!(
             calls,

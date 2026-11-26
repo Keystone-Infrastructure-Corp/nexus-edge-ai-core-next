@@ -8680,6 +8680,42 @@ mod tests {
         );
     }
 
+    /// SPEC-089 — `recording_activity_v1` is on the heartbeat, and a camera
+    /// write carrying a policy and its expected revision keeps the cloud's
+    /// camera `settings.write` mapping: a reader cannot make it.
+    #[test]
+    fn recording_activity_capability_keeps_the_camera_write_permission() {
+        use nexus_cloud_client::actor_token::{EnvelopeContext, VerifiedActor};
+        assert!(crate::cloud_tunnel::heartbeat_caps(None, false, false)
+            .iter()
+            .any(|c| c == "recording_activity_v1"));
+        let body = serde_json::json!({
+            "id": 7,
+            "name": "c",
+            "url": "virtual://local",
+            "recording_policy": { "mode": "observed" },
+            "expected_recording_policy_revision": "r",
+        })
+        .to_string();
+        let envelope = EnvelopeContext {
+            method: "PUT",
+            path: "/admin/cameras/7",
+        };
+        let allows = |perm: &str| {
+            VerifiedActor {
+                sub: "human".into(),
+                role: "viewer".into(),
+                perm: Some(perm.into()),
+                jti: "jti".into(),
+                org_id: "org".into(),
+                actor_org_id: None,
+            }
+            .allows_rpc(envelope, Some(body.as_bytes()), false)
+        };
+        assert!(allows("settings.write"));
+        assert!(!allows("settings.read"));
+    }
+
     /// SPEC-088 — `camera_config_snapshot_v1` is on the heartbeat, and both
     /// things it promises exist: the gated route and the cloud's camera
     /// `settings.read` mapping for it.
@@ -8882,6 +8918,7 @@ mod tests {
             id,
             7,
             Some(policy),
+            "rev-7",
             "bytetrack",
             2,
             5,
@@ -8927,11 +8964,6 @@ mod tests {
                 json!(5_000 + open_ms.as_u64().unwrap())
             );
         }
-        let revision = got["policy_revision"].take();
-        assert!(
-            revision.as_str().unwrap().starts_with("sha256:"),
-            "{revision}"
-        );
         let none = json!({"activity": 0, "post_roll": 0, "degraded_coverage": 0, "quiet": 0});
         assert_eq!(
             got,
@@ -8939,7 +8971,7 @@ mod tests {
                 "schema_version": 1,
                 "mode": "shadow",
                 "generation": 7,
-                "policy_revision": null,
+                "policy_revision": "rev-7",
                 "active_clip_id": clip.clip_id,
                 "legacy_open": true,
                 "shadow_open": true,
