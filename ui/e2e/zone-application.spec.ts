@@ -1718,7 +1718,7 @@ test.describe("zone application", () => {
       cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
       const id = cameraId;
       const { status } = await openApplied(page, id);
-      await page.route(`**/api/v1/cameras/${id}`, (route) =>
+      await page.route(cameraPath(id), (route) =>
         route.request().method() === "PUT"
           ? route.fulfill({ status: 403, json: { error: "e2e: forbidden" } })
           : route.fallback(),
