@@ -1349,15 +1349,17 @@ async fn list_cameras(State(s): State<ApiState>) -> Result<Json<Vec<CameraConfig
 }
 
 /// SPEC-088 — `GET /v1/admin/cameras/{camera_id}/config-snapshot`. The
-/// revision metadata sits beside `settings`, never inside it. No `parking` or
-/// `parking_revision`: this build reports no parking, and a reader takes
-/// their absence as unsupported, never as a default.
+/// revision metadata sits beside `settings`, never inside it. SPEC-077 —
+/// `settings.parking` and `parking_revision` always come together: this
+/// build reports parking, and a reader takes their absence (an older build)
+/// as unsupported, never as a default.
 #[derive(serde::Serialize)]
 struct CameraConfigSnapshot {
     schema_version: u32,
     camera_id: CameraId,
     settings: CameraZoneSettingsView,
     zones_revision: String,
+    parking_revision: String,
 }
 
 /// The settings the snapshot binds to a revision, copied field by field: no
@@ -1365,12 +1367,22 @@ struct CameraConfigSnapshot {
 #[derive(serde::Serialize)]
 struct CameraZoneSettingsView {
     zones: Vec<nexus_config::ZoneConfig>,
+    parking: CameraParkingSettingsView,
 }
 
-/// The camera's zones and the revision hashed from them, both taken from the
-/// one stored row this read decodes, so a save racing the read cannot pair
-/// one write's zones with another's revision. A row this build cannot decode
-/// answers a generic error, never the decode error, which can quote the row.
+/// SPEC-077 — the rest of the parking tuple: the mode, and the whole v2
+/// policy, an explicit `null` when the camera has none.
+#[derive(serde::Serialize)]
+struct CameraParkingSettingsView {
+    parking_lot_mode: bool,
+    parking_policy_v2: Option<nexus_config::ParkingPolicyV2>,
+}
+
+/// The camera's zones and parking settings and the revisions hashed from
+/// them, all taken from the one stored row this read decodes, so a save
+/// racing the read cannot pair one write's settings with another's revision.
+/// A row this build cannot decode answers a generic error, never the decode
+/// error, which can quote the row.
 async fn get_camera_config_snapshot(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
@@ -1387,13 +1399,19 @@ async fn get_camera_config_snapshot(
         });
     };
     let zones_revision = nexus_pipeline::zone_application::zone_revision(&camera.zones);
+    let parking_revision = nexus_pipeline::zone_application::parking_revision(&camera);
     Ok(Json(CameraConfigSnapshot {
         schema_version: 1,
         camera_id: id,
         settings: CameraZoneSettingsView {
+            parking: CameraParkingSettingsView {
+                parking_lot_mode: camera.behavior.parking_lot_mode,
+                parking_policy_v2: camera.behavior.parking_policy_v2,
+            },
             zones: camera.zones,
         },
         zones_revision,
+        parking_revision,
     }))
 }
 
@@ -8545,6 +8563,33 @@ mod tests {
         serde_json::from_value(snap["settings"]["zones"].clone()).unwrap()
     }
 
+    /// SPEC-077 — what the snapshot's `settings.parking` must hold for
+    /// `camera`: its mode and its whole policy, `null` when it has none.
+    fn snapshot_parking(camera: &nexus_config::CameraConfig) -> serde_json::Value {
+        serde_json::json!({
+            "parking_lot_mode": camera.behavior.parking_lot_mode,
+            "parking_policy_v2": camera.behavior.parking_policy_v2,
+        })
+    }
+
+    /// SPEC-077 — `camera` with parking-lot mode, a v2 policy and a parking
+    /// zone added to its zones.
+    fn snapshot_parked(mut camera: nexus_config::CameraConfig) -> nexus_config::CameraConfig {
+        camera.behavior.parking_lot_mode = true;
+        camera.behavior.parking_policy_v2 = Some(nexus_config::ParkingPolicyV2 {
+            dwell_secs: 10.0,
+            max_speed_box_diagonals_per_sec: 0.05,
+            max_displacement_box_diagonals: 0.10,
+            max_observation_gap_secs: 3.0,
+        });
+        camera.zones.push(nexus_config::ZoneConfig {
+            kind: nexus_config::ZoneKind::Parking,
+            min_bbox_area_px_override: None,
+            ..snapshot_zone("stalls", 0.3)
+        });
+        camera
+    }
+
     fn snapshot_zone(id: &str, x: f32) -> nexus_config::ZoneConfig {
         nexus_config::ZoneConfig {
             id: id.into(),
@@ -8589,10 +8634,12 @@ mod tests {
     /// revision, and nothing else the stored camera holds: no stream URL, no
     /// ONVIF or talk-down field, no name, no credential, in the body or in
     /// what the request logs. The legacy list still returns them all
-    /// (BUG-311 stays open); this view does not claim to fix it.
+    /// (BUG-311 stays open); this view does not claim to fix it. SPEC-077 —
+    /// with the parking mode and v2 policy and their revision beside them,
+    /// and still nothing else.
     #[tokio::test]
     async fn camera_config_snapshot_is_the_zones_and_never_a_credential() {
-        use nexus_pipeline::zone_application::zone_revision;
+        use nexus_pipeline::zone_application::{parking_revision, zone_revision};
         const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-sentinel-secret";
         const SENTINELS: [&str; 14] = [
             "name-sentinel-n0",
@@ -8630,6 +8677,7 @@ mod tests {
         camera.talk_down.backchannel_url =
             Some("rtsp://talk-user-s11:talk-pass-s12@talk-host-s13.test/back".into());
         camera.zones = vec![snapshot_zone("door", 0.1), snapshot_zone("drive", 0.2)];
+        let camera = snapshot_parked(camera);
         store.upsert_camera(&camera).await.unwrap();
         let token = sign_admin_jwt(ADMIN_SECRET);
         let (status, legacy) = {
@@ -8680,36 +8728,48 @@ mod tests {
         };
         assert_eq!(
             keys(&snap),
-            ["camera_id", "schema_version", "settings", "zones_revision"],
-            "no parking_revision: this build reports no parking"
+            [
+                "camera_id",
+                "parking_revision",
+                "schema_version",
+                "settings",
+                "zones_revision"
+            ]
         );
+        assert_eq!(keys(&snap["settings"]), ["parking", "zones"]);
         assert_eq!(
-            keys(&snap["settings"]),
-            ["zones"],
-            "no parking: unsupported"
+            keys(&snap["settings"]["parking"]),
+            ["parking_lot_mode", "parking_policy_v2"]
         );
         assert_eq!(snap["schema_version"], 1);
         assert_eq!(snap["camera_id"], camera.id);
         assert_eq!(snapshot_zones(&snap), camera.zones);
         assert_eq!(snap["zones_revision"], zone_revision(&camera.zones));
+        assert_eq!(snap["settings"]["parking"], snapshot_parking(&camera));
+        assert_eq!(snap["parking_revision"], parking_revision(&camera));
     }
 
     /// SPEC-088 — one snapshot's zones and revision come from one stored
     /// object: after each of A → B → A the read answers that write, and
     /// reads racing a writer flipping A and B never pair one write's zones
-    /// with the other's revision.
+    /// with the other's revision. SPEC-077 — nor its parking projection and
+    /// revision: A has no v2, which reads as explicit absence, and B has one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn camera_config_snapshot_pairs_zones_with_their_revision_under_writes() {
-        use nexus_pipeline::zone_application::zone_revision;
+        use nexus_pipeline::zone_application::{parking_revision, zone_revision};
         const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-pairing-secret";
         let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
         store_default_camera(&store, true).await;
         let mut a = store.list_cameras().await.unwrap()[0].clone();
         a.zones = vec![snapshot_zone("a", 0.1)];
+        a.behavior.parking_lot_mode = false;
+        a.behavior.parking_policy_v2 = None;
         let mut b = a.clone();
         b.zones = vec![snapshot_zone("b", 0.3), snapshot_zone("c", 0.4)];
+        let b = snapshot_parked(b);
         let (rev_a, rev_b) = (zone_revision(&a.zones), zone_revision(&b.zones));
         assert_ne!(rev_a, rev_b);
+        assert_ne!(parking_revision(&a), parking_revision(&b));
         let token = sign_admin_jwt(ADMIN_SECRET);
         let id = a.id.to_string();
 
@@ -8718,8 +8778,17 @@ mod tests {
             let snap = read_config_snapshot(&app, &id, &token).await;
             assert_eq!(snapshot_zones(&snap), camera.zones);
             assert_eq!(snap["zones_revision"], **rev);
+            assert_eq!(snap["settings"]["parking"], snapshot_parking(camera));
+            assert_eq!(snap["parking_revision"], parking_revision(camera));
         }
+        assert_eq!(
+            read_config_snapshot(&app, &id, &token).await["settings"]["parking"],
+            serde_json::json!({ "parking_lot_mode": false, "parking_policy_v2": null }),
+            "a camera with no v2 reports its absence explicitly"
+        );
 
+        let [a_tuple, b_tuple] =
+            [&a, &b].map(|c| (snapshot_parking(c), serde_json::json!(parking_revision(c))));
         let writer = {
             let store = store.clone();
             tokio::spawn(async move {
@@ -8736,6 +8805,12 @@ mod tests {
             let rev = snap["zones_revision"].as_str().unwrap();
             assert_eq!(rev, zone_revision(&snapshot_zones(&snap)), "{snap}");
             assert!(rev == rev_a || rev == rev_b, "{snap}");
+            let written = if rev == rev_a { &a_tuple } else { &b_tuple };
+            assert_eq!(
+                (&snap["settings"]["parking"], &snap["parking_revision"]),
+                (&written.0, &written.1),
+                "{snap}"
+            );
         }
         writer.await.unwrap();
     }
