@@ -20,7 +20,8 @@
 //! * **Clock discontinuities.** Buckets are placed and pruned by the wall
 //!   clock. When it jumps (see [`Store::check_clock`]), `accounting_since`
 //!   moves past the jump so no window overlapping it reads complete, and
-//!   pruning follows monotonic time so a forward jump deletes no history.
+//!   pruning never runs ahead of monotonic time in this process, so a
+//!   forward jump while running deletes no history.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
