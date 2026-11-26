@@ -107,13 +107,16 @@ pub async fn get_video_encoder_configurations(
     Ok(parse_configs(&resp))
 }
 
-/// Read the option ranges for an encoder configuration / profile.
+/// Read the option ranges for an encoder configuration / profile. A
+/// camera may answer with every codec's ranges; `encoding` keeps only that
+/// codec's, `None` merges them.
 pub async fn get_video_encoder_configuration_options(
     endpoint: &str,
     username: &str,
     password: &str,
     config_token: Option<&str>,
     profile_token: Option<&str>,
+    encoding: Option<&str>,
 ) -> Result<VideoEncoderOptions, String> {
     let mut body = String::from("<trt:GetVideoEncoderConfigurationOptions>");
     if let Some(t) = config_token {
@@ -138,7 +141,7 @@ pub async fn get_video_encoder_configuration_options(
             &body,
         )
         .await?;
-    Ok(parse_options(&resp))
+    Ok(parse_options(&resp, encoding))
 }
 
 /// Write a (read-modify-write) video-encoder configuration.
@@ -371,7 +374,10 @@ const RANGE_SECTIONS: &[&str] = &[
     "ResolutionsAvailable",
 ];
 
-fn parse_options(body: &str) -> VideoEncoderOptions {
+/// The per-codec option blocks (`Options/<codec>`, `Extension/<codec>`).
+const CODEC_SECTIONS: &[&str] = &["JPEG", "MPEG4", "Mpeg4", "H264", "H265"];
+
+fn parse_options(body: &str, encoding: Option<&str>) -> VideoEncoderOptions {
     let mut reader = Reader::from_str(body);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -403,9 +409,13 @@ fn parse_options(body: &str) -> VideoEncoderOptions {
                 let n = local_name(&e.name());
                 if capture.as_deref() == Some(n.as_str()) {
                     let v = acc.trim().to_string();
-                    if !v.is_empty() {
-                        let section =
-                            nearest(&stack[..stack.len().saturating_sub(1)], RANGE_SECTIONS);
+                    let outer = &stack[..stack.len().saturating_sub(1)];
+                    let other_codec = matches!(
+                        (encoding, nearest(outer, CODEC_SECTIONS)),
+                        (Some(e), Some(c)) if !c.eq_ignore_ascii_case(e)
+                    );
+                    if !v.is_empty() && !other_codec {
+                        let section = nearest(outer, RANGE_SECTIONS);
                         apply_option_leaf(&mut out, section, &n, &v, &mut res_w, &mut res_h);
                     }
                 }
@@ -555,7 +565,7 @@ mod tests {
                 <tt:Extension><tt:H264><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>16384</tt:Max></tt:BitrateRange></tt:H264></tt:Extension>
             </trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>"#,
         );
-        let o = parse_options(&body);
+        let o = parse_options(&body, None);
         assert_eq!(o.quality_range, Some(FloatRange { min: 1.0, max: 6.0 }));
         assert_eq!(o.resolutions, vec![(1920, 1080), (1280, 720)]);
         assert_eq!(o.gov_length_range, Some(IntRange { min: 1, max: 400 }));
@@ -568,6 +578,60 @@ mod tests {
             })
         );
         assert_eq!(o.profiles_supported, vec!["Baseline", "High"]);
+    }
+
+    /// A mixed-codec answer keeps only the asked codec's ranges and
+    /// profiles; without one it merges them as before.
+    #[test]
+    fn parses_only_the_asked_codecs_options() {
+        let body = wrap(
+            r#"<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options>
+                <tt:QualityRange><tt:Min>1</tt:Min><tt:Max>6</tt:Max></tt:QualityRange>
+                <tt:JPEG>
+                    <tt:ResolutionsAvailable><tt:Width>2592</tt:Width><tt:Height>1520</tt:Height></tt:ResolutionsAvailable>
+                    <tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>30</tt:Max></tt:FrameRateRange>
+                </tt:JPEG>
+                <tt:H264>
+                    <tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable>
+                    <tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>200</tt:Max></tt:GovLengthRange>
+                    <tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>25</tt:Max></tt:FrameRateRange>
+                    <tt:H264ProfilesSupported>Main</tt:H264ProfilesSupported>
+                </tt:H264>
+                <tt:Extension>
+                    <tt:JPEG><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>16384</tt:Max></tt:BitrateRange></tt:JPEG>
+                    <tt:H264><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>4096</tt:Max></tt:BitrateRange></tt:H264>
+                </tt:Extension>
+            </trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>"#,
+        );
+        let quality = Some(FloatRange { min: 1.0, max: 6.0 });
+        let h264 = parse_options(&body, Some("H264"));
+        assert_eq!(
+            h264,
+            VideoEncoderOptions {
+                resolutions: vec![(1280, 720)],
+                quality_range: quality,
+                frame_rate_range: Some(IntRange { min: 1, max: 25 }),
+                gov_length_range: Some(IntRange { min: 1, max: 200 }),
+                bitrate_range: Some(IntRange { min: 32, max: 4096 }),
+                profiles_supported: vec!["Main".into()],
+            }
+        );
+        let jpeg = parse_options(&body, Some("JPEG"));
+        assert_eq!(
+            jpeg,
+            VideoEncoderOptions {
+                resolutions: vec![(2592, 1520)],
+                quality_range: quality,
+                frame_rate_range: Some(IntRange { min: 1, max: 30 }),
+                bitrate_range: Some(IntRange {
+                    min: 32,
+                    max: 16384
+                }),
+                ..VideoEncoderOptions::default()
+            }
+        );
+        let merged = parse_options(&body, None);
+        assert_eq!(merged.resolutions, vec![(2592, 1520), (1280, 720)]);
     }
 
     #[test]

@@ -2858,4 +2858,49 @@ mod tests {
         assert_eq!(c.alert.delivered_bytes, 11, "alert-bytes, not the stored 0");
         assert_eq!(c.ordinary.attempted_bytes + c.alert.attempted_bytes, 0);
     }
+
+    /// SPEC-090 — an uploader stopped mid-transfer (its task dropped, as on
+    /// a restart) leaves nothing marked in flight: the clip is back to
+    /// plain `ready`, and the restarted uploader's set holds only its own
+    /// transfers.
+    #[tokio::test]
+    async fn recording_delivery_in_flight_clears_across_an_uploader_restart() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        *backend.first_put_hook.lock() = Some(Box::pin(std::future::pending()));
+        let tick_task = {
+            let (store, backend, clips_dir) = (store.clone(), backend.clone(), clips_dir.clone());
+            tokio::spawn(async move { run_tick(&store, &clips_dir, &backend).await })
+        };
+        for _ in 0..200 {
+            if !backend.put_paths.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let snap = || async {
+            store
+                .recording_delivery_stats(Utc::now, None)
+                .await
+                .unwrap()
+        };
+        assert_eq!(snap().await.ordinary.in_flight.unwrap().count, 1);
+
+        tick_task.abort();
+        assert!(tick_task.await.unwrap_err().is_cancelled());
+        let stopped = snap().await;
+        assert_eq!(stopped.ordinary.in_flight.unwrap().count, 0, "not stale");
+        assert_eq!(stopped.ordinary.ready.count, 1, "still queued");
+
+        run_tick(&store, &clips_dir, &backend).await;
+        let restarted = snap().await;
+        assert_eq!(restarted.ordinary.in_flight.unwrap().count, 0);
+        assert_eq!(restarted.ordinary.ready.count, 0);
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+        assert!(
+            clip.cold_handle.is_some(),
+            "the restarted uploader delivered it"
+        );
+    }
 }

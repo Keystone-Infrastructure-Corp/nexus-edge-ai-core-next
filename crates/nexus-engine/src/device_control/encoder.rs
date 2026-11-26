@@ -65,12 +65,16 @@ pub async fn encoder_get(
     if selected.is_some_and(|tok| !configs.iter().any(|c| c.token == tok)) {
         return Err(unknown_token());
     }
+    let encoding = selected
+        .and_then(|tok| configs.iter().find(|c| c.token == tok))
+        .and_then(|c| c.encoding.as_deref());
     let options = onvif_encoder::get_video_encoder_configuration_options(
         &t.endpoint,
         &t.username,
         &t.password,
         selected,
         None,
+        encoding,
     )
     .await
     .ok();
@@ -106,10 +110,7 @@ pub async fn encoder_put(
     rbac(&ctx, Role::Admin)?;
     const ACTION: &str = "camera.onvif.encoder.set";
     let t = onvif_target(&s, id).await?;
-    let checked = tokio::time::timeout(PUT_READ_BUDGET, check_selected(&t, &req.config))
-        .await
-        .unwrap_or_else(|_| Err(enc_err("encoder read timed out; nothing written".into())));
-    if let Err(ApiError(status, e)) = checked {
+    if let Err(ApiError(status, e)) = preflight(&t, &req.config, PUT_READ_BUDGET).await {
         audit(
             &s,
             &ctx,
@@ -161,6 +162,18 @@ fn unknown_token() -> ApiError {
     )
 }
 
+/// [`check_selected`] within `budget`: a slow camera fails before the
+/// write, so nothing is written.
+async fn preflight(
+    t: &OnvifTarget,
+    new: &VideoEncoderConfig,
+    budget: Duration,
+) -> Result<(), ApiError> {
+    tokio::time::timeout(budget, check_selected(t, new))
+        .await
+        .unwrap_or_else(|_| Err(enc_err("encoder read timed out; nothing written".into())))
+}
+
 /// Read the camera's current config for `new.token` and that
 /// configuration's options, then [`check_write`].
 async fn check_selected(t: &OnvifTarget, new: &VideoEncoderConfig) -> Result<(), ApiError> {
@@ -172,12 +185,15 @@ async fn check_selected(t: &OnvifTarget, new: &VideoEncoderConfig) -> Result<(),
         .iter()
         .find(|c| c.token == new.token)
         .ok_or_else(unknown_token)?;
+    // Judged by the codec being written: a camera may list every codec's.
+    let encoding = new.encoding.as_deref().or(current.encoding.as_deref());
     let options = onvif_encoder::get_video_encoder_configuration_options(
         &t.endpoint,
         &t.username,
         &t.password,
         Some(&new.token),
         None,
+        encoding,
     )
     .await
     .map_err(enc_err)?;
@@ -725,5 +741,146 @@ mod tests {
         ] {
             assert!(check_write(&bad, &current, &opts).is_err(), "{bad:?}");
         }
+    }
+
+    /// An H264 and a JPEG configuration, as a mixed-codec camera lists them.
+    const MIXED_CONFIGS: &str = concat!(
+        r#"<trt:Configurations token="VE_sub"><tt:Name>sub</tt:Name><tt:Encoding>H264</tt:Encoding>"#,
+        r#"<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>"#,
+        r#"<tt:RateControl><tt:FrameRateLimit>15</tt:FrameRateLimit><tt:BitrateLimit>2048</tt:BitrateLimit></tt:RateControl>"#,
+        r#"<tt:H264><tt:GovLength>30</tt:GovLength></tt:H264></trt:Configurations>"#,
+        r#"<trt:Configurations token="VE_jpeg"><tt:Name>snap</tt:Name><tt:Encoding>JPEG</tt:Encoding>"#,
+        r#"<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>"#,
+        r#"<tt:RateControl><tt:FrameRateLimit>10</tt:FrameRateLimit><tt:BitrateLimit>2048</tt:BitrateLimit></tt:RateControl>"#,
+        r#"</trt:Configurations>"#,
+    );
+
+    /// Per-codec options: (codec block, its `Extension` bitrate block).
+    const JPEG_OPTS: (&str, &str) = (
+        concat!(
+            "<tt:JPEG><tt:ResolutionsAvailable><tt:Width>2592</tt:Width><tt:Height>1520</tt:Height></tt:ResolutionsAvailable>",
+            "<tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable>",
+            "<tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>30</tt:Max></tt:FrameRateRange></tt:JPEG>",
+        ),
+        "<tt:JPEG><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>16384</tt:Max></tt:BitrateRange></tt:JPEG>",
+    );
+    const H264_OPTS: (&str, &str) = (
+        concat!(
+            "<tt:H264><tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable>",
+            "<tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>200</tt:Max></tt:GovLengthRange>",
+            "<tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>25</tt:Max></tt:FrameRateRange></tt:H264>",
+        ),
+        "<tt:H264><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>4096</tt:Max></tt:BitrateRange></tt:H264>",
+    );
+
+    /// Camera stub: [`MIXED_CONFIGS`] and the options of `codecs` in that
+    /// order, each answer after `delay`.
+    async fn camera(codecs: &[(&str, &str)], delay: Duration) -> OnvifTarget {
+        let blocks: String = codecs.iter().map(|c| c.0).collect();
+        let bitrates: String = codecs.iter().map(|c| c.1).collect();
+        let options = format!("{blocks}<tt:Extension>{bitrates}</tt:Extension>");
+        let h = move |body: String| async move {
+            tokio::time::sleep(delay).await;
+            let inner = if body.contains("GetVideoEncoderConfigurations") {
+                format!("<trt:GetVideoEncoderConfigurationsResponse>{MIXED_CONFIGS}</trt:GetVideoEncoderConfigurationsResponse>")
+            } else {
+                format!("<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options>{options}</trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>")
+            };
+            format!(
+                r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body>{inner}</s:Body></s:Envelope>"#
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, axum::Router::new().fallback(h)).await;
+        });
+        OnvifTarget {
+            endpoint: format!("http://{addr}/onvif/device_service"),
+            username: "admin".into(),
+            password: "secret".into(),
+        }
+    }
+
+    /// A camera offering JPEG and H264 options in one answer: each write
+    /// is judged by its own configuration's codec, never another codec's
+    /// resolution, frame rate or bitrate, in either listing order.
+    #[tokio::test]
+    async fn write_check_judges_a_mixed_codec_camera_by_the_configurations_codec() {
+        for order in [[JPEG_OPTS, H264_OPTS], [H264_OPTS, JPEG_OPTS]] {
+            let t = camera(&order, Duration::ZERO).await;
+            let configs = onvif_encoder::get_video_encoder_configurations(
+                &t.endpoint,
+                &t.username,
+                &t.password,
+            )
+            .await
+            .unwrap();
+            let (sub, jpeg) = (configs[0].clone(), configs[1].clone());
+            for bad in [
+                VideoEncoderConfig {
+                    width: Some(2592),
+                    height: Some(1520),
+                    ..sub.clone()
+                },
+                VideoEncoderConfig {
+                    frame_rate_limit: Some(30),
+                    ..sub.clone()
+                },
+                VideoEncoderConfig {
+                    bitrate_limit: Some(8000),
+                    ..sub.clone()
+                },
+            ] {
+                let got = check_selected(&t, &bad).await.map_err(|ApiError(s, _)| s);
+                assert_eq!(got, Err(StatusCode::BAD_REQUEST), "{bad:?}");
+            }
+            for ok in [
+                VideoEncoderConfig {
+                    frame_rate_limit: Some(25),
+                    bitrate_limit: Some(4096),
+                    ..sub.clone()
+                },
+                VideoEncoderConfig {
+                    width: Some(2592),
+                    height: Some(1520),
+                    frame_rate_limit: Some(30),
+                    bitrate_limit: Some(8000),
+                    ..jpeg.clone()
+                },
+            ] {
+                let got = check_selected(&t, &ok).await.map_err(|ApiError(_, e)| e);
+                assert_eq!(got, Ok(()), "{ok:?}");
+            }
+        }
+    }
+
+    /// The PUT's pre-write reads share one budget, 6 s in production so
+    /// the 5 s write after it stays inside edge-gateway's 15 s RPC window:
+    /// a camera slower than the budget fails with a 502 before any write.
+    #[tokio::test]
+    async fn preflight_past_its_budget_fails_before_the_write() {
+        assert_eq!(PUT_READ_BUDGET, Duration::from_secs(6));
+        assert!(
+            PUT_READ_BUDGET + crate::discovery::onvif_soap::REQ_TIMEOUT < Duration::from_secs(15)
+        );
+        // Two reads of 300 ms each: past a 450 ms budget, inside a 3 s one.
+        let t = camera(&[H264_OPTS], Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        let ApiError(status, e) = preflight(&t, &cfg("VE_sub"), Duration::from_millis(450))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (status, e.as_str()),
+            (
+                StatusCode::BAD_GATEWAY,
+                "encoder read timed out; nothing written"
+            )
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let got = preflight(&t, &cfg("VE_sub"), Duration::from_secs(3))
+            .await
+            .map_err(|ApiError(_, e)| e);
+        assert_eq!(got, Ok(()));
     }
 }
