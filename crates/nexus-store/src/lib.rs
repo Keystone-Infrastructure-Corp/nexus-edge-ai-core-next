@@ -616,6 +616,8 @@ impl Store {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         id: CameraId,
     ) -> Result<(), StoreError> {
+        // SPEC-090 — the cascade below drops the camera's upload queue.
+        self.record_camera_loss(tx, id).await?;
         sqlx::query("DELETE FROM cameras WHERE id = ?")
             .bind(id)
             .execute(&mut **tx)

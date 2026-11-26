@@ -417,6 +417,38 @@ impl Store {
         }
     }
 
+    /// Count `camera_id`'s undelivered queue (at or after the enrollment
+    /// floor) as evicted before upload, in the caller's transaction: a
+    /// camera delete's FK cascade removes those clips without the evictors.
+    pub(crate) async fn record_camera_loss(
+        &self,
+        conn: &mut SqliteConnection,
+        camera_id: CameraId,
+    ) -> Result<(), StoreError> {
+        let floor = self.eviction_floor().await;
+        for source in [RecordingSource::Ordinary, RecordingSource::Alert] {
+            let g = source.gates();
+            let (bytes, count): (i64, i64) = sqlx::query_as(&format!(
+                "SELECT COALESCE(SUM(CASE WHEN size_bytes > 0 THEN size_bytes END), 0), COUNT(*)
+                   FROM {} WHERE camera_id = ?1 AND {} AND {}",
+                g.table, g.queue, g.after_floor
+            ))
+            .bind(camera_id)
+            .bind(floor.as_deref())
+            .fetch_one(&mut *conn)
+            .await?;
+            if count > 0 {
+                let lost = DeliveryCounters {
+                    evicted_before_upload_bytes: bytes,
+                    evicted_before_upload_count: count,
+                    ..DeliveryCounters::default()
+                };
+                add_to_bucket(conn, camera_id, source, Utc::now(), &lost).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// SPEC-090 — the versioned `recording_delivery` snapshot at `now`
     /// for enrollment `floor`, read in one transaction.
     pub async fn recording_delivery_stats(

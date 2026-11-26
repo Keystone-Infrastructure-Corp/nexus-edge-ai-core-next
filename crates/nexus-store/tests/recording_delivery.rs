@@ -624,6 +624,57 @@ async fn recording_delivery_counts_eviction_before_upload() {
     assert_eq!(w.cameras.len(), 2);
 }
 
+/// Deleting a camera cascades its clips away without the evictors; its
+/// undelivered queue is still an explicit loss, and an alert clip that
+/// was already evicted is not counted again.
+#[tokio::test]
+async fn recording_delivery_counts_camera_deletion_as_eviction_before_upload() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let now = Utc::now();
+    closed_clip(&store, 1, now - Duration::hours(1), 500, true).await;
+    let delivered = closed_clip(&store, 1, now - Duration::hours(1), 700, true).await;
+    store
+        .mark_cold_replicated(delivered, &cold_mark("d.mp4", now))
+        .await
+        .unwrap();
+    let a_lost = alert_clip(&store, 1, now - Duration::hours(1)).await;
+    store
+        .mark_alert_clip_ready(a_lost, 5_000, 60, Some(&"b".repeat(64)))
+        .await
+        .unwrap();
+    let a_evicted = alert_clip(&store, 1, now - Duration::hours(1)).await;
+    store
+        .mark_alert_clip_ready(a_evicted, 5_000, 80, Some(&"b".repeat(64)))
+        .await
+        .unwrap();
+    store.mark_alert_clip_evicted(a_evicted).await.unwrap();
+
+    store.delete_camera(1).await.unwrap();
+
+    let snap = store
+        .recording_delivery_stats(Utc::now() + Duration::minutes(2), None)
+        .await
+        .unwrap();
+    let w = hour(&snap);
+    assert_eq!(
+        (
+            w.core.ordinary.evicted_before_upload_bytes,
+            w.core.ordinary.evicted_before_upload_count
+        ),
+        (500, 1)
+    );
+    assert_eq!(
+        (
+            w.core.alert.evicted_before_upload_bytes,
+            w.core.alert.evicted_before_upload_count
+        ),
+        (140, 2),
+        "the earlier eviction (80) plus the cascaded clip (60), once each"
+    );
+    assert_eq!(snap.ordinary.ready.count + snap.alert.ready.count, 0);
+}
+
 /// Windows are whole UTC minutes ending at the start of the sample's
 /// minute; a clip finalized one millisecond before the hour belongs to
 /// the previous hour.
