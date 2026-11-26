@@ -39,7 +39,9 @@ use crate::recorder::{
 use crate::recording_activity::{
     AnalysisOutcome, EvidenceSummary, Observation, RecordingIntent, RecordingReason,
 };
-use crate::recording_diagnostics::{millis, EvidenceCounts, ShadowRecording, ShadowWrites};
+use crate::recording_diagnostics::{
+    millis, EvidenceCounts, LegacyRuntime, ShadowRecording, ShadowWrites,
+};
 use crate::stats::FrameStatsRegistry;
 
 /// Recording decisions moved here from the camera supervisor; their log
@@ -380,6 +382,7 @@ pub fn spawn(
         alive,
         cancelled: false,
         shadow: None,
+        legacy: None,
         observed: false,
         want_open: false,
         clip: None,
@@ -443,6 +446,8 @@ struct Controller {
     cancelled: bool,
     /// The fresh-evidence policy and its diagnostics; `None` in legacy.
     shadow: Option<ShadowRecording>,
+    /// What the camera's stats report while legacy runs; `None` otherwise.
+    legacy: Option<LegacyRuntime>,
     /// The policy writes; legacy only traces.
     observed: bool,
     /// Observed's latest intent.
@@ -933,12 +938,13 @@ impl Controller {
             self.pending_links.clear();
             self.hold = None;
         }
+        let (now, wall) = self.now();
         if self.observed {
-            let (now, wall) = self.now();
             let intent = self.intent_now(now);
             self.drive(intent, now, wall).await;
-            self.trace(now, wall).await;
         }
+        // A new runtime names the clip it inherits; shadow traces nothing before its first frame.
+        self.trace(now, wall).await;
         info!(
             target: LOG_TARGET,
             camera_id = self.cfg.camera_id,
@@ -982,6 +988,10 @@ impl Controller {
         };
         // A tracker without an observed/predicted contract cannot drive files.
         self.observed = observed && self.shadow.is_some();
+        self.legacy = self
+            .shadow
+            .is_none()
+            .then(|| registry.start_legacy(cfg.camera_id, cfg.generation, &cfg.policy_revision));
     }
 
     /// M2.1: rotate on the five-minute duration cap, the byte cap and a
@@ -1226,6 +1236,9 @@ impl Controller {
             None => self.clip.map(|h| h.clip_id),
         };
         let held = self.hold.is_some();
+        if let Some(legacy) = &self.legacy {
+            legacy.set_active_clip(clip);
+        }
         if let Some(shadow) = self.shadow.as_mut() {
             let writes = shadow.record(now, wall, clip, held);
             persist(&self.store, shadow, writes).await;
@@ -1236,6 +1249,7 @@ impl Controller {
     async fn finalize(&mut self) {
         self.flush_deferred_close().await;
         self.close(Utc::now(), "shutdown").await;
+        self.legacy = None;
         if let Some(mut shadow) = self.shadow.take() {
             let writes = shadow.finish();
             persist(&self.store, &shadow, writes).await;

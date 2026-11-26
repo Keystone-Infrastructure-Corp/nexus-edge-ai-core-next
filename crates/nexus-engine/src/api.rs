@@ -3086,9 +3086,11 @@ struct CameraFrameStatsView {
     /// never as applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     zones_runtime: Option<ZonesReceipt>,
-    /// SPEC-089 — the fresh-evidence recording policy's runtime. Present only
-    /// while the camera's supervisor runs it in shadow; absent for legacy, an
-    /// unsupported tracker, or no running supervisor.
+    /// SPEC-089 — the recording policy the camera's supervisor runs. Present
+    /// whenever one runs it: legacy (an unsupported tracker included) names
+    /// only its mode, generation, applied revision and clip, with no
+    /// diagnostics. Absent only when no supervisor runs the camera, which a
+    /// reader never takes as legacy.
     #[serde(skip_serializing_if = "Option::is_none")]
     recording_activity: Option<RecordingActivityView>,
 }
@@ -8829,11 +8831,13 @@ mod tests {
         );
     }
 
-    /// SPEC-089 — `recording_activity` on the camera-stats read: absent for a
-    /// legacy camera, every key present (explicit `null`s) while a shadow
-    /// supervisor runs, the open legacy clip's bytes read from the recorder,
-    /// the single and the batch read agreeing, and absent again once that
-    /// supervisor ends.
+    /// SPEC-089 — `recording_activity` on the camera-stats read: absent while
+    /// no supervisor runs the camera, so absence never reads as legacy; a
+    /// legacy supervisor's mode, generation and applied revision with no
+    /// shadow diagnostics; every key present (explicit `null`s) while a
+    /// shadow supervisor runs, the open legacy clip's bytes read from the
+    /// recorder, the single and the batch read agreeing, and absent again
+    /// once that supervisor ends.
     #[tokio::test]
     async fn camera_stats_report_shadow_recording_activity_in_the_agreed_shape() {
         use nexus_pipeline::recording_activity::AnalysisOutcome;
@@ -8907,7 +8911,47 @@ mod tests {
         let frame_stats = state.frame_stats.clone();
         let recorder = state.recorder.clone();
         let app = super::router(state);
-        assert_eq!(activity(&app, id).await, None, "legacy reports nothing");
+        assert_eq!(activity(&app, id).await, None, "nothing runs the camera");
+
+        use nexus_pipeline::recording_controller::{RecordingCommand, COMMAND_TIMEOUT};
+        let (_stop, stop_rx) = tokio::sync::watch::channel(false);
+        let (control, _guard) = nexus_pipeline::recording_controller::spawn(
+            nexus_pipeline::recording_controller::ControllerConfig {
+                camera_id: id,
+                generation: 6,
+                policy: None,
+                policy_revision: "rev-6".into(),
+                tracker: "bytetrack".into(),
+                post_roll_secs: 2,
+                pre_roll_secs: 5,
+                max_clip_bytes: 0,
+                record_motion_clip_on_alert: false,
+                frame_width: 512,
+                frame_height: 288,
+            },
+            recorder.clone(),
+            store.clone(),
+            frame_stats.clone(),
+            stop_rx,
+        );
+        assert_eq!(
+            activity(&app, id).await,
+            Some(json!({
+                "schema_version": 1,
+                "mode": "legacy",
+                "generation": 6,
+                "policy_revision": "rev-6",
+                "active_clip_id": null,
+                "active_clip_bytes": null,
+                "recorder_error": null,
+            })),
+            "a supervisor running legacy says so"
+        );
+        control
+            .request(RecordingCommand::Stop, COMMAND_TIMEOUT)
+            .await
+            .unwrap();
+        assert_eq!(activity(&app, id).await, None, "its supervisor stopped");
 
         let policy = nexus_config::RecordingPolicyConfig {
             mode: nexus_config::RecordingPolicyMode::Shadow,

@@ -2842,7 +2842,11 @@ mod tests {
                 .recording_activity()
                 .snapshot(7, std::time::Instant::now())
         };
-        assert!(runtime().is_none(), "legacy reports no runtime");
+        wait_until("legacy reports the clip it holds", || {
+            runtime().and_then(|r| r.active_clip_id) == Some(1)
+        })
+        .await;
+        let legacy = runtime().map(|r| (r.mode, r.generation, r.policy_revision));
 
         let mut shadow = cam(None);
         shadow.behavior.recording_policy = Some(RecordingPolicyConfig {
@@ -2880,10 +2884,25 @@ mod tests {
             .expect("roll back");
         reconcile(&args).await.expect("pass after the rollback");
         let after_rollback = entry_of(&args.handles, 7);
-        let rolled_back = runtime().is_none();
+        let rolled_back = runtime().map(|r| (r.mode, r.policy_revision, r.active_clip_id));
         let calls = recorder.calls();
+
+        let mut disabled = cam(None);
+        disabled.ingest.enabled = false;
+        args.store.upsert_camera(&disabled).await.expect("disable");
+        reconcile(&args).await.expect("pass after the disable");
+        let disabled = runtime();
         abort_all(&args.handles);
 
+        assert_eq!(
+            legacy,
+            Some((
+                RecordingPolicyMode::Legacy,
+                original.zone_generation,
+                String::new()
+            )),
+            "the running legacy generation and the revision it applied"
+        );
         assert!(
             Arc::ptr_eq(&after_shadow.task, &original.task)
                 && Arc::ptr_eq(&after_aba.task, &original.task)
@@ -2900,7 +2919,12 @@ mod tests {
             "the pass applied shadow to the running generation"
         );
         assert_eq!(aba.as_deref(), Some("rev-aba"), "the pass applied the ABA");
-        assert!(rolled_back, "the rollback ended the measurement");
+        assert_eq!(
+            rolled_back,
+            Some((RecordingPolicyMode::Legacy, String::new(), Some(1))),
+            "the rollback runs legacy on the clip it inherited"
+        );
+        assert!(disabled.is_none(), "nothing runs a disabled camera");
         assert_eq!(
             calls,
             [ClipCall::Open(1)],
@@ -2939,7 +2963,7 @@ mod tests {
             .expect("roll back");
         reconcile(&args).await.expect("pass after the rollback");
         let after_rollback = entry_of(&args.handles, 7);
-        let rolled_back = runtime().is_none();
+        let rolled_back = runtime().map(|r| r.mode);
         // Legacy holds the clip on the person still in view.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let calls = recorder.calls();
@@ -2954,7 +2978,11 @@ mod tests {
             Arc::ptr_eq(&after_rollback.task, &original.task),
             "a rollback must not restart the camera"
         );
-        assert!(rolled_back, "legacy reports no runtime");
+        assert_eq!(
+            rolled_back,
+            Some(RecordingPolicyMode::Legacy),
+            "the rollback runs legacy"
+        );
         assert_eq!(calls, [ClipCall::Open(1)], "the open clip carried on");
     }
 

@@ -382,7 +382,7 @@ pub struct ShadowState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RecordingActivityRuntime {
     pub schema_version: u32,
-    /// The mode running; legacy has no runtime.
+    /// The mode running.
     pub mode: RecordingPolicyMode,
     /// The supervisor generation running it.
     pub generation: u64,
@@ -390,12 +390,14 @@ pub struct RecordingActivityRuntime {
     pub policy_revision: String,
     /// The open motion clip of whichever side writes: legacy, or observed's policy.
     pub active_clip_id: Option<ClipId>,
+    /// `None` for legacy, which measures nothing.
     #[serde(flatten)]
-    pub diagnostics: DiagnosticsSnapshot,
+    pub diagnostics: Option<DiagnosticsSnapshot>,
 }
 
-/// Each camera running a non-legacy policy. Entries are weak: a supervisor
-/// that ends, however it ends, takes its entry with it.
+/// Each camera whose supervisor runs, whatever its mode, so no entry means
+/// nothing runs it. Entries are weak: a supervisor that ends, however it
+/// ends, takes its entry with it.
 #[derive(Debug, Default)]
 pub struct RecordingActivityRegistry {
     cameras: RwLock<HashMap<CameraId, Weak<Mutex<ShadowState>>>>,
@@ -410,6 +412,27 @@ impl RecordingActivityRegistry {
         shared
     }
 
+    /// A camera whose supervisor runs legacy, reported while the handle lives.
+    pub(crate) fn start_legacy(
+        &self,
+        camera_id: CameraId,
+        generation: u64,
+        policy_revision: &str,
+    ) -> LegacyRuntime {
+        LegacyRuntime(self.start(
+            camera_id,
+            ShadowState {
+                mode: RecordingPolicyMode::Legacy,
+                generation,
+                policy_revision: policy_revision.to_owned(),
+                origin: None,
+                active_clip: None,
+                // Never read: legacy reports no diagnostics.
+                diagnostics: RecordingDiagnostics::new(0),
+            },
+        ))
+    }
+
     pub fn snapshot(&self, camera_id: CameraId, now: Instant) -> Option<RecordingActivityRuntime> {
         let shared = self.cameras.read().get(&camera_id)?.upgrade()?;
         let s = shared.lock();
@@ -420,8 +443,19 @@ impl RecordingActivityRegistry {
             generation: s.generation,
             policy_revision: s.policy_revision.clone(),
             active_clip_id: s.active_clip,
-            diagnostics: s.diagnostics.snapshot(now_ms),
+            diagnostics: (s.mode != RecordingPolicyMode::Legacy)
+                .then(|| s.diagnostics.snapshot(now_ms)),
         })
+    }
+}
+
+/// A legacy camera's entry in the [`RecordingActivityRegistry`].
+pub(crate) struct LegacyRuntime(Arc<Mutex<ShadowState>>);
+
+impl LegacyRuntime {
+    /// Legacy's open motion clip, which the camera's stats report.
+    pub(crate) fn set_active_clip(&self, clip: Option<ClipId>) {
+        self.0.lock().active_clip = clip;
     }
 }
 
@@ -1019,7 +1053,8 @@ mod tests {
         assert!(registry.snapshot(3, Instant::now()).is_none());
         let shadow = start(mode(RecordingPolicyMode::Shadow), "iou-naive").unwrap();
         let runtime = registry.snapshot(3, Instant::now()).unwrap();
-        assert_eq!((runtime.generation, runtime.diagnostics.reason), (9, None));
+        let reason = runtime.diagnostics.map(|d| d.reason);
+        assert_eq!((runtime.generation, reason), (9, Some(None)));
         assert_eq!(runtime.policy_revision, "rev-9");
         drop(shadow);
         assert!(registry.snapshot(3, Instant::now()).is_none());

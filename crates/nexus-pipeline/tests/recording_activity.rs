@@ -1180,7 +1180,11 @@ mod supervisor_shadow {
         assert_eq!(shadow.motion, legacy.motion, "identical motion rows");
 
         // Diagnostics differ: only shadow measures and persists anything.
-        assert!(legacy.runtime.is_none());
+        assert_eq!(
+            legacy.runtime.map(|r| (r.mode, r.diagnostics)),
+            Some((RecordingPolicyMode::Legacy, None)),
+            "legacy reports only that it runs"
+        );
         assert!(legacy.minutes.is_empty() && legacy.episodes.is_empty());
         let runtime = shadow.runtime.expect("shadow reports its runtime");
         assert_eq!(runtime.mode, RecordingPolicyMode::Shadow);
@@ -1188,11 +1192,12 @@ mod supervisor_shadow {
             runtime.policy_revision, "rev-saved",
             "the runtime names the saved revision it runs"
         );
-        assert!(runtime.diagnostics.last_failure_age_ms.is_some());
-        assert!(!runtime.diagnostics.trace_incomplete);
-        assert_eq!(runtime.diagnostics.collector_error, None);
+        let diagnostics = runtime.diagnostics.expect("shadow measures");
+        assert!(diagnostics.last_failure_age_ms.is_some());
+        assert!(!diagnostics.trace_incomplete);
+        assert_eq!(diagnostics.collector_error, None);
         assert!(
-            runtime.diagnostics.elapsed.legacy_open.quiet > 0,
+            diagnostics.elapsed.legacy_open.quiet > 0,
             "legacy kept recording on ByteTrack's coasting track; shadow did not"
         );
 
@@ -1250,9 +1255,12 @@ mod supervisor_shadow {
     async fn a_collector_failure_is_reported_and_recording_continues() {
         let script = scenario();
         let o = run(policy(RecordingPolicyMode::Shadow), script, Some(80)).await;
-        let runtime = o.runtime.expect("shadow reports its runtime");
-        assert!(runtime.diagnostics.trace_incomplete);
-        let error = runtime.diagnostics.collector_error.expect("reported");
+        let diagnostics = o
+            .runtime
+            .and_then(|r| r.diagnostics)
+            .expect("shadow reports its runtime");
+        assert!(diagnostics.trace_incomplete);
+        let error = diagnostics.collector_error.expect("reported");
         assert!(error.contains("not saved"), "{error}");
         assert!(
             o.calls.iter().filter(|c| c.starts_with("close")).count() >= 2,

@@ -551,7 +551,7 @@ async fn observed_records_degraded_coverage_while_the_first_analysis_hangs() {
     assert_eq!((opens(&calls), closes(&calls)), (1, 0), "{calls:#?}");
     let runtime = rig.stats.recording_activity().snapshot(1, Instant::now());
     assert_eq!(
-        runtime.map(|r| (r.mode, r.diagnostics.reason)),
+        runtime.map(|r| (r.mode, r.diagnostics.and_then(|d| d.reason))),
         Some((
             RecordingPolicyMode::Observed,
             Some(nexus_pipeline::recording_activity::RecordingReason::DegradedCoverage)
@@ -1136,10 +1136,9 @@ mod controller {
     /// The shadow policy's reason, whether it would record, and whether its
     /// trace has a gap.
     fn proposed(c: &Cam) -> Option<(Option<RecordingReason>, bool, bool)> {
-        c.runtime().map(|r| {
-            let d = r.diagnostics;
-            (d.reason, d.shadow_open, d.trace_incomplete)
-        })
+        c.runtime()
+            .and_then(|r| r.diagnostics)
+            .map(|d| (d.reason, d.shadow_open, d.trace_incomplete))
     }
 
     /// R-4/R-6: shadow proposes what observed would do, on its own clock. A
@@ -1637,7 +1636,7 @@ mod controller {
         assert_eq!(receipt.clip.map(|h| h.clip_id), Some(2));
         let runtime = c.runtime().unwrap();
         assert_eq!(
-            runtime.diagnostics.reason,
+            runtime.diagnostics.unwrap().reason,
             Some(nexus_pipeline::recording_activity::RecordingReason::DegradedCoverage)
         );
         assert!(c.stop().await.clip.is_none());
@@ -1671,7 +1670,7 @@ mod controller {
             "held, not closed: {:#?}",
             c.rec.calls()
         );
-        let held = c.runtime().unwrap().diagnostics;
+        let held = c.runtime().unwrap().diagnostics.unwrap();
         assert_eq!(
             held.reason,
             Some(nexus_pipeline::recording_activity::RecordingReason::MinimumDuration)
@@ -1683,7 +1682,13 @@ mod controller {
             *closed >= *"closed 2 media=3",
             "three seconds of media: {closed}"
         );
-        let elapsed = c.runtime().unwrap().diagnostics.elapsed.legacy_open;
+        let elapsed = c
+            .runtime()
+            .unwrap()
+            .diagnostics
+            .unwrap()
+            .elapsed
+            .legacy_open;
         assert!(elapsed.minimum_duration >= 2_000, "{elapsed:?}");
         assert!(elapsed.activity < 1_000, "{elapsed:?}");
     }
@@ -1766,7 +1771,17 @@ mod controller {
             Some(1),
             "the clip carried on"
         );
-        assert!(c.runtime().is_none(), "legacy reports no runtime");
+        assert_eq!(
+            c.runtime()
+                .map(|r| (r.mode, r.policy_revision, r.active_clip_id, r.diagnostics)),
+            Some((
+                RecordingPolicyMode::Legacy,
+                "rev-legacy".into(),
+                Some(1),
+                None
+            )),
+            "legacy reports that it runs, on the clip it inherited"
+        );
         // Legacy's live track holds the clip; its post-roll then closes it.
         for _ in 0..6 {
             let ms = c.elapsed_ms();
@@ -1864,6 +1879,10 @@ mod controller {
         c.send(RecordingCommand::PolicyChanged(None, "rev-4".into()), LONG)
             .await
             .unwrap();
-        assert_eq!(applied(&c), None, "legacy reports no runtime");
+        assert_eq!(
+            applied(&c),
+            Some((RecordingPolicyMode::Legacy, "rev-4".to_owned())),
+            "legacy reports the revision it applied"
+        );
     }
 }
