@@ -148,6 +148,13 @@ const FINALIZE_DRAINS: u32 = 3;
 const FINALIZE_RETRY_MIN: Duration = Duration::from_secs(5);
 const FINALIZE_RETRY_MAX: Duration = Duration::from_secs(300);
 
+/// The delays before each of a clip's own retries, endless.
+fn finalize_retry_delays() -> impl Iterator<Item = Duration> {
+    std::iter::successors(Some(FINALIZE_RETRY_MIN), |d| {
+        Some((*d * 2).min(FINALIZE_RETRY_MAX))
+    })
+}
+
 /// Recording-health reason of a clip whose close did not finish.
 const UNFINALIZED: &str = "recording could not be finalized";
 
@@ -946,10 +953,8 @@ impl Writers {
         let in_flight = self.in_flight.clone();
         let shutting_down = self.shutting_down.clone();
         tokio::spawn(async move {
-            let mut delay = FINALIZE_RETRY_MIN;
-            loop {
+            for delay in finalize_retry_delays() {
                 tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(FINALIZE_RETRY_MAX);
                 let _attempt = in_flight.subscribe();
                 // As an open does: either shutdown's idle check sees this
                 // attempt, or this sees shutdown begun.
@@ -6903,6 +6908,75 @@ mod epoch_tests {
         assert_eq!(
             attempts(&rec, clip),
             Some(3),
+            "the schedule retried after shutdown"
+        );
+    }
+
+    /// SPEC-088 review 11: a clip's own retries come 5 s after its close
+    /// failed, then twice as far apart after each failed attempt, and never
+    /// more than five minutes apart.
+    #[test]
+    fn a_clips_own_retries_double_up_to_five_minutes_apart() {
+        let secs: Vec<u64> = finalize_retry_delays()
+            .take(9)
+            .map(|d| d.as_secs())
+            .collect();
+        assert_eq!(secs, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
+    }
+
+    /// SPEC-088 review 11: shutdown waits for a scheduled attempt under way,
+    /// here blocked on a store with no free connection, and once it ended
+    /// the schedule makes no other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_a_blocked_scheduled_attempt_and_ends_the_schedule() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let clip = release_an_unfinalized_clip(&rec, &store, &clips_dir).await;
+        let idle = rec.in_flight.is_closed();
+        // Every connection held: the schedule's first attempt, 5 s on, blocks.
+        let mut held = Vec::new();
+        for _ in 0..store.pool().options().get_max_connections() {
+            held.push(store.pool().acquire().await.unwrap());
+        }
+
+        let under_way = wait_for(Duration::from_secs(10), || !rec.in_flight.is_closed()).await;
+        // Past the attempt's shutdown check, into the store.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let early = tokio::time::timeout(Duration::from_millis(500), rec.shutdown())
+            .await
+            .is_ok();
+        drop(held);
+        let shut = tokio::time::timeout(Duration::from_secs(10), rec.shutdown())
+            .await
+            .is_ok();
+        let attempted = attempts(&rec, clip);
+        // Past the schedule's next delay.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+
+        assert!(
+            idle,
+            "precondition: nothing was in flight after the release"
+        );
+        assert!(under_way, "precondition: the schedule's attempt began");
+        assert!(
+            !early,
+            "shutdown returned while a scheduled attempt was under way"
+        );
+        assert!(shut, "shutdown did not return once the attempt ended");
+        assert_eq!(
+            attempted,
+            Some(4),
+            "the blocked attempt did not run to its end"
+        );
+        assert_eq!(
+            attempts(&rec, clip),
+            Some(4),
             "the schedule retried after shutdown"
         );
     }
