@@ -720,8 +720,9 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                 } else if entry.key == want {
                     info!(
                         camera_id = cam_id,
-                        "camera reconciler: supervisor's zone generation is no longer current \
-                         (camera deleted and re-created); restarting supervisor"
+                        "camera reconciler: supervisor's zone generation is no longer running \
+                         (its source ended, or the camera was deleted and re-created); \
+                         restarting supervisor"
                     );
                 } else {
                     info!(
