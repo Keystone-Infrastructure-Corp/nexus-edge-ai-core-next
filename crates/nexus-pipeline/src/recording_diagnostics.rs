@@ -448,9 +448,9 @@ pub struct TraceClock {
     pub wall_at: DateTime<Utc>,
 }
 
-/// Each camera whose supervisor runs, whatever its mode, so no entry means
-/// nothing runs it. Entries are weak: a supervisor that ends, however it
-/// ends, takes its entry with it.
+/// Each camera whose supervisor runs its configured mode, so no entry means
+/// nothing runs it, or its tracker cannot run its policy. Entries are weak:
+/// a supervisor that ends, however it ends, takes its entry with it.
 #[derive(Debug, Default)]
 pub struct RecordingActivityRegistry {
     cameras: RwLock<HashMap<CameraId, Weak<Mutex<ShadowState>>>>,
@@ -693,7 +693,9 @@ impl ShadowRecording {
             warn!(
                 camera_id,
                 tracker,
-                "recording_policy shadow needs a tracker with an observed/predicted contract; not running"
+                ?mode,
+                "recording_policy needs a tracker with an observed/predicted contract; \
+                 recording as legacy, with no recording-activity runtime"
             );
             return None;
         };

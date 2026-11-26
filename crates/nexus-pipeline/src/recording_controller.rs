@@ -1004,9 +1004,10 @@ impl Controller {
         };
         // A tracker without an observed/predicted contract cannot drive files.
         self.observed = observed && self.shadow.is_some();
-        self.legacy = self
-            .shadow
-            .is_none()
+        // Such a policy records as legacy but reports no runtime: legacy is not what runs it.
+        self.legacy = cfg
+            .policy
+            .is_none_or(|p| p.mode == RecordingPolicyMode::Legacy)
             .then(|| registry.start_legacy(cfg.camera_id, cfg.generation, &cfg.policy_revision));
     }
 

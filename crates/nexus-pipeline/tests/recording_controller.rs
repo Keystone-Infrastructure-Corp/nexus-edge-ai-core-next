@@ -2298,6 +2298,57 @@ mod controller {
         );
     }
 
+    /// PR #406 review: a shadow or observed policy whose tracker has no
+    /// observed/predicted contract cannot run. The camera records as legacy,
+    /// fail-open, but reports no runtime rather than "legacy running", which
+    /// is not what was configured. A legacy camera still reports its own,
+    /// and a live change to such a policy takes that report away.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_its_tracker_cannot_run_records_as_legacy_and_reports_no_runtime() {
+        let unsupported = |cfg: ControllerConfig| ControllerConfig {
+            tracker: "kalman".into(),
+            ..cfg
+        };
+        for cfg in [shadow(1_000), observed(1)] {
+            let mode = cfg.policy.map(|p| p.mode);
+            let mut c = cam(unsupported(cfg), 0, false, false).await;
+            assert_eq!(
+                clip_id(&c.frame(0, live(true)).await),
+                Some(1),
+                "{mode:?}: legacy's birth opens the clip"
+            );
+            assert!(
+                c.runtime().is_none(),
+                "{mode:?}: no runtime, not {:?}",
+                c.runtime()
+            );
+            c.stop().await;
+        }
+
+        let mut c = cam(unsupported(config(None)), 0, false, false).await;
+        assert_eq!(clip_id(&c.frame(0, live(true)).await), Some(1));
+        assert_eq!(
+            c.runtime()
+                .map(|r| (r.mode, r.active_clip_id, r.diagnostics.is_none())),
+            Some((RecordingPolicyMode::Legacy, Some(1), true)),
+            "legacy reports its minimal runtime"
+        );
+        let receipt = c
+            .send(
+                RecordingCommand::PolicyChanged(shadow(1_000).policy, "rev-2".into()),
+                LONG,
+            )
+            .await
+            .unwrap();
+        assert_eq!(clip_id(&receipt), Some(1), "the clip carried on");
+        assert!(
+            c.runtime().is_none(),
+            "the shadow it cannot run reports nothing: {:?}",
+            c.runtime()
+        );
+        c.stop().await;
+    }
+
     /// Observed with `post_roll_secs`, `preroll_ms` of retained media and a
     /// 10 s stale deadline, healthy and past the startup's clip.
     async fn observed_and_quiet(post_roll_secs: u32, preroll_ms: u64) -> Cam {
