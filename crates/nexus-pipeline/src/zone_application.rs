@@ -41,13 +41,20 @@ pub const APPLICATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// `sha256:` and the lowercase hex digest of `zones` as JSON, in saved order
 /// and with every field the supervisor reads. Only the zones go in, so nothing
 /// else about the camera, its credentials included, moves it or leaks into it.
-// shortcut: a save that only flips a vertex between 0.0 and -0.0 hashes differently but restarts nothing (the reconciler's key compares them equal), so it reads applying until the camera's next restart; normalize the sign if a client ever sends -0.0.
+/// A -0.0 vertex hashes as 0.0: the reconciler's key compares them equal, so
+/// a save flipping that sign restarts nothing and must not change the revision.
 #[expect(
     clippy::expect_used,
     reason = "a ZoneConfig is strings, floats, a unit enum and an Option<u32>, which always serialize to JSON"
 )]
 pub fn zone_revision(zones: &[ZoneConfig]) -> String {
-    let json = serde_json::to_vec(zones).expect("zones serialize to JSON");
+    let mut zones = zones.to_vec();
+    for (x, y) in zones.iter_mut().flat_map(|z| z.polygon.iter_mut()) {
+        // -0.0 + 0.0 is 0.0; every other value is unchanged.
+        *x += 0.0;
+        *y += 0.0;
+    }
+    let json = serde_json::to_vec(&zones).expect("zones serialize to JSON");
     format!("sha256:{:x}", Sha256::digest(json))
 }
 
@@ -569,6 +576,55 @@ mod tests {
         for other in [kind, area, polygon, id, zones("B"), vec![]] {
             assert_ne!(zone_revision(&other), zone_revision(&zones("A")));
         }
+    }
+
+    /// Zeros and the frame's edges hash as they always have: folding -0.0
+    /// into 0.0 changes no saved config's digest.
+    #[test]
+    fn a_config_with_zero_vertices_keeps_its_pinned_revision() {
+        let mut edges = zones("Driveway");
+        edges[0].polygon = vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)];
+        assert_eq!(
+            zone_revision(&edges),
+            "sha256:3865868024017ee787cdb03c9d3326f5f4e89816f3ad2f4158a34ce7e8537268"
+        );
+        assert_eq!(
+            zone_revision(&[]),
+            "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945"
+        );
+    }
+
+    /// A save that turns a 0.0 vertex into -0.0 passes validation and is the
+    /// same zones to the reconciler's key (`==`), so nothing restarts: it is
+    /// the same revision, and the running generation's receipt stays Applied.
+    #[test]
+    fn a_negative_zero_vertex_save_is_the_same_revision_and_stays_applied() {
+        let camera = |x: &str| -> nexus_config::CameraConfig {
+            serde_json::from_str(&format!(
+                r#"{{"name":"c1","url":"rtsp://example/cam","zones":[{{"id":"z1","name":"door",
+                "polygon":[[{x},0.0],[1.0,0.0],[0.0,1.0]],"kind":"exclusion"}}]}}"#
+            ))
+            .unwrap()
+        };
+        let (zero, negative) = (camera("0.0"), camera("-0.0"));
+        assert!(negative.zones[0].polygon[0].0.is_sign_negative(), "fixture");
+        assert_eq!(negative.validate_finite(), Ok(()));
+        assert_eq!(negative.zones, zero.zones, "the reconciler would restart");
+        let a = zone_revision(&zero.zones);
+        assert_eq!(zone_revision(&negative.zones), a);
+
+        let r = ZoneApplicationRegistry::default();
+        let now = Instant::now();
+        r.request(7, &a, true);
+        let g = r.start(7, &a);
+        frame(&r, g, &a, at(0));
+        // The save requests what it stored; the reconciler restarts nothing.
+        let saved = zone_revision(&negative.zones);
+        r.request(7, &saved, true);
+        assert_eq!(
+            read(&r, &saved, now),
+            (a.clone(), Some(a.clone()), g, Some(g), Applied, None)
+        );
     }
 
     /// The plan's vector: A applied by g1, B started by g2 without an
