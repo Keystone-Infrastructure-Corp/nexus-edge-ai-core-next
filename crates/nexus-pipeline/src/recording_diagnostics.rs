@@ -214,6 +214,7 @@ pub struct RecordingDiagnostics {
     shadow_files: Files,
     transitions: u64,
     trace_incomplete: bool,
+    clock_steps_back: u64,
     collector_error: Option<String>,
     minute: MinuteCounters,
     counts: EvidenceCounts,
@@ -234,6 +235,7 @@ impl RecordingDiagnostics {
             shadow_files: Files::default(),
             transitions: 0,
             trace_incomplete: false,
+            clock_steps_back: 0,
             collector_error: None,
             minute: MinuteCounters::default(),
             counts: EvidenceCounts::default(),
@@ -255,6 +257,7 @@ impl RecordingDiagnostics {
         if at_ms < self.credited_ms {
             // Never credit time twice: hold the clock and say the trace has a gap.
             self.trace_incomplete = true;
+            self.clock_steps_back += 1;
         }
         let at_ms = at_ms.max(self.credited_ms);
         self.credit(at_ms);
@@ -395,6 +398,36 @@ pub struct RecordingActivityRuntime {
     pub diagnostics: Option<DiagnosticsSnapshot>,
 }
 
+/// A non-legacy camera's retained transitions, for the explicit diagnostics
+/// bundle only: shadow intervals placed on capture time can be matched to
+/// independently labeled events.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TransitionTrace {
+    pub mode: RecordingPolicyMode,
+    pub generation: u64,
+    pub policy_revision: String,
+    /// `None` until the generation's first frame starts the policy clock.
+    pub clock: Option<TraceClock>,
+    /// Oldest first, at most [`TRANSITION_RING`]; each state holds until
+    /// the next, the last one through `clock.policy_ms`.
+    pub transitions: Vec<Transition>,
+    pub trace_incomplete: bool,
+    /// Why it is incomplete: older transitions the full ring dropped, clock
+    /// steps back (that transition was held at the previous time), and the
+    /// collector's last failure.
+    pub dropped_transitions: u64,
+    pub clock_steps_back: u64,
+    pub collector_error: Option<String>,
+}
+
+/// The policy clock and the wall clock read together: a transition at
+/// `at_ms` was captured at `wall_at - (policy_ms - at_ms)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct TraceClock {
+    pub policy_ms: u64,
+    pub wall_at: DateTime<Utc>,
+}
+
 /// Each camera whose supervisor runs, whatever its mode, so no entry means
 /// nothing runs it. Entries are weak: a supervisor that ends, however it
 /// ends, takes its entry with it.
@@ -445,6 +478,37 @@ impl RecordingActivityRegistry {
             active_clip_id: s.active_clip,
             diagnostics: (s.mode != RecordingPolicyMode::Legacy)
                 .then(|| s.diagnostics.snapshot(now_ms)),
+        })
+    }
+
+    /// The camera's [`TransitionTrace`], `None` for legacy; `now` and
+    /// `wall_at` must be read together.
+    pub fn trace(
+        &self,
+        camera_id: CameraId,
+        now: Instant,
+        wall_at: DateTime<Utc>,
+    ) -> Option<TransitionTrace> {
+        let shared = self.cameras.read().get(&camera_id)?.upgrade()?;
+        let s = shared.lock();
+        if s.mode == RecordingPolicyMode::Legacy {
+            return None;
+        }
+        let d = &s.diagnostics;
+        Some(TransitionTrace {
+            mode: s.mode,
+            generation: s.generation,
+            policy_revision: s.policy_revision.clone(),
+            clock: s.origin.map(|origin| TraceClock {
+                policy_ms: millis(now, origin),
+                wall_at,
+            }),
+            transitions: d.ring.iter().copied().collect(),
+            trace_incomplete: d.trace_incomplete,
+            // Every transition entered the ring; only a full ring drops one.
+            dropped_transitions: d.transitions - d.ring.len() as u64,
+            clock_steps_back: d.clock_steps_back,
+            collector_error: d.collector_error.clone(),
         })
     }
 }
@@ -1030,6 +1094,97 @@ mod tests {
         assert_eq!(second.elapsed.legacy_closed.quiet, 50_000);
         assert_eq!(second.transitions, 1);
         assert!(!second.trace_incomplete);
+    }
+
+    /// The bundle's trace: the retained transitions on the policy clock, the
+    /// wall clock read beside it, and why it is incomplete.
+    #[test]
+    fn a_trace_places_each_retained_interval_and_names_its_gaps() {
+        let registry = RecordingActivityRegistry::default();
+        let legacy = registry.start_legacy(4, 2, "rev-2");
+        assert!(
+            registry.trace(4, Instant::now(), Utc::now()).is_none(),
+            "legacy measures nothing"
+        );
+        drop(legacy);
+        let origin = Instant::now();
+        let shared = registry.start(
+            3,
+            ShadowState {
+                mode: RecordingPolicyMode::Shadow,
+                generation: 9,
+                policy_revision: "rev-9".into(),
+                origin: None,
+                active_clip: None,
+                diagnostics: RecordingDiagnostics::new(0),
+            },
+        );
+        let wall = Utc::now();
+        let at = |ms| origin + std::time::Duration::from_millis(ms);
+        assert_eq!(registry.trace(3, at(5_000), wall).unwrap().clock, None);
+        shared.lock().origin = Some(origin);
+        // Three shadow intervals inside one minute.
+        let intervals = [(1_000, 4_000), (10_000, 12_000), (30_000, 33_000)];
+        for (open, close) in intervals {
+            let d = &mut shared.lock().diagnostics;
+            d.transition(open, false, true, Activity);
+            d.transition(close, false, false, Quiet);
+        }
+        let trace = registry.trace(3, at(40_000), wall).unwrap();
+        assert_eq!(
+            (trace.mode, trace.generation, trace.policy_revision.as_str()),
+            (RecordingPolicyMode::Shadow, 9, "rev-9")
+        );
+        assert_eq!(
+            trace.clock,
+            Some(TraceClock {
+                policy_ms: 40_000,
+                wall_at: wall
+            })
+        );
+        let expected: Vec<Transition> = intervals
+            .iter()
+            .flat_map(|&(open, close)| {
+                [
+                    Transition {
+                        at_ms: open,
+                        legacy_open: false,
+                        shadow_open: true,
+                        reason: Activity,
+                    },
+                    Transition {
+                        at_ms: close,
+                        legacy_open: false,
+                        shadow_open: false,
+                        reason: Quiet,
+                    },
+                ]
+            })
+            .collect();
+        assert_eq!(trace.transitions, expected);
+        assert!(!trace.trace_incomplete);
+        assert_eq!((trace.dropped_transitions, trace.clock_steps_back), (0, 0));
+
+        {
+            let d = &mut shared.lock().diagnostics;
+            for k in 0..300u64 {
+                d.transition(40_000 + k, k % 2 == 0, false, Quiet);
+            }
+            // A changed state whose clock stepped back is held and counted.
+            d.transition(1_000, true, false, Quiet);
+            d.collector_failed("minute summary not saved".into());
+        }
+        let trace = registry.trace(3, at(41_000), wall).unwrap();
+        assert_eq!(trace.transitions.len(), TRANSITION_RING);
+        assert!(trace.trace_incomplete);
+        assert_eq!(
+            (trace.dropped_transitions, trace.clock_steps_back),
+            (6 + 301 - TRANSITION_RING as u64, 1)
+        );
+        assert_eq!(
+            trace.collector_error.as_deref(),
+            Some("minute summary not saved")
+        );
     }
 
     #[test]

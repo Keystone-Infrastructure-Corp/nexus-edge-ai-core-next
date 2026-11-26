@@ -350,16 +350,19 @@ async fn build_snapshot(
     };
 
     // Per-camera throughput + decode health, sorted by camera id so two
-    // bundles from the same box diff cleanly. Counters only — no URL, name
+    // bundles from the same box diff cleanly. Counters and SPEC-089's
+    // bounded shadow transition trace (exported only here) — no URL, name
     // or credential — so this needs no redaction pass.
     let camera_stats_json = {
         let mut rows: Vec<(nexus_types::CameraId, nexus_pipeline::CameraFrameStats)> =
             s.frame_stats.snapshot_all().into_iter().collect();
         rows.sort_by_key(|(id, _)| *id);
+        let (mono, wall) = (std::time::Instant::now(), Utc::now());
         let view: Vec<serde_json::Value> = rows
             .into_iter()
             .map(|(id, st)| {
                 let dh = s.decode_health.snapshot(id).unwrap_or_default();
+                let trace = s.frame_stats.recording_activity().trace(id, mono, wall);
                 serde_json::json!({
                     "camera_id": id,
                     "last_frame_at": st.last_frame_at,
@@ -376,6 +379,7 @@ async fn build_snapshot(
                     "sampled_frames": dh.sampled_frames,
                     "duplicate_frames": dh.duplicate_frames,
                     "duplicate_per_mille": dh.duplicate_per_mille(),
+                    "recording_activity_trace": trace,
                 })
             })
             .collect();

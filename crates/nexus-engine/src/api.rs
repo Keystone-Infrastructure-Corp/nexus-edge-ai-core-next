@@ -9046,6 +9046,190 @@ mod tests {
         );
     }
 
+    /// SPEC-089 — the explicit diagnostics bundle carries a shadow camera's
+    /// retained transitions on the policy clock, with the wall clock read
+    /// beside it, so each shadow interval inside one minute can be placed
+    /// on capture time against labeled events; and it says when the ring
+    /// dropped some.
+    #[tokio::test]
+    async fn diagnostics_bundle_exports_each_shadow_interval_of_the_trace() {
+        use nexus_pipeline::recording_activity::AnalysisOutcome;
+        use nexus_pipeline::recording_diagnostics::{
+            EvidenceCounts, ShadowRecording, TRANSITION_RING,
+        };
+        use serde_json::json;
+        use std::io::Read as _;
+        use std::time::{Duration, Instant};
+
+        const ADMIN_SECRET: &[u8] = b"diagnostics-bundle-shadow-trace-secret";
+
+        /// The camera's `recording_activity_trace` in the bundle's camera-stats.json.
+        async fn trace(app: &axum::Router, id: nexus_types::CameraId) -> serde_json::Value {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/admin/diagnostics/export?log_lines=0")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", sign_admin_jwt(ADMIN_SECRET)),
+                )
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let gz = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&gz[..]));
+            for entry in archive.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                if entry.path().unwrap().to_str() == Some("camera-stats.json") {
+                    let mut body = String::new();
+                    entry.read_to_string(&mut body).unwrap();
+                    let rows: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+                    let row = rows.iter().find(|r| r["camera_id"] == id).unwrap();
+                    return row
+                        .get("recording_activity_trace")
+                        .cloned()
+                        .unwrap_or_else(|| panic!("no trace key: {row}"));
+                }
+            }
+            panic!("camera-stats.json missing from the bundle");
+        }
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let id = store.list_cameras().await.unwrap()[0].id;
+        let frame_stats = state.frame_stats.clone();
+        let epoch = frame_stats.begin_session(id);
+        frame_stats.observe_frame(id, epoch, chrono::Utc::now(), 512, 288);
+        let app = super::router(state);
+        assert_eq!(trace(&app, id).await, json!(null), "nothing runs a policy");
+
+        let policy = nexus_config::RecordingPolicyConfig {
+            mode: nexus_config::RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 10_000,
+        };
+        let mut shadow = ShadowRecording::start(
+            frame_stats.recording_activity(),
+            id,
+            7,
+            Some(policy),
+            "rev-7",
+            "bytetrack",
+            2,
+            5,
+        )
+        .unwrap();
+        let before = trace(&app, id).await;
+        assert_eq!(
+            before["clock"],
+            json!(null),
+            "no frame has started the clock"
+        );
+        assert_eq!(before["transitions"], json!([]));
+
+        // One minute of frames captured up to now; a person at 10, 20 and 30 s.
+        let t0 = Instant::now().checked_sub(Duration::from_secs(60)).unwrap();
+        let w0 = chrono::Utc::now() - chrono::Duration::seconds(60);
+        let mut frame = |ms: u64, observed: u32, legacy_clip: Option<nexus_store::ClipId>| {
+            shadow.frame(
+                t0 + Duration::from_millis(ms),
+                w0 + chrono::Duration::milliseconds(ms as i64),
+                AnalysisOutcome::Success,
+                EvidenceCounts {
+                    observed,
+                    ..EvidenceCounts::default()
+                },
+                false,
+                legacy_clip,
+            );
+        };
+        for ms in [0, 1_000, 2_000, 3_000, 4_000] {
+            frame(ms, 0, None);
+        }
+        for start in [10_000, 20_000, 30_000] {
+            frame(start, 1, None);
+            frame(start + 1_000, 0, None);
+            frame(start + 2_000, 0, None);
+        }
+
+        let got = trace(&app, id).await;
+        assert_eq!(
+            (
+                &got["mode"],
+                &got["generation"],
+                &got["policy_revision"],
+                &got["trace_incomplete"],
+                &got["dropped_transitions"],
+            ),
+            (
+                &json!("shadow"),
+                &json!(7),
+                &json!("rev-7"),
+                &json!(false),
+                &json!(0)
+            )
+        );
+        let t = |at_ms: u64, shadow_open: bool, reason: &str| {
+            json!({
+                "at_ms": at_ms,
+                "legacy_open": false,
+                "shadow_open": shadow_open,
+                "reason": reason,
+            })
+        };
+        assert_eq!(
+            got["transitions"],
+            json!([
+                // Degraded until three passes over two seconds recover it.
+                t(0, true, "degraded_coverage"),
+                t(2_000, true, "activity"),
+                t(3_000, true, "post_roll"),
+                t(4_000, false, "quiet"),
+                t(10_000, true, "activity"),
+                t(11_000, true, "post_roll"),
+                t(12_000, false, "quiet"),
+                t(20_000, true, "activity"),
+                t(21_000, true, "post_roll"),
+                t(22_000, false, "quiet"),
+                t(30_000, true, "activity"),
+                t(31_000, true, "post_roll"),
+                t(32_000, false, "quiet"),
+            ]),
+            "{got}"
+        );
+        // The clock pair places each transition on the frame's capture time.
+        let policy_ms = got["clock"]["policy_ms"].as_u64().unwrap();
+        let wall_at: chrono::DateTime<chrono::Utc> =
+            serde_json::from_value(got["clock"]["wall_at"].clone()).unwrap();
+        assert!(policy_ms >= 60_000, "{got}");
+        for tr in got["transitions"].as_array().unwrap() {
+            let at_ms = tr["at_ms"].as_u64().unwrap();
+            let placed = wall_at - chrono::Duration::milliseconds((policy_ms - at_ms) as i64);
+            let captured = w0 + chrono::Duration::milliseconds(at_ms as i64);
+            assert!(
+                (placed - captured).num_milliseconds().abs() < 1_000,
+                "{at_ms} placed at {placed}, captured at {captured}"
+            );
+        }
+
+        // Legacy opening and closing every frame overruns the ring.
+        for k in 0..300u64 {
+            frame(33_000 + k * 10, 0, (k % 2 == 0).then_some(1));
+        }
+        let got = trace(&app, id).await;
+        assert_eq!(got["trace_incomplete"], json!(true), "{got}");
+        assert_eq!(
+            got["dropped_transitions"],
+            json!(13 + 300 - TRANSITION_RING)
+        );
+        assert_eq!(
+            got["transitions"].as_array().map(Vec::len),
+            Some(TRANSITION_RING)
+        );
+        // The 13 shadow transitions and the first 44 toggles were dropped.
+        assert_eq!(got["transitions"][0]["at_ms"], json!(33_000 + 44 * 10));
+    }
+
     /// SPEC-088 — `zones_runtime` on the camera-stats read, in the shape the
     /// cloud console is built against: all eight keys with explicit `null`s,
     /// the desired revision and enabled flag read from the store now, and the
