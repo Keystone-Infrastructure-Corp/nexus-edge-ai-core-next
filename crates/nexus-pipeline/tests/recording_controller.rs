@@ -2241,6 +2241,63 @@ mod controller {
         assert!(c.rec.calls().iter().any(|call| call == "closed 2 media=5"));
     }
 
+    /// PR #406 review: the quiet frame that ends an observed clip still
+    /// carries its tracks' lifecycle rows. They land on that clip before
+    /// it closes, as legacy's do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_frame_that_closes_an_observed_clip_keeps_its_motion_rows() {
+        let mut c = cam(observed(0), 5_000, false, false).await;
+        c.healthy().await;
+        c.until(3, "closed 1 ").await;
+        let opened = Instant::now();
+        assert_eq!(clip_id(&c.now(AnalysisOutcome::Success, 1).await), Some(2));
+        // Past the three seconds under which the stub discards a clip and its rows.
+        while opened.elapsed() < Duration::from_millis(3_200) {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(clip_id(&c.now(AnalysisOutcome::Success, 1).await), Some(2));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let ms = c.elapsed_ms();
+        let died = nexus_tracker::MotionDecision {
+            camera_id: 1,
+            track_id: 7,
+            kind: nexus_tracker::MotionKind::Died,
+            captured_at: c.clock(ms).1,
+            bbox: BBox {
+                x1: 0.1,
+                y1: 0.1,
+                x2: 0.2,
+                y2: 0.2,
+            },
+            label: "person".into(),
+            confidence: 0.9,
+            attributes: Default::default(),
+        };
+        let motion = Motion {
+            decisions: vec![died],
+            ..quiet()
+        };
+        let receipt = c
+            .frame_within(ms, AnalysisOutcome::Success, 0, motion, LONG)
+            .await
+            .unwrap();
+        assert!(receipt.clip.is_none(), "closed: {:#?}", c.rec.calls());
+        let day = chrono::Duration::days(1);
+        let rows: Vec<_> = c
+            .store
+            .list_motion_events_for_camera(1, c.w0 - day, c.w0 + day, 100)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.clip_id, m.track_id, format!("{:?}", m.kind)))
+            .collect();
+        assert_eq!(
+            rows,
+            [(2, 7, "Died".to_owned())],
+            "the closing frame's Died row is on the clip it closed"
+        );
+    }
+
     /// Observed with `post_roll_secs`, `preroll_ms` of retained media and a
     /// 10 s stale deadline, healthy and past the startup's clip.
     async fn observed_and_quiet(post_roll_secs: u32, preroll_ms: u64) -> Cam {

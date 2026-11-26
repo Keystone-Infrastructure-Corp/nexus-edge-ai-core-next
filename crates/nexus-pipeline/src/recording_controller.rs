@@ -227,7 +227,7 @@ pub struct Motion {
     /// Alert events this frame recorded; an [`RecordingCommand::Alert`]
     /// naming them follows this evidence.
     pub alerts: usize,
-    /// The frame's `motion_events` rows, stamped with the clip it leaves open.
+    /// The frame's `motion_events` rows, stamped with its clip, one it ends included.
     pub decisions: Vec<MotionDecision>,
 }
 
@@ -719,6 +719,7 @@ impl Controller {
             (close_now, error) = self.legacy(e.captured_mono, e.captured_at, motion).await;
         }
         let alerts = e.motion.as_ref().map_or(0, |m| m.alerts);
+        let mut ending = None;
         // Arrival alone starts the policy: degraded coverage counts from healthy ingest.
         if let Some(shadow) = self.shadow.as_mut() {
             let alert = !self.observed && self.cfg.record_motion_clip_on_alert && alerts > 0;
@@ -730,13 +731,19 @@ impl Controller {
                 &e.summary,
                 alert,
             );
-            if self.observed {
-                // Decided now, so acted on now: the writer's clock never runs back.
+            // Decided now, so acted on now: the writer's clock never runs back.
+            // An open comes before the frame's rows; an end after them, as legacy's.
+            if self.observed && intent.open {
                 error = self.drive(intent, now, wall).await;
+            } else if self.observed {
+                ending = Some(intent);
             }
         }
         if let Some(motion) = &e.motion {
             self.stamp(&motion.decisions).await;
+        }
+        if let Some(intent) = ending {
+            error = self.drive(intent, now, wall).await;
         }
         // Legacy closes once the frame's rows are in, and after its alerts link.
         if close_now {
@@ -1235,8 +1242,9 @@ impl Controller {
         }
     }
 
-    /// Stamp the frame's motion rows with the clip it leaves open. With
-    /// none (a refused open) the rows are dropped: `clip_id` is required.
+    /// Stamp the frame's motion rows with its clip: one it opened, or one it
+    /// is about to close. With none (a refused open) the rows are dropped:
+    /// `clip_id` is required.
     async fn stamp(&self, decisions: &[MotionDecision]) {
         let Some(handle) = self.clip else {
             return;
