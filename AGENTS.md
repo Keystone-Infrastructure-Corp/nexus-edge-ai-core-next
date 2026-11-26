@@ -101,7 +101,7 @@ These bind even when no skill loads:
   Verify each finding, push back with reasons, clarify unclear items first; no
   performative agreement.
 
-Context budget: search before opening files, read definitions before consumers, skip
+Context budget: search before opening files, read definers before consumers, skip
 re-reads and large generated files.
 
 ## Commands
@@ -111,7 +111,7 @@ The local admin console is [ui/](ui/): npm and `package-lock.json`, never pnpm (
 
 - Rust: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D
   warnings`, `cargo test --workspace`, `cargo xtask check-models`,
-  `check-span-cardinality`, and `cargo test -p nexus-types --features ts`, after which
+  `cargo xtask check-span-cardinality`, and `cargo test -p nexus-types --features ts`, after which
   `ui/src/api/types/` must show no diff.
 - UI, from `ui/`: `npm ci`, `npm test` (Vitest), `npm run` `dev`, `lint`, `typecheck`,
   `build`, `e2e` (Playwright; `e2e:install` once).
