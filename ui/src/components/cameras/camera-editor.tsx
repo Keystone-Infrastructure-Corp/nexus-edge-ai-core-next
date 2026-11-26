@@ -429,17 +429,7 @@ export function CameraEditor({
     mutationKey: saveKey(camera.id),
     mutationFn: (cfg: CameraConfig) => upsertCamera(cfg),
     onMutate: () => markZoneSave(camera.id),
-    onSuccess: (_saved, cfg) => {
-      // The PUT answer carries no revision and is not applied: the
-      // post-save snapshot and a fresh receipt decide. Typing since the save
-      // began stays, because the draft is never replaced by the answer.
-      setZoneView((v) => ({
-        ...v,
-        savedAt: Date.now(),
-        awaiting: true,
-        synced: cfg.zones,
-        base: null,
-      }));
+    onSuccess: () => {
       if (!isNew) toast.success("Camera saved");
       onSaved(isNew);
     },
@@ -451,6 +441,7 @@ export function CameraEditor({
     },
   });
   const saving = useIsMutating({ mutationKey: saveKey(camera.id) }) > 0;
+  const resetSave = mutation.reset;
 
   const snapQ = useQuery({
     queryKey: snapshotKey(camera.id),
@@ -572,6 +563,9 @@ export function CameraEditor({
     const changed = authority !== was.authority;
     if (!changed && (!denied || was.denied)) return;
     markZoneSave(camera.id);
+    // A save begun before stays on the engine but no longer sets what this
+    // editor sent or synced: its zones would read as an edit or a verdict.
+    resetSave();
     onvifEndpointTouched.current = Boolean(camera.onvif?.endpoint);
     setDraft(camera);
     setError(null);
@@ -580,7 +574,7 @@ export function CameraEditor({
       restartQuery(qc, snapshotKey(camera.id));
       restartQuery(qc, statsKey(camera.id));
     }
-  }, [qc, camera, authority, denied]);
+  }, [qc, camera, authority, denied, resetSave]);
 
   const set = <K extends keyof CameraConfig>(
     k: K,
@@ -615,7 +609,20 @@ export function CameraEditor({
       setError("URL is required.");
       return;
     }
-    mutation.mutate(draft);
+    mutation.mutate(draft, {
+      // Not called once `resetSave` fenced the save. The PUT answer carries
+      // no revision and is not applied: the post-save snapshot and a fresh
+      // receipt decide. Typing since the save began stays, because the
+      // draft is never replaced by the answer.
+      onSuccess: (_saved, cfg) =>
+        setZoneView((v) => ({
+          ...v,
+          savedAt: Date.now(),
+          awaiting: true,
+          synced: cfg.zones,
+          base: null,
+        })),
+    });
   };
 
   return (

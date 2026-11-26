@@ -96,6 +96,7 @@ export type ReceiptRead = {
   data: Tagged<StatsBody> | undefined;
   status: "pending" | "error" | "success";
   dataUpdatedAt: number;
+  error: unknown;
 };
 
 /** The snapshot installed in this editor (null before one is) and the snapshot read's error. */
@@ -168,8 +169,10 @@ export function deriveZoneApplication(
   epoch: AcceptanceEpoch,
 ): ZoneApplication {
   const receipt = deriveReceipt(saved, read, draft.phase === "saved", epoch);
-  // A denied saved-zone read shows as such, never as an edit to save.
-  if (draft.phase === "dirty" && !isDenied(saved.error)) {
+  // A denied read, of the saved zones or of the status, shows as such: never
+  // as an edit to save or a save in flight, which the denial dropped.
+  if (isDenied(saved.error) || isDenied(read.error)) return receipt;
+  if (draft.phase === "dirty") {
     const elsewhere =
       receipt.kind === "changed_elsewhere" ||
       (draft.base !== null &&

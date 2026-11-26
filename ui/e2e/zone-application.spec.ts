@@ -474,6 +474,99 @@ test.describe("zone application", () => {
     await expect(page.getByText("Unsaved changes")).toHaveCount(0);
   });
 
+  /** Park the camera's next PUT until released, then send it to the engine. */
+  async function holdSave(page: Page, id: number) {
+    let seen = () => {};
+    let release = () => {};
+    const parked = new Promise<void>((resolve) => (seen = resolve));
+    const opened = new Promise<void>((resolve) => (release = resolve));
+    await page.route(`**/api/v1/cameras/${id}`, async (route) => {
+      if (route.request().method() !== "PUT") return route.fallback();
+      seen();
+      await opened;
+      await route.continue();
+    });
+    return { parked, release };
+  }
+
+  /** After the denial, for `ms`: it stays shown, and no edit, save or verdict replaces it. */
+  async function denialHolds(page: Page, denial: string, ms: number) {
+    const status = page.getByTestId("zone-application");
+    for (const until = Date.now() + ms; Date.now() < until; await page.waitForTimeout(200)) {
+      await expect(status).toContainText(denial, { timeout: 100 });
+      for (const masked of ["Unsaved changes", "Saving to camera…", "Applied to camera"]) {
+        expect(await page.getByText(masked).count()).toBe(0);
+      }
+    }
+  }
+
+  test("a denied stats read during a save shows the denial, and the late success changes nothing", async ({
+    page,
+  }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+    await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
+    const save = await holdSave(page, id);
+    await page.getByRole("button", { name: /^save$/i }).click();
+    await save.parked;
+    await expect(status).toContainText("Saving to camera…");
+
+    // The access goes while the save is in flight: the next stats read is refused.
+    await page.route(`**/api/v1/cameras/${id}/stats`, (route) =>
+      route.fulfill({ status: 403, json: { error: "e2e: forbidden" } }),
+    );
+    const denial = "Cannot confirm: status read failed";
+    await expect(status).toContainText(denial, POLL);
+    await denialHolds(page, denial, 1_000);
+
+    const saved = page.waitForResponse(
+      (r) => r.request().method() === "PUT" && new URL(r.url()).pathname === `/api/v1/cameras/${id}`,
+    );
+    save.release();
+    expect((await saved).ok()).toBe(true);
+    await denialHolds(page, denial, 4_000);
+  });
+
+  test("a denied saved-zone read during a save shows the denial, and the late success changes nothing", async ({
+    page,
+  }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    // The editor's first saved-zone read is still in flight when the save starts.
+    let answer = () => {};
+    const answered = new Promise<void>((resolve) => (answer = resolve));
+    await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, async (route) => {
+      await answered;
+      await route.fulfill({ status: 403, json: { error: "e2e: forbidden" } });
+    });
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
+    const save = await holdSave(page, id);
+    await page.getByRole("button", { name: /^save$/i }).click();
+    await save.parked;
+    await expect(status).toContainText("Saving to camera…");
+
+    answer();
+    const denial = "Cannot verify: no access to the saved zones";
+    await expect(status).toContainText(denial, POLL);
+    await denialHolds(page, denial, 1_000);
+
+    const saved = page.waitForResponse(
+      (r) => r.request().method() === "PUT" && new URL(r.url()).pathname === `/api/v1/cameras/${id}`,
+    );
+    save.release();
+    expect((await saved).ok()).toBe(true);
+    await denialHolds(page, denial, 4_000);
+    await expect(zoneRow(page, "Gate")).toHaveCount(0);
+    await expect(zoneRow(page, "Door")).toBeVisible();
+  });
+
   test("a hidden page reconciles a late mismatch only once visible again", async ({ page }) => {
     cameraId = await createCamera(page, [DOOR]);
     const receipt = await controlReceipt(page, cameraId);

@@ -46,6 +46,7 @@ const read = (zonesRuntime: unknown, seq = 10, cameraId = 7): ReceiptRead => ({
   data: { seq, body: { camera_id: cameraId, zones_runtime: zonesRuntime } },
   status: "success",
   dataUpdatedAt: 1_000,
+  error: null,
 });
 
 const clean: ZoneDraftState = { phase: "clean", base: null };
@@ -72,7 +73,7 @@ describe("deriveZoneApplication", () => {
   });
 
   it("is unread with no read or no installed snapshot", () => {
-    expect(derive({ data: undefined, status: "pending", dataUpdatedAt: 0 }).kind).toBe("unread");
+    expect(derive({ data: undefined, status: "pending", dataUpdatedAt: 0, error: null }).kind).toBe("unread");
     expect(derive(read(receipt()), { snapshot: null, error: null }).kind).toBe("unread");
   });
 
@@ -156,6 +157,18 @@ describe("deriveZoneApplication", () => {
     });
     expect(denied.kind).toBe("disconnected");
     expect(denied.title).toBe("Cannot verify: no access to the saved zones");
+  });
+
+  it("shows a denied read, saved zones or status, over an edit or a save in flight", () => {
+    const forbidden = new ApiError(403, "forbidden");
+    const statsDenied: ReceiptRead = { data: undefined, status: "error", dataUpdatedAt: 0, error: forbidden };
+    for (const phase of ["dirty", "saving", "saved"] as const) {
+      const draft = { phase, base: A };
+      expect(derive(statsDenied, shown(), draft).title).toBe("Cannot confirm: status read failed");
+      expect(derive(read(receipt()), { snapshot: null, error: forbidden }, draft).title).toBe(
+        "Cannot verify: no access to the saved zones",
+      );
+    }
   });
 
   it("never shows Applied while a save is pending or awaiting its snapshot", () => {
