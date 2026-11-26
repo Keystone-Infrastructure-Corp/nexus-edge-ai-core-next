@@ -608,7 +608,8 @@ impl Store {
     }
 
     pub async fn delete_camera(&self, id: CameraId) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        // IMMEDIATE: the SPEC-090 loss count reads before the first write.
+        let mut tx = self.begin_tx().await?;
         self.delete_camera_tx(&mut tx, id).await?;
         tx.commit().await?;
         Ok(())
