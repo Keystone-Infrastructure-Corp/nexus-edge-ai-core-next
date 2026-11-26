@@ -752,6 +752,91 @@ async fn recording_delivery_reconciles_a_loss_when_the_upload_completes_after_ev
     );
 }
 
+/// Codex review 10: the loss is taken back from the minute that counted the
+/// eviction, not the completion's. The eviction is moved three minutes
+/// back (the test clock cannot complete in the future), so the late
+/// completion lands in a later minute; an unrelated loss in the eviction
+/// minute stays, and a duplicate completion changes nothing.
+#[tokio::test]
+async fn recording_delivery_reconciles_a_loss_in_the_eviction_minute_not_the_completion_minute() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let started = Utc::now() - Duration::minutes(10);
+    let late = alert_clip(&store, 1, started).await;
+    let other = alert_clip(&store, 1, started).await;
+    for (id, size) in [(late, 1_000), (other, 2_500)] {
+        store
+            .mark_alert_clip_ready(id, 5_000, size, Some(&"b".repeat(64)))
+            .await
+            .unwrap();
+        store.mark_alert_clip_evicted(id).await.unwrap();
+    }
+    let evicted: Vec<(i64, String)> = sqlx::query_as("SELECT id, acct_evicted_at FROM alert_clips")
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+    for (id, when) in evicted {
+        let back = DateTime::parse_from_rfc3339(&when).unwrap() - Duration::minutes(3);
+        sqlx::query("UPDATE alert_clips SET acct_evicted_at = ? WHERE id = ?")
+            .bind(back.to_rfc3339_opts(SecondsFormat::Millis, true))
+            .bind(id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+    }
+    let counted: i64 = sqlx::query_scalar(
+        "SELECT minute_utc FROM recording_minute_buckets WHERE evicted_before_upload_count > 0",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let evicted_minute = counted - 180;
+    sqlx::query("UPDATE recording_minute_buckets SET minute_utc = minute_utc - 180")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    // The moved eviction must still be inside the accounted history.
+    sqlx::query("UPDATE recording_delivery_baseline SET accounting_since = ?")
+        .bind((Utc::now() - Duration::hours(1)).to_rfc3339_opts(SecondsFormat::Millis, true))
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let done = AlertClipColdMark {
+        cold_handle: "cold".into(),
+        cold_path: "a.mp4".into(),
+        cold_uploaded_at: Utc::now(),
+    };
+    let completion_minute = done.cold_uploaded_at.timestamp().div_euclid(60) * 60;
+    assert!(completion_minute >= evicted_minute + 120, "a later minute");
+    let buckets = || async {
+        sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            "SELECT minute_utc, evicted_before_upload_bytes, evicted_before_upload_count,
+                    delivered_bytes
+               FROM recording_minute_buckets WHERE source_kind = 'alert' ORDER BY minute_utc",
+        )
+        .fetch_all(store.pool())
+        .await
+        .unwrap()
+    };
+    assert_eq!(buckets().await, [(evicted_minute, 3_500, 2, 0)]);
+
+    for _ in 0..2 {
+        store
+            .mark_alert_clip_cold_uploaded(late, &done, Some(1_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            buckets().await,
+            [
+                (evicted_minute, 2_500, 1, 0),
+                (completion_minute, 0, 0, 1_000)
+            ],
+            "only the completed clip's loss left the eviction minute"
+        );
+    }
+}
+
 /// A loss whose bucket was pruned, or that was counted before an
 /// accounting restart, is not taken back: no bucket is re-created or
 /// driven negative, and the restarted one keeps its loss.
