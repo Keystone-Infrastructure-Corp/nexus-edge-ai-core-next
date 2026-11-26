@@ -586,6 +586,7 @@ async fn tick(
                         error = %se,
                         "cold replicator: record_cold_upload_failure failed"
                     );
+                    store.record_accounting_gap(Utc::now()).await;
                 }
                 if quarantine {
                     quarantined += 1;
@@ -624,7 +625,8 @@ pub(crate) fn upload_floor(enrollment: Option<&CloudEnrollment>) -> Option<chron
 
 /// SPEC-090 — count a transfer as it starts, so attempted bytes include
 /// retries and transfers that never finish. Accounting never blocks an
-/// upload: a failed write is only logged.
+/// upload: a failed write is logged and recorded as an accounting gap, so
+/// no window overlapping it reads complete.
 async fn record_attempt(store: &Store, source: RecordingSource, id: i64, bytes: usize) {
     let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
     if let Err(e) = store
@@ -632,6 +634,7 @@ async fn record_attempt(store: &Store, source: RecordingSource, id: i64, bytes: 
         .await
     {
         warn!(id, ?source, error = %e, "cold replicator: record_upload_attempt failed");
+        store.record_accounting_gap(Utc::now()).await;
     }
 }
 
@@ -851,6 +854,7 @@ async fn drain_alert_clips(
                         error = %se,
                         "cold replicator: record_alert_clip_cold_failure failed"
                     );
+                    store.record_accounting_gap(Utc::now()).await;
                 }
                 warn!(
                     alert_clip_id = clip.id,
@@ -2662,6 +2666,88 @@ mod tests {
         assert_eq!(c.ordinary.failure_count, 1);
         assert_eq!(c.ordinary.delivered_bytes, 10, "delivered once");
         assert_eq!(c.alert, nexus_store::DeliveryCounters::default());
+    }
+
+    /// SPEC-090 — a transient write failure on the attempt counter, then a
+    /// successful delivery: every window overlapping the failure reads
+    /// incomplete, never complete with attempted 0 / delivered 10.
+    #[tokio::test]
+    async fn recording_delivery_failed_attempt_write_marks_windows_incomplete() {
+        let (store, _clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        // Accounting began long ago, so only a gap can make a window incomplete.
+        sqlx::query("UPDATE recording_delivery_baseline SET accounting_since = ?")
+            .bind((Utc::now() - ChronoDuration::days(1)).to_rfc3339())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_attempt BEFORE INSERT ON recording_minute_buckets
+             WHEN NEW.attempted_bytes > 0
+             BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        run_tick(&store, &clips_dir, &backend).await;
+        assert_eq!(backend.put_count(), 1, "the upload went ahead");
+
+        let snap = store
+            .recording_delivery_stats(|| Utc::now() + ChronoDuration::minutes(2), None)
+            .await
+            .unwrap();
+        let c = snap.windows[0].core.ordinary;
+        assert_eq!((c.attempted_bytes, c.delivered_bytes), (0, 10));
+        for w in &snap.windows {
+            assert!(
+                !w.complete,
+                "the {} s window overlaps the gap",
+                w.window_seconds
+            );
+        }
+    }
+
+    /// Acknowledgement retries of one upload leave the counters unchanged.
+    #[tokio::test]
+    async fn recording_delivery_counters_hold_across_ack_retries() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        *backend.with_url.lock() = true;
+        let outbox = Arc::new(TunnelOutbox::new());
+        let tunnel = Arc::new(CapturingTunnel::default());
+        outbox.set_handle(Some(tunnel.clone()));
+        enroll(&store, CORE_A, Utc::now() - ChronoDuration::hours(1), None).await;
+        let cfg = announce_cfg(clips_dir, outbox);
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+        upload_one(
+            &cfg,
+            &store,
+            &*backend,
+            &TokenBucket::new(0),
+            "mock",
+            &clip,
+            None,
+        )
+        .await
+        .unwrap();
+        let once = hour_counters(&store).await;
+        assert_eq!(once.ordinary.delivered_bytes, 10);
+        for h in 1..=3 {
+            reannounce(&cfg, &store, Utc::now() + ChronoDuration::hours(h)).await;
+        }
+        assert_eq!(
+            tunnel.sent.lock().len(),
+            4,
+            "announced then re-sent unacked"
+        );
+        assert_eq!(hour_counters(&store).await, once);
+        let id = tunnel.sent.lock()[0].meta.id.clone();
+        store
+            .record_clip_announce_ack(&id, Utc::now(), None)
+            .await
+            .unwrap();
+        assert_eq!(hour_counters(&store).await, once);
     }
 
     /// A missing hot file is a failed attempt with no transfer: a failure,

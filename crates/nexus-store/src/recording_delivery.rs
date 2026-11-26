@@ -523,6 +523,24 @@ impl Store {
         Ok(horizon)
     }
 
+    /// SPEC-090 — an accounting write failed at `at`: the counters now
+    /// understate what happened, so treat it as a discontinuity. The gap is
+    /// kept pending (as a detected clock jump is) and applied now if the
+    /// store allows; every later check re-applies it until it commits.
+    // shortcut: the pending gap lives in memory, so a process restart before
+    // it commits forgets it; persist it if accounting writes fail that long.
+    pub async fn record_accounting_gap(&self, at: DateTime<Utc>) {
+        self.delivery.pending_restart(Some(at));
+        let applied = async {
+            let mut conn = self.pool.acquire().await?;
+            self.check_clock(&mut conn).await
+        }
+        .await;
+        if let Err(e) = applied {
+            tracing::warn!(error = %e, "recording delivery: accounting gap stays pending");
+        }
+    }
+
     /// `source`'s uploader runs in this process: report its transfers
     /// (`in_flight`) from now on instead of null.
     pub fn track_transfers(&self, source: RecordingSource) {
@@ -1060,5 +1078,89 @@ mod tests {
                 .unwrap();
         let since = crate::motion::parse_ts(&since).unwrap();
         assert_eq!(since.timestamp_millis(), jumped.timestamp_millis());
+    }
+
+    /// A transient write failure on an attempt counter, then a delivery:
+    /// the windows overlapping the failure read incomplete (never complete
+    /// with attempted 0 / delivered 1000), and a gap whose own write also
+    /// fails stays pending until the store recovers.
+    #[tokio::test]
+    async fn recording_delivery_failed_accounting_write_marks_windows_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let store = store_since(dir.path(), t0 - Duration::hours(2)).await;
+        set_wall(&store, t0);
+        let clip = closed(&store, t0 - Duration::minutes(30), 1_000).await;
+        for t in ["recording_minute_buckets", "recording_delivery_baseline"] {
+            sqlx::query(&format!(
+                "CREATE TRIGGER fail_{t} BEFORE {} ON {t}
+                 BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+                if t == "recording_minute_buckets" {
+                    "INSERT"
+                } else {
+                    "UPDATE"
+                }
+            ))
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        }
+        store
+            .record_upload_attempt(RecordingSource::Ordinary, clip, t0, 1_000)
+            .await
+            .unwrap_err();
+        let failed_at = t0 + Duration::seconds(5);
+        store.record_accounting_gap(failed_at).await;
+        // The baseline is still unmoved: the gap is only pending.
+        sqlx::query("DROP TRIGGER fail_recording_minute_buckets")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        set_wall(&store, failed_at);
+        store
+            .mark_cold_uploaded(
+                clip,
+                &crate::ClipColdMark {
+                    cold_handle: "local".into(),
+                    cold_path: "p".into(),
+                    cold_uploaded_at: failed_at,
+                },
+                Some(1_000),
+            )
+            .await
+            .unwrap_err();
+        sqlx::query("DROP TRIGGER fail_recording_delivery_baseline")
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        store
+            .mark_cold_uploaded(
+                clip,
+                &crate::ClipColdMark {
+                    cold_handle: "local".into(),
+                    cold_path: "p".into(),
+                    cold_uploaded_at: failed_at,
+                },
+                Some(1_000),
+            )
+            .await
+            .unwrap();
+        let snap = store
+            .recording_delivery_stats(|| failed_at + Duration::minutes(2), None)
+            .await
+            .unwrap();
+        assert_eq!(snap.windows[0].core.ordinary.delivered_bytes, 1_000);
+        assert_eq!(snap.windows[0].core.ordinary.attempted_bytes, 0);
+        for w in &snap.windows {
+            assert!(
+                !w.complete,
+                "the {} s window overlaps the gap",
+                w.window_seconds
+            );
+        }
+        assert_eq!(
+            snap.accounting_since.timestamp_millis(),
+            failed_at.timestamp_millis()
+        );
     }
 }
