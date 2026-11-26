@@ -192,8 +192,12 @@ async function setVisibility(page: Page, state: "hidden" | "visible") {
 }
 
 // A receipt change shows on the next poll: every 2 s just after a save,
-// otherwise at the editor's 5 s stats refresh.
+// every 10 s while unresolved. Applied and Inactive read once a minute:
+// `steadyRead` jumps the page's clock to that read.
 const POLL = { timeout: 15_000 };
+
+/** Jump the page's clock a minute ahead, to the editor's next steady stats read. */
+const steadyRead = (page: Page) => page.clock.fastForward(60_000);
 
 /** Click the zone canvas at normalised (`x`, `y`). */
 async function clickCanvas(page: Page, x: number, y: number, clicks: 1 | 2 = 1) {
@@ -215,6 +219,8 @@ test.describe("zone application", () => {
   let cameraId: number | null = null;
 
   test.beforeEach(async ({ page }) => {
+    // Time flows as usual; a test jumps it ahead to reach a steady read.
+    await page.clock.install();
     await loginAsAdmin(page);
     await page.goto("/cameras");
   });
@@ -222,6 +228,30 @@ test.describe("zone application", () => {
   test.afterEach(async ({ page }) => {
     if (cameraId !== null) await engine(page, "DELETE", `/cameras/${cameraId}`);
     cameraId = null;
+  });
+
+  test("an applied camera reads its stats once a minute, not at a decode refresh", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const receipt = await controlReceipt(page, cameraId);
+    receipt.set(applied(1));
+    const statsUrl = `/api/v1/cameras/${cameraId}/stats`;
+    let reads = 0;
+    page.on("request", (r) => {
+      if (new URL(r.url()).pathname === statsUrl) reads += 1;
+    });
+    await page.goto(`/cameras/${cameraId}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    // A minute in 5 s steps, each long enough for a read it starts to land.
+    const from = reads;
+    for (let step = 0; step < 12; step++) {
+      await page.clock.fastForward(5_000);
+      await page.waitForTimeout(250);
+    }
+    expect(reads - from).toBeGreaterThanOrEqual(1);
+    expect(reads - from).toBeLessThanOrEqual(2);
+    await expect(status).toContainText("Applied to camera");
   });
 
   test("a disabled camera's saved zones apply when enabled, without fast polling", async ({ page }) => {
@@ -306,12 +336,14 @@ test.describe("zone application", () => {
     // Equal digests from an older generation are not success; a fresh
     // generation's acknowledgement is.
     receipt.set(applying(3, 2, (r) => r.desired_revision));
+    await steadyRead(page);
     await expect(status).toContainText("Saved; applying to camera", POLL);
     receipt.set(applied(4));
     await expect(status).toContainText("Applied to camera", POLL);
 
     // A generation older than one already read cannot recover the verdict.
     receipt.set(applied(1));
+    await steadyRead(page);
     await expect(status).toContainText("Saved; applying to camera", POLL);
   });
 
@@ -362,6 +394,7 @@ test.describe("zone application", () => {
 
     await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
     const held = receipt.holdNext();
+    await steadyRead(page);
     await held.parked;
     // Every later read reports the saved zones still applying...
     receipt.set(applying(2, 1, () => `sha256:${"0".repeat(64)}`));
@@ -385,6 +418,7 @@ test.describe("zone application", () => {
 
     receipt.set(applied(2));
     await saveZonesElsewhere(page, cameraId, [DOCK]);
+    await steadyRead(page);
     await expect(zoneRow(page, "Loading dock")).toBeVisible(POLL);
     await expect(status).toContainText("Applied to camera", POLL);
     // The verdict sits beside the zones it certifies.
@@ -421,6 +455,7 @@ test.describe("zone application", () => {
     await expect(status).toContainText("Unsaved changes");
     receipt.set(applied(2));
     await saveZonesElsewhere(page, cameraId, [DOCK]);
+    await steadyRead(page);
     await expect(status).toContainText("Unsaved changes; zones changed elsewhere", POLL);
     await expect(zoneRow(page, "Mine")).toBeVisible();
     await expect(zoneRow(page, "Loading dock")).toHaveCount(0);
@@ -455,6 +490,7 @@ test.describe("zone application", () => {
       expire = false;
       return route.fulfill({ status: 401, json: { error: "e2e: token expired" } });
     });
+    await steadyRead(page);
 
     await expect(status).toContainText("Cannot verify: no access to the saved zones", POLL);
     expect(demoted).toBe(true);
@@ -480,6 +516,7 @@ test.describe("zone application", () => {
     );
     receipt.set(applied(2));
     await saveZonesElsewhere(page, cameraId, [DOCK]);
+    await steadyRead(page);
 
     await expect(status).toContainText("Cannot verify: no access to the saved zones", POLL);
     await expect(zoneRow(page, "Mine")).toHaveCount(0);
@@ -593,6 +630,7 @@ test.describe("zone application", () => {
     // A stats read in flight when the page is hidden lands after another
     // operator's save and reports the mismatch.
     const held = receipt.holdNext();
+    await steadyRead(page);
     await held.parked;
     await setVisibility(page, "hidden");
     receipt.set(applied(2));
@@ -616,6 +654,7 @@ test.describe("zone application", () => {
     await expect(status).toContainText("Applied to camera");
 
     receipt.set(() => "error");
+    await steadyRead(page);
     await expect(status).toContainText("Cannot confirm: status read failed", POLL);
     await expect(page.getByText("Applied to camera")).toHaveCount(0);
 
@@ -639,6 +678,7 @@ test.describe("zone application", () => {
     await expect(status).toContainText("Applied to camera", POLL);
 
     receipt.set(() => "missing");
+    await steadyRead(page);
     await expect(status).toContainText("Saved; running application cannot be verified", POLL);
     await expect(page.getByText("Applied to camera")).toHaveCount(0);
   });
@@ -665,6 +705,7 @@ test.describe("zone application", () => {
         failed = true;
         await route.fulfill({ status: code, json: { error: `e2e: ${code}` } });
       });
+      await steadyRead(page);
       await failedRead;
       await expect(page.getByText("Applied to camera")).toHaveCount(0, { timeout: 500 });
       await expect(status).toContainText("Cannot confirm: status read failed");
@@ -700,10 +741,12 @@ test.describe("zone application", () => {
       expire = false;
       return route.fulfill({ status: 401, json: { error: "e2e: token expired" } });
     });
+    await steadyRead(page);
     await expect.poll(() => refreshes, POLL).toBe(1);
     await expect(page.getByRole("button", { name: /^Finish/ })).toHaveCount(0);
     role = null;
     expire = true;
+    await steadyRead(page);
     await expect.poll(() => refreshes, POLL).toBe(2);
 
     // Nothing of the sketch is left to finish or commit.
@@ -726,7 +769,8 @@ test.describe("zone application", () => {
     await clickCanvas(page, 0.6, 0.6);
     await expect(status).toContainText("Unsaved changes");
     // Across the editor's next scheduled stats read.
-    await neverApplied(page, 6_000);
+    await steadyRead(page);
+    await neverApplied(page, 3_000);
 
     const finish = page.getByRole("button", { name: /^Finish/ });
     await finish.locator("..").getByRole("button", { name: "Cancel" }).click();

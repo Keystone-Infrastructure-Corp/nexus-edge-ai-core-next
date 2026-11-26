@@ -178,8 +178,6 @@ function round2(n: number): string {
 // SPEC-088 zone application status.
 // ---------------------------------------------------------------------------
 
-/** The decode section's refresh of the stats read zone application shares. */
-const DECODE_REFRESH_MS = 5_000;
 const statsKey = (id: number) => ["cameras", "stats", id] as const;
 const snapshotKey = (id: number) => ["cameras", "config-snapshot", id] as const;
 const saveKey = (id: number) => ["cameras", "save", id] as const;
@@ -499,16 +497,11 @@ export function CameraEditor({
       const seq = nextAcceptanceSeq();
       return { seq, body: await getCameraStats(camera.id) };
     },
-    // One read for decode health (every 5 s) and zone application, which
-    // only ever reads sooner: every 2 s just after a save. Paused while the
-    // page is hidden, re-read at once when it is visible again.
-    refetchInterval: (q) => {
-      // A denied stats or saved-zone read stops every read, the decode
-      // refresh included; unsupported stops only the zone polling.
-      if ([q.state.error, snapQ.error].some(isDenied)) return false;
-      const zone = zonePollMs(q.state);
-      return zone === false ? DECODE_REFRESH_MS : Math.min(zone, DECODE_REFRESH_MS);
-    },
+    // One read for decode health and zone application, at the receipt's
+    // cadence: once a minute when Applied or Inactive, none when denied or
+    // unsupported. Paused while the page is hidden, re-read at once when it
+    // is visible again.
+    refetchInterval: (q) => zonePollMs(q.state),
     // A failed read shows at once: an internal retry would keep the last
     // answer (an Applied, say) on screen meanwhile. The cadence reads again.
     retry: false,

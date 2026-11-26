@@ -211,11 +211,16 @@ describe("zoneApplicationPollMs", () => {
   it("keeps one 60 s read for applied and inactive, including behind an edit", () => {
     expect(zoneApplicationPollMs(at(read(receipt())), [], 1_000, 2_000)).toBe(60_000);
     expect(zoneApplicationPollMs(at(read(receipt()), { phase: "dirty", base: A }), [], null)).toBe(60_000);
+    const inactive = read(receipt({ state: "inactive", applied_revision: null, applied_at: null }));
+    expect(zoneApplicationPollMs(at(inactive), [], 1_000, 2_000)).toBe(60_000);
   });
 
   it("stops for an unsupported camera or a denied read", () => {
     expect(zoneApplicationPollMs(at(read(undefined)), [], 1_000, 2_000)).toBe(false);
+    expect(zoneApplicationPollMs(at(read(undefined), { phase: "dirty", base: A }), [], null)).toBe(false);
     expect(zoneApplicationPollMs(at(applying), [new ApiError(403, "no")], 1_000, 2_000)).toBe(false);
+    // A denied saved-zone read stops it even beside an Applied receipt.
+    expect(zoneApplicationPollMs(at(read(receipt())), [null, new ApiError(401, "no")], null)).toBe(false);
   });
 });
 
