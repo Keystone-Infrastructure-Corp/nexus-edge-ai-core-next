@@ -111,15 +111,15 @@ fn closing_pass(p: &mut RecordingActivityPolicy, from: u64) -> u64 {
 fn the_next_change_is_only_the_stale_deadline() {
     let mut p = RecordingActivityPolicy::new(POST_ROLL, STALE, 0);
     assert_eq!(
-        p.next_change_ms(0),
+        p.next_change_ms(),
         None,
         "degraded until evidence recovers it"
     );
     let mut p2 = healthy_quiet_at_30s();
     // The last success was at 30 s: stale after 40 s.
-    assert_eq!(p2.next_change_ms(30_000), Some(40_001));
+    assert_eq!(p2.next_change_ms(), Some(40_001));
     p2.observe(success(31_000, 1));
-    assert_eq!(p2.next_change_ms(31_000), Some(41_001), "no activity timer");
+    assert_eq!(p2.next_change_ms(), Some(41_001), "no activity timer");
     assert_eq!(
         state(&mut p2, 41_000),
         OPEN_ACTIVITY,
@@ -127,7 +127,28 @@ fn the_next_change_is_only_the_stale_deadline() {
     );
     assert_eq!(state(&mut p2, 41_001), OPEN_DEGRADED, "then staleness");
     p.observe(success(0, 0));
-    assert_eq!(p.next_change_ms(0), None);
+    assert_eq!(p.next_change_ms(), None);
+}
+
+/// Codex review 8: a consumer blocked in a recorder call past the stale
+/// deadline still finds it due when it looks again, so it wakes at once
+/// rather than at some unrelated timer. The tick there degrades, after
+/// which there is no timer: one wake, no spin.
+#[test]
+fn an_overdue_stale_deadline_stays_due_until_judged() {
+    let mut p = healthy_quiet_at_30s();
+    // Stale from 40.001 s; the consumer, blocked, next looks at 41.2 s and
+    // wakes for every change due by then.
+    let now = 41_200;
+    let mut wakes = 0;
+    while let Some(due) = p.next_change_ms().filter(|&t| t <= now) {
+        assert_eq!(due, 40_001, "overdue, not dropped");
+        assert!(wakes < 3, "spinning");
+        assert_eq!(state(&mut p, now), OPEN_DEGRADED, "judged when it wakes");
+        wakes += 1;
+    }
+    assert_eq!(wakes, 1, "one wake");
+    assert_eq!(p.next_change_ms(), None, "degraded: only evidence ends it");
 }
 
 const OPEN_ACTIVITY: (bool, RecordingReason) = (true, RecordingReason::Activity);

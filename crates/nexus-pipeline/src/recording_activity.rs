@@ -238,17 +238,17 @@ impl RecordingActivityPolicy {
         }
     }
 
-    /// The first instant after `now_ms` at which [`Self::tick`] can answer
-    /// differently with no new evidence: analysis going stale. Activity
-    /// ends only with evidence, so it has no timer. `None` while degraded,
-    /// which only evidence ends.
-    pub fn next_change_ms(&self, now_ms: u64) -> Option<u64> {
+    /// The instant from which [`Self::tick`] answers differently with no
+    /// new evidence: analysis going stale. Once passed it stays due (a
+    /// consumer blocked past it wakes at once) until a tick judges it:
+    /// that tick degrades, and degraded has no timer, so a consumer that
+    /// ticks when it wakes cannot spin. Activity ends only with evidence,
+    /// so it has no timer. `None` while degraded, which only evidence ends.
+    pub fn next_change_ms(&self) -> Option<u64> {
         if self.degraded {
             return None;
         }
-        self.last_success_ms
-            .map(|s| s + self.stale_after_ms + 1)
-            .filter(|&t| t > now_ms)
+        self.last_success_ms.map(|s| s + self.stale_after_ms + 1)
     }
 
     /// When and why the current degraded coverage began; `None` while healthy.

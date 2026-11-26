@@ -605,7 +605,7 @@ impl Controller {
         // The policy's own deadlines and minute buckets, in shadow as in observed.
         if let Some(shadow) = &self.shadow {
             waits.extend(
-                [shadow.next_change(now), shadow.next_minute()]
+                [shadow.next_change(), shadow.next_minute()]
                     .into_iter()
                     .flatten()
                     .map(until),

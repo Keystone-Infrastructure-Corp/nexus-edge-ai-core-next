@@ -832,10 +832,11 @@ impl ShadowRecording {
         Some(intent)
     }
 
-    /// When [`Self::tick`] can next answer differently without new evidence.
-    pub fn next_change(&self, now: Instant) -> Option<Instant> {
+    /// When [`Self::tick`] next answers differently without new evidence;
+    /// still due, in the past, until a tick judges it.
+    pub fn next_change(&self) -> Option<Instant> {
         let origin = self.shared.lock().origin?;
-        let at = self.policy.as_ref()?.next_change_ms(millis(now, origin))?;
+        let at = self.policy.as_ref()?.next_change_ms()?;
         Some(origin + std::time::Duration::from_millis(at))
     }
 
@@ -1555,13 +1556,15 @@ mod tests {
         /// Run the controller's clock to `until`, waking at each policy
         /// deadline and minute timer before it.
         fn wait(&mut self, until: u64) {
-            while let Some(t) = [self.s.next_change(self.at(self.now)), self.s.next_minute()]
+            while let Some(t) = [self.s.next_change(), self.s.next_minute()]
                 .into_iter()
                 .flatten()
                 .min()
                 .filter(|&t| t < self.at(until))
             {
-                let ms = millis(t, self.t0);
+                // An overdue timer wakes the controller at its now, never back then.
+                let ms = millis(t, self.t0).max(self.now);
+                let t = self.at(ms);
                 self.s.tick(t);
                 self.s.record(t, self.wall(ms), None, false);
                 self.now = ms;

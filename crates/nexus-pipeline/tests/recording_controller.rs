@@ -1585,11 +1585,11 @@ mod controller {
 
     /// Codex review 7: evidence that degrades on success is counted too.
     /// Healthy through 59 s under a 1 s stale deadline; a slow legacy open
-    /// keeps the controller busy past the deadline (60.001 s), so the first
-    /// wake after it, the minute cut, traces degraded coverage at 61 s. A
+    /// keeps the controller busy past the deadline (60.001 s) to 61.2 s, so
+    /// the overdue deadline traces degraded coverage as the open ends. A
     /// success captured at 60.5 s, used at 62 s, starts a new run: analysis
     /// was not sustained from 60 s, so the state it shows at its capture is
-    /// degraded, though held at 61 s where nothing changes. That is a
+    /// degraded, though held at 61.2 s where nothing changes. That is a
     /// reported gap, counted once, as is a failure there. With the stale
     /// wake on time, the same frames leave no gap.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1610,7 +1610,8 @@ mod controller {
                 .frame_within(59_000, AnalysisOutcome::Success, 0, live(true), SHORT)
                 .await;
             assert_eq!(born.is_err(), late, "only the gated open is slow");
-            tokio::time::sleep_until((t59 + Duration::from_millis(1_200)).into()).await;
+            // Past the 60.5 s capture: an open ending sooner judges stale before it.
+            tokio::time::sleep_until((t59 + Duration::from_millis(2_200)).into()).await;
             c.rec.opens.add_permits(FREE);
             let deadline = Instant::now() + LONG;
             let stale = loop {
@@ -1625,7 +1626,7 @@ mod controller {
                 assert!(Instant::now() < deadline, "never stale: {:#?}", trace(&c));
                 tokio::time::sleep(Duration::from_millis(20)).await;
             };
-            let wake = if late { 61_000..61_500 } else { 60_001..60_500 };
+            let wake = if late { 61_100..61_700 } else { 60_001..60_500 };
             assert!(wake.contains(&stale), "{late}: {:#?}", trace(&c));
             let (mono, wall) = c.clock(60_500);
             let arrived = c.producer.arrived(mono, wall);
@@ -1658,6 +1659,94 @@ mod controller {
                 "{outcome:?}: {trace:#?}"
             );
         }
+    }
+
+    /// Codex review 8, observed: a quiet success closes clip 2 and the
+    /// close is held past the 1 s stale deadline while analysis stalls
+    /// (encoded ingest goes on, so 5 s of pre-roll cannot cover a late
+    /// reopen). The overdue deadline wakes the controller as the close
+    /// ends: degraded coverage opens clip 3 then, not at the next recorder
+    /// wake (the 10 s stall check).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_held_past_the_stale_deadline_reopens_as_it_ends() {
+        let mut c = cam(observed(0), 5_000, false, true).await;
+        c.rec.closes.add_permits(1);
+        c.healthy().await;
+        c.until(3, "closed 1 ").await;
+        assert_eq!(clip_id(&c.now(AnalysisOutcome::Success, 1).await), Some(2));
+        let ms = c.elapsed_ms();
+        let closing = c
+            .frame_within(ms, AnalysisOutcome::Success, 0, quiet(), SHORT)
+            .await;
+        assert_eq!(closing.unwrap_err(), RecordingError::Timeout(SHORT));
+        // No evidence from here; the close ends 1.5 s after the quiet pass.
+        sleep_until(&c, ms + 1_500).await;
+        c.rec.closes.add_permits(FREE);
+        let released = tokio::time::Instant::now();
+        c.until(15, "opened 3 ").await;
+        let opened = c.rec.opened.lock()[&3];
+        let late = opened.saturating_duration_since(released);
+        assert!(
+            late < Duration::from_millis(100),
+            "reopened {late:?} after the close: {:#?}",
+            c.rec.calls()
+        );
+        let reason = c.runtime().unwrap().diagnostics.unwrap().reason;
+        assert_eq!(reason, Some(RecordingReason::DegradedCoverage));
+        assert!(c.stop().await.clip.is_none());
+    }
+
+    /// Codex review 8 in shadow: legacy's post-roll close (frame 3.8 s) is
+    /// held past the 1 s stale deadline (4.801 s) and analysis stalls. The
+    /// policy goes stale as the close ends, traced at the controller's now
+    /// then, not at the next unrelated wake (the minute cut at 61 s).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shadow_traces_a_stale_deadline_overdue_behind_a_close_as_it_ends() {
+        use RecordingReason::DegradedCoverage;
+        let mut c = cam(shadow(1_000), 0, false, true).await;
+        for ms in (0..=2_400).step_by(200) {
+            c.frame(ms, quiet()).await;
+        }
+        assert!(c.frame(2_600, live(true)).await.clip.is_some());
+        for ms in (2_800..=3_600).step_by(200) {
+            c.frame(ms, quiet()).await;
+        }
+        // The controller's clock runs on from 3.8 s in real time.
+        let sent = Instant::now();
+        let closing = c
+            .frame_within(3_800, AnalysisOutcome::Success, 0, quiet(), SHORT)
+            .await;
+        assert_eq!(closing.unwrap_err(), RecordingError::Timeout(SHORT));
+        tokio::time::sleep_until((sent + Duration::from_millis(1_500)).into()).await;
+        c.rec.closes.add_permits(FREE);
+        let held = sent.elapsed().as_millis() as u64;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let stale = loop {
+            let at = trace(&c)
+                .transitions
+                .iter()
+                .find(|t| t.at_ms > 3_800 && t.reason == DegradedCoverage)
+                .map(|t| t.at_ms);
+            if let Some(at) = at {
+                break at;
+            }
+            assert!(Instant::now() < deadline, "never stale: {:#?}", trace(&c));
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let trace = trace(&c);
+        assert!(
+            (5_200..=3_800 + held + 100).contains(&stale),
+            "stale at {stale}, close ended about {}: {trace:#?}",
+            3_800 + held
+        );
+        let window: Vec<_> = trace
+            .transitions
+            .iter()
+            .filter(|t| t.at_ms > 3_800)
+            .map(|t| (t.at_ms, t.legacy_open, t.reason))
+            .collect();
+        assert_eq!(window, [(stale, false, DegradedCoverage)], "{trace:#?}");
+        assert!(!trace.trace_incomplete, "{trace:#?}");
     }
 
     /// Observed: an alert drive is the writer's own decision, traced at
