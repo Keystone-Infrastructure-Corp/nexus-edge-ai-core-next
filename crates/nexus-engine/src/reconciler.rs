@@ -1095,8 +1095,10 @@ async fn apply_recording_policy(
             COMMAND_TIMEOUT,
         )
         .await
+        // A receipt can refuse too: `Stopped` once the controller was cancelled.
+        .and_then(|receipt| receipt.error.map_or(Ok(()), Err))
     {
-        Ok(_) => {
+        Ok(()) => {
             info!(
                 camera_id = cam.id,
                 "camera reconciler: recording policy applied without a restart"
@@ -2929,6 +2931,83 @@ mod tests {
             calls,
             [ClipCall::Open(1)],
             "the open clip carried on through both changes"
+        );
+    }
+
+    /// PR #406 review: a controller cancelled while a policy change waits
+    /// answers it with a `Stopped` receipt. That pass must not mark the
+    /// policy applied, so the next pass sends it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_change_racing_a_stop_is_sent_again() {
+        use nexus_config::{RecordingPolicyConfig, RecordingPolicyMode};
+        use nexus_pipeline::recording_controller::{
+            RecordingCommand, RecordingControl, RecordingError, RecordingReceipt, Request,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        reconcile(&args).await.expect("initial pass");
+        // Stands in for the controller: the first change races its stop, the next lands.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Request>(4);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let seen = sent.clone();
+        tokio::spawn(async move {
+            for error in [Some(RecordingError::Stopped), None] {
+                let Some(request) = rx.recv().await else {
+                    return;
+                };
+                if matches!(request.command, RecordingCommand::PolicyChanged(..)) {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                let _ = request.reply.send(RecordingReceipt {
+                    generation: request.generation,
+                    clip: None,
+                    error,
+                });
+            }
+        });
+        {
+            let mut handles = args.handles.lock();
+            let live = handles.get_mut(&7).expect("camera running");
+            live.recording = RecordingControl {
+                tx,
+                generation: live.recording.generation,
+            };
+        }
+        let policy = Some(RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 10_000,
+        });
+        let mut shadow = cam(None);
+        shadow.behavior.recording_policy = policy;
+        shadow.behavior.recording_policy_revision = "rev-shadow".into();
+        args.store
+            .upsert_camera(&shadow)
+            .await
+            .expect("save shadow");
+        let applied = || {
+            let key = entry_of(&args.handles, 7).key;
+            (
+                key.behavior.recording_policy,
+                key.behavior.recording_policy_revision,
+            )
+        };
+
+        reconcile(&args).await.expect("pass the stop refuses");
+        let refused = (applied(), sent.load(Ordering::SeqCst));
+        reconcile(&args).await.expect("pass after the refusal");
+        let retried = (applied(), sent.load(Ordering::SeqCst));
+        abort_all(&args.handles);
+
+        assert_eq!(
+            refused,
+            ((None, String::new()), 1),
+            "a Stopped receipt left the policy marked applied"
+        );
+        assert_eq!(
+            retried,
+            ((policy, "rev-shadow".to_owned()), 2),
+            "the next pass sent the change again and recorded it"
         );
     }
 
