@@ -600,7 +600,10 @@ export function CameraEditor({
     });
   };
 
-  const onSubmit = (e: React.FormEvent) => {
+  // The saved zones are being read again before a save is sent.
+  const [checking, setChecking] = useState(false);
+
+  const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     // ID is server-assigned on create (POST /cameras returns
@@ -610,7 +613,33 @@ export function CameraEditor({
       setError("URL is required.");
       return;
     }
-    mutation.mutate(draft, {
+    // The save replaces the camera's zones whole. Unedited zones go out as
+    // saved now, not as last read here, so an unrelated edit never reverts
+    // another operator's newer zones. Edited zones are sent as edited: the
+    // status says when they were changed elsewhere.
+    let cfg = draft;
+    if (!isNew && draft.zones === zoneView.synced) {
+      setChecking(true);
+      let snap: CameraConfigSnapshot;
+      try {
+        snap = parseConfigSnapshot(await getCameraConfigSnapshot(camera.id));
+      } catch (err) {
+        setError(
+          `Not saved: this camera's saved zones could not be re-read, so saving could undo ` +
+            `another operator's zone changes (${err instanceof Error ? err.message : String(err)}). Try again.`,
+        );
+        return;
+      } finally {
+        setChecking(false);
+      }
+      if (snap.zones_revision !== zoneView.base) {
+        const zones = snap.settings.zones;
+        cfg = { ...draft, zones };
+        setZoneView((v) => ({ ...v, synced: zones, base: snap.zones_revision }));
+        setDraft((d) => (d.zones === draft.zones ? { ...d, zones } : d));
+      }
+    }
+    mutation.mutate(cfg, {
       // Not called once `resetSave` fenced the save. The PUT answer carries
       // no revision and is not applied: the post-save snapshot and a fresh
       // receipt decide. Typing since the save began stays, because the
@@ -637,8 +666,8 @@ export function CameraEditor({
           <Button variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button onClick={onSubmit} disabled={saving}>
-            {saving ? "Saving…" : "Save"}
+          <Button onClick={onSubmit} disabled={saving || checking}>
+            {saving || checking ? "Saving…" : "Save"}
           </Button>
         </>
       }
