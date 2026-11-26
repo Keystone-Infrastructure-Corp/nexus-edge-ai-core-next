@@ -669,12 +669,17 @@ async fn a_parked_car_lost_and_reacquired_is_visible_until_a_fresh_dwell() {
         vec![back],
         "seen again, visible and older than the dwell"
     );
-    let born = |r: &&MotionEventRow| r.kind == MotionEventKind::Born;
+    // Its motion restarts once it is lost, and ends at its fresh dwell. The
+    // parked car's post-roll would close the clip at 15 870 ms; visible
+    // again, it keeps the clip open past the post-roll after that dwell.
+    let lost = first_at(&times, 9_000);
+    let dwelled = first_at(&times, times[back] + 5_000);
+    assert_eq!(o.motion_at(MotionEventKind::Born), vec![0, times[lost]]);
     assert_eq!(
-        o.motion.iter().filter(born).count(),
-        2,
-        "its motion restarted"
+        o.motion_at(MotionEventKind::Died),
+        vec![5_520, times[dwelled]]
     );
+    assert_eq!(o.clips, vec![(0, None)]);
     assert_eq!(o.anchors, vec![(128.0, 144.0)], "reclaimed, not duplicated");
 }
 
