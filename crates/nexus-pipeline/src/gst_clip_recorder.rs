@@ -874,14 +874,11 @@ async fn retry_finalize(
     };
     let mut unfinalized = unfinalized.lock();
     match retried {
-        Ok(()) => {
-            unfinalized.remove(&clip_id);
-            info!(
-                clip_id,
-                camera_id, "gst recorder: finalized a clip on retry"
-            );
-            true
-        }
+        Ok(()) => info!(
+            clip_id,
+            camera_id, "gst recorder: finalized a clip on retry"
+        ),
+        Err(e) if row_gone(&e, clip_id, camera_id) => {}
         Err(e) => {
             warn!(
                 clip_id,
@@ -893,9 +890,27 @@ async fn retry_finalize(
                 u.attempts += 1;
                 u.error = e.to_string();
             }
-            false
+            return false;
         }
     }
+    unfinalized.remove(&clip_id);
+    true
+}
+
+/// Whether `e` says `clip_id`'s row is gone: deleting its camera cascades
+/// its clip rows, so nothing is left to finalize. The step is done, neither
+/// retained nor reported in recording health (SPEC-088).
+fn row_gone(e: &nexus_store::StoreError, clip_id: ClipId, camera_id: CameraId) -> bool {
+    let gone = matches!(e, nexus_store::StoreError::NotFound(_));
+    if gone {
+        warn!(
+            clip_id,
+            camera_id,
+            "gst recorder: clip row is gone, as when its camera was deleted; nothing left \
+             to finalize"
+        );
+    }
+    gone
 }
 
 impl Writers {
@@ -1130,7 +1145,9 @@ impl Writers {
                 }
             }
             if let Err(e) = self.store.discard_clip_metadata(handle.clip_id).await {
-                return Err(self.unfinalized(handle, FinalStep::Discard, e));
+                if !row_gone(&e, handle.clip_id, handle.camera_id) {
+                    return Err(self.unfinalized(handle, FinalStep::Discard, e));
+                }
             }
             failure.complete();
             return Ok(ClipMeta {
@@ -1281,9 +1298,11 @@ impl Writers {
             hot_path: Some(rel),
             sha256,
         };
-        if let Err(e) = self.store.close_clip(handle.clip_id, &close).await {
-            return Err(self.unfinalized(handle, FinalStep::Close(close), e));
-        }
+        let gone = match self.store.close_clip(handle.clip_id, &close).await {
+            Ok(()) => false,
+            Err(e) if row_gone(&e, handle.clip_id, handle.camera_id) => true,
+            Err(e) => return Err(self.unfinalized(handle, FinalStep::Close(close), e)),
+        };
 
         debug!(
             camera_id = state.camera_id,
@@ -1296,8 +1315,9 @@ impl Writers {
         // M2.2: notify the cold replicator. Best-effort — a missing
         // bus, a serialize failure, or zero subscribers MUST NOT
         // fail the close (the row is already on disk and the 5-min
-        // polling backstop will pick it up regardless).
-        if let Some(bus) = &self.bus {
+        // polling backstop will pick it up regardless). A gone row is no
+        // clip to announce.
+        if let Some(bus) = self.bus.as_ref().filter(|_| !gone) {
             let payload = serde_json::json!({
                 "clip_id": handle.clip_id,
                 "camera_id": state.camera_id,
@@ -6523,8 +6543,8 @@ mod epoch_tests {
         assert!(finalized_playable(&store, &clips_dir, clip.clip_id).await);
     }
 
-    /// SPEC-088 Z-4: a clip the drain could not finalize (here its row is
-    /// gone, so it cannot be stamped) is reported, so the engine does not
+    /// SPEC-088 Z-4: a clip the drain could not finalize (here the store
+    /// rejects its row) is reported, so the engine does not
     /// count the camera as drained; its writer is stopped all the same.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn draining_a_camera_reports_a_clip_it_could_not_finalize() {
@@ -6537,8 +6557,8 @@ mod epoch_tests {
         let clips_dir = dir.path().join("clips");
         let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
         let started_at = Utc::now() - chrono::Duration::seconds(30);
-        let (clip, _, writer) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
-        store.discard_clip_metadata(clip.clip_id).await.unwrap();
+        let (_, _, writer) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        fail_clip_writes(&store).await;
 
         let drained = tokio::time::timeout(Duration::from_secs(15), rec.drain_camera(1))
             .await
@@ -6593,11 +6613,12 @@ mod epoch_tests {
         );
     }
 
-    /// SPEC-088 review 9: a clip that stays unfinalizable (its row is gone)
-    /// holds its camera stopping for three drains, the fourth releases it so
-    /// recording resumes, and recording health keeps reporting it after the
-    /// reconciler removed the camera's ingester. The same holds for the
-    /// reconciler's later passes, which poll a drain once and do not wait.
+    /// SPEC-088 review 9: a clip that stays unfinalizable (the store rejects
+    /// its row) holds its camera stopping for three drains, the fourth
+    /// releases it so recording resumes, and recording health keeps reporting
+    /// it after the reconciler removed the camera's ingester. The same holds
+    /// for the reconciler's later passes, which poll a drain once and do not
+    /// wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_persistent_finalization_failure_releases_its_camera_after_three_drains() {
         assert!(
@@ -6610,10 +6631,9 @@ mod epoch_tests {
         let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
         let started_at = Utc::now() - chrono::Duration::seconds(30);
         for camera_id in [1, 2] {
-            let (clip, _, _) =
-                register_clip(&rec, &store, &clips_dir, camera_id, started_at, None).await;
-            store.discard_clip_metadata(clip.clip_id).await.unwrap();
+            register_clip(&rec, &store, &clips_dir, camera_id, started_at, None).await;
         }
+        fail_clip_writes(&store).await;
 
         let mut drained = Vec::new();
         for _ in 0..4 {
@@ -6671,7 +6691,7 @@ mod epoch_tests {
         });
         let started_at = Utc::now() - chrono::Duration::seconds(30);
         let (clip, _, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, Some(pump)).await;
-        store.discard_clip_metadata(clip.clip_id).await.unwrap();
+        fail_clip_writes(&store).await;
         close_then_abort_caller(&rec, clip).await;
 
         let timed_out = tokio::time::timeout(Duration::from_millis(300), rec.drain_camera(1))
@@ -6884,6 +6904,96 @@ mod epoch_tests {
             attempts(&rec, clip),
             Some(3),
             "the schedule retried after shutdown"
+        );
+    }
+
+    /// SPEC-088 review 10: deleting a recording camera cascades its clip rows
+    /// before the reconciler stops it, so its clip's close, the supervisor's
+    /// or the drain's, finds no row to stamp, nor to discard (camera 3's clip
+    /// recorded nothing). Nothing is left to finalize: every stop succeeds,
+    /// no clip is retained and no camera reads unfinalized, however many
+    /// cameras are deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_recording_cameras_leaves_nothing_unfinalized() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+
+        for camera_id in 1..=3 {
+            let (clip, path, _) =
+                register_clip(&rec, &store, &clips_dir, camera_id, started_at, None).await;
+            if camera_id == 3 {
+                fs::remove_file(&path).await.unwrap();
+            }
+            store.delete_camera(camera_id).await.unwrap();
+            let closed = if camera_id == 1 {
+                rec.close(
+                    clip,
+                    ClipFinal {
+                        ended_at: Utc::now(),
+                    },
+                )
+                .await
+                .map(|_| ())
+            } else {
+                Ok(())
+            };
+            let drained = rec.drain_camera(camera_id).await;
+            let degraded = rec.recording_degradations();
+            rec.remove_camera_ingester(camera_id);
+
+            assert!(closed.is_ok(), "camera {camera_id}'s close: {closed:?}");
+            assert!(drained.is_ok(), "camera {camera_id}'s drain: {drained:?}");
+            assert!(
+                !degraded.iter().any(|d| d.reason == UNFINALIZED),
+                "deleting camera {camera_id} left it unfinalized: {degraded:?}"
+            );
+        }
+        assert!(
+            rec.unfinalized.lock().is_empty(),
+            "a deleted camera's clip is retained"
+        );
+    }
+
+    /// SPEC-088 review 10: a clip retained for a store error whose camera is
+    /// deleted next is not kept for good: its next retry finds no row, so
+    /// nothing is left to finalize, and the drain lets the camera go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retained_clip_of_a_deleted_camera_is_let_go() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        fail_clip_writes(&store).await;
+
+        let failed = rec.drain_camera(1).await;
+        restore_clip_writes(&store).await;
+        store.delete_camera(1).await.unwrap();
+        let drained = rec.drain_camera(1).await;
+        rec.remove_camera_ingester(1);
+
+        assert!(failed.is_err(), "precondition: the close failed");
+        assert!(drained.is_ok(), "the deleted camera's drain: {drained:?}");
+        assert!(
+            rec.unfinalized.lock().is_empty(),
+            "a deleted camera's clip is retained"
+        );
+        assert!(
+            rec.recording_degradations().is_empty(),
+            "a deleted camera is still reported: {:?}",
+            rec.recording_degradations()
         );
     }
 
