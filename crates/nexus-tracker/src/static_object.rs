@@ -177,8 +177,9 @@ struct ParkingV2 {
 struct V2Track {
     window: StillnessWindow,
     alert_epoch: u64,
-    /// The `seq` of the last frame that carried this track.
+    /// The `seq` of the last frame that carried this track, and its capture ms.
     seen_seq: u64,
+    seen_ms: u64,
     /// The last observed center and its capture ms.
     last: Option<((f32, f32), u64)>,
     /// The anchor of the track's current parked episode (with persistence
@@ -706,6 +707,7 @@ impl StaticObjectFilter {
                 window: StillnessWindow::new(params),
                 alert_epoch: 0,
                 seen_seq: 0,
+                seen_ms: 0,
                 last: None,
                 parked_at: None,
                 owner: false,
@@ -720,7 +722,7 @@ impl StaticObjectFilter {
                     t.alert_epoch += 1;
                 }
             }
-            t.seen_seq = v2.seq;
+            (t.seen_seq, t.seen_ms) = (v2.seq, at_ms);
             let mut still = false;
             match o.detection_bbox {
                 Some(b) => {
@@ -842,6 +844,12 @@ impl StaticObjectFilter {
                 Value::Number(t.alert_epoch.into()),
             );
         }
+        // Any absence already ends a track's window, ownership and parked
+        // episode, and the rules drop an absent track's alert state; within
+        // the gap a return still moves on to a new alert epoch. Past it,
+        // forget the id too, so ids cannot pile up for the camera's lifetime.
+        v2.tracks
+            .retain(|_, t| at_ms.saturating_sub(t.seen_ms) as f64 <= max_gap_ms);
         if dirty {
             self.save_registry();
         }
@@ -2605,6 +2613,18 @@ mod tests {
             assert_eq!(epoch_of(&out[0]), 1, "{ms} ms");
         }
         assert_eq!(anchor_centers(&f), vec![(400.0, 500.0)]);
+    }
+
+    /// Track ids come and go for a camera's lifetime: the filter keeps only
+    /// those seen within the observation gap.
+    #[test]
+    fn v2_forgets_tracks_absent_past_the_observation_gap() {
+        let mut f = v2_filter();
+        for (k, ms) in capture_ms(2.0, 0, 60_000).into_iter().enumerate() {
+            v2_step(&mut f, ms, HD, vec![vehicle(k as TrackId, 400.0, 500.0)]);
+        }
+        let kept = f.parking_v2.as_ref().map(|v2| v2.tracks.len());
+        assert_eq!(kept, Some(7), "this frame's id and those of the last 3 s");
     }
 
     fn anchor_at(x: f32, y: f32) -> StaticAnchor {
