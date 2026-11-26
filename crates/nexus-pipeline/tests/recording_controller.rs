@@ -1106,6 +1106,42 @@ mod controller {
         assert!(c.rec.calls().is_empty(), "legacy recorded nothing");
     }
 
+    /// R-4: freshness is judged when the controller uses the evidence, not
+    /// when its frame was captured. A frame whose analysis takes 1.5 s under
+    /// a 1 s stale deadline cannot end degraded coverage, though the success
+    /// run it extends met the recovery gate long before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn evidence_consumed_after_the_stale_deadline_is_stale() {
+        let mut c = cam(shadow(1_000), 0, false, false).await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while proposed(&c) != Some((Some(RecordingReason::Quiet), false, false)) {
+            assert!(Instant::now() < deadline, "{:#?}", c.runtime());
+            c.now(AnalysisOutcome::Success, 0).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let (mono, wall) = c.clock(c.elapsed_ms());
+        let arrived = c.producer.arrived(mono, wall);
+        c.send(RecordingCommand::Evidence(arrived), LONG)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        let analysed = c.producer.analysed(
+            mono,
+            wall,
+            AnalysisOutcome::Success,
+            EvidenceCounts::default(),
+            Some(quiet()),
+        );
+        c.send(RecordingCommand::Evidence(analysed), LONG)
+            .await
+            .unwrap();
+        assert_eq!(
+            proposed(&c),
+            Some((Some(RecordingReason::DegradedCoverage), true, false)),
+            "1.5 s old when used"
+        );
+    }
+
     /// A slow open is waited for, never raced: the frames behind it time
     /// out where their requester can see it, and the clip they then find is
     /// the one that open produced.

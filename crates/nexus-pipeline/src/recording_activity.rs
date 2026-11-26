@@ -173,13 +173,20 @@ impl RecordingActivityPolicy {
         self.activity(captured_ms);
     }
 
-    pub fn tick(&mut self, now_ms: u64) -> RecordingIntent {
+    /// Degraded coverage once the newest successful analysis is older than
+    /// the stale deadline at `now_ms`, the consumer's clock: evidence used
+    /// late is as old as it is when used, whenever its frame was captured.
+    pub fn expire(&mut self, now_ms: u64) {
         let stale = self
             .last_success_ms
             .is_none_or(|s| now_ms.saturating_sub(s) > self.stale_after_ms);
         if !self.degraded && stale {
             self.degrade(now_ms);
         }
+    }
+
+    pub fn tick(&mut self, now_ms: u64) -> RecordingIntent {
+        self.expire(now_ms);
         let reason = match self.last_activity_ms {
             _ if self.degraded => RecordingReason::DegradedCoverage,
             // The activity instant itself is open even with zero post-roll.

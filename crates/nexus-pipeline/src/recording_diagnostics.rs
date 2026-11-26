@@ -651,6 +651,7 @@ impl ShadowRecording {
         self.evidence(
             origin,
             captured_mono,
+            captured_mono,
             Some((outcome, counts)),
             &summary,
             alert,
@@ -659,25 +660,30 @@ impl ShadowRecording {
     }
 
     /// Apply a producer's coalesced `summary`, reduced on a clock that
-    /// starts at `origin`, as of the frame captured at `captured_mono`.
-    /// `analysis` is that frame's own pass, counted by [`Self::record`].
+    /// starts at `origin`, as of the frame captured at `captured_mono` and
+    /// used at `now`: activity runs on the capture clock, freshness is
+    /// judged now. `analysis` is that frame's own pass, counted by
+    /// [`Self::record`].
     pub fn evidence(
         &mut self,
         origin: Instant,
         captured_mono: Instant,
+        now: Instant,
         analysis: Option<(AnalysisOutcome, EvidenceCounts)>,
         summary: &EvidenceSummary,
         alert: bool,
     ) -> RecordingIntent {
         let origin = *self.shared.lock().origin.get_or_insert(origin);
         let at = millis(captured_mono, origin);
+        let now_ms = millis(now, origin).max(at);
         let policy = self.policy.get_or_insert_with(|| {
             RecordingActivityPolicy::new(self.post_roll_ms, self.stale_after_ms, at)
         });
         if alert {
             policy.alert(at);
         }
-        policy.apply_summary(summary, at);
+        policy.apply_summary(summary, now_ms);
+        policy.expire(now_ms);
         let intent = policy.tick(at);
         self.intent = Some(intent);
         if let Some((outcome, counts)) = analysis {
@@ -1093,6 +1099,40 @@ mod tests {
             2_000
         );
         assert_eq!(counters["succeeded"], 2);
+    }
+
+    /// A frame captured at 31 s whose analysis is used at 46 s is 15 s old
+    /// under a 10 s stale deadline: degraded coverage, not a quiet scene.
+    #[test]
+    fn evidence_is_as_fresh_as_it_is_when_used() {
+        let registry = RecordingActivityRegistry::default();
+        let policy = RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 10_000,
+        };
+        let mut s =
+            ShadowRecording::start(&registry, 3, 9, Some(policy), "rev-9", "iou-naive", 10, 0)
+                .unwrap();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        let mut summary = EvidenceSummary::new(9, 10_000);
+        let mut used = |ms: u64, now: u64| {
+            let seen = Observation {
+                captured_ms: ms,
+                received_ms: ms,
+                qualifying_observed: 0,
+                predicted_only: 0,
+                outcome: AnalysisOutcome::Success,
+            };
+            summary.reduce(9, ms / 1_000 + 1, seen);
+            s.evidence(t0, at(ms), at(now), None, &summary, false)
+                .reason
+        };
+        for ms in (0..=30_000).step_by(1_000) {
+            used(ms, ms);
+        }
+        assert_eq!(used(30_000, 30_000), Quiet);
+        assert_eq!(used(31_000, 46_000), DegradedCoverage);
     }
 
     #[test]

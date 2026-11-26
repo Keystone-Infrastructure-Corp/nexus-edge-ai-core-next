@@ -681,7 +681,14 @@ impl Controller {
         // Arrival alone starts the policy: degraded coverage counts from healthy ingest.
         if let Some(shadow) = self.shadow.as_mut() {
             let alert = !self.observed && self.cfg.record_motion_clip_on_alert && alerts > 0;
-            let intent = shadow.evidence(e.origin, e.captured_mono, e.analysis, &e.summary, alert);
+            let intent = shadow.evidence(
+                e.origin,
+                e.captured_mono,
+                now,
+                e.analysis,
+                &e.summary,
+                alert,
+            );
             if self.observed {
                 error = self.drive(intent, e.captured_mono, e.captured_at).await;
             }
