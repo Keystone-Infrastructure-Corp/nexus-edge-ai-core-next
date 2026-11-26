@@ -149,6 +149,15 @@ describe("deriveZoneApplication", () => {
     expect(elsewhere.title).toBe("Unsaved changes; zones changed elsewhere");
   });
 
+  it("shows a denied saved-zone read, never an unsaved edit over it", () => {
+    const denied = derive(read(receipt()), { snapshot: null, error: new ApiError(403, "forbidden") }, {
+      phase: "dirty",
+      base: A,
+    });
+    expect(denied.kind).toBe("disconnected");
+    expect(denied.title).toBe("Cannot verify: no access to the saved zones");
+  });
+
   it("never shows Applied while a save is pending or awaiting its snapshot", () => {
     expect(derive(read(receipt()), shown(), { phase: "saving", base: null }).title).toBe("Saving to camera…");
     expect(derive(read(receipt()), shown(), { phase: "saved", base: null }).title).toBe("Saved; applying to camera");

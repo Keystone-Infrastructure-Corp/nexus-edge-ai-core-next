@@ -399,6 +399,65 @@ test.describe("zone application", () => {
     await expect(page.getByText("Applied to camera")).toHaveCount(0);
   });
 
+  test("a role demoted by a token refresh drops the edit and shows the denial", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const receipt = await controlReceipt(page, cameraId);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${cameraId}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+    await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
+    await expect(status).toContainText("Unsaved changes");
+
+    // The next stats read answers 401; the refresh it triggers rotates the
+    // tokens and carries the operator role, which may not read saved zones.
+    let demoted = false;
+    await page.route("**/api/v1/auth/refresh", async (route) => {
+      const res = await route.fetch();
+      const tokens = (await res.json()) as { user: Record<string, unknown> };
+      demoted = true;
+      await route.fulfill({ response: res, json: { ...tokens, user: { ...tokens.user, role: "operator" } } });
+    });
+    await page.route(`**/api/v1/admin/cameras/${cameraId}/config-snapshot`, (route) =>
+      demoted ? route.fulfill({ status: 403, json: { error: "e2e: forbidden" } }) : route.fallback(),
+    );
+    let expire = true;
+    await page.route(`**/api/v1/cameras/${cameraId}/stats`, (route) => {
+      if (!expire) return route.fallback();
+      expire = false;
+      return route.fulfill({ status: 401, json: { error: "e2e: token expired" } });
+    });
+
+    await expect(status).toContainText("Cannot verify: no access to the saved zones", POLL);
+    expect(demoted).toBe(true);
+    await expect(zoneRow(page, "Gate")).toHaveCount(0);
+    await expect(zoneRow(page, "Door")).toBeVisible();
+    await expect(page.getByText("Unsaved changes")).toHaveCount(0);
+  });
+
+  test("a denied saved-zone read during an edit drops it and shows the denial", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const receipt = await controlReceipt(page, cameraId);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${cameraId}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+    await zoneRow(page, "Door").getByRole("textbox").fill("Mine");
+    await expect(status).toContainText("Unsaved changes");
+
+    // Another save makes the editor reload the saved zones, and that read
+    // is now refused: the access is gone.
+    await page.route(`**/api/v1/admin/cameras/${cameraId}/config-snapshot`, (route) =>
+      route.fulfill({ status: 403, json: { error: "e2e: forbidden" } }),
+    );
+    receipt.set(applied(2));
+    await saveZonesElsewhere(page, cameraId, [DOCK]);
+
+    await expect(status).toContainText("Cannot verify: no access to the saved zones", POLL);
+    await expect(zoneRow(page, "Mine")).toHaveCount(0);
+    await expect(page.getByText("Unsaved changes")).toHaveCount(0);
+  });
+
   test("failed reads, old receipts and engine failures are never Applied, and recover", async ({ page }) => {
     cameraId = await createCamera(page, [DOOR]);
     const receipt = await controlReceipt(page, cameraId);

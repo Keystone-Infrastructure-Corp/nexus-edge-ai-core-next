@@ -75,14 +75,14 @@ export const nextAcceptanceSeq = () => ++acceptanceSeq;
 
 const zoneSaveSeqs = new Map<number, number>();
 /**
- * A save of the camera started or ended. Kept per camera outside any editor,
- * so one closed and reopened mid-save still fences out every read begun
- * before the save ended.
+ * A save of the camera started or ended, or the editor's access changed.
+ * Kept per camera outside any editor, so one closed and reopened mid-save
+ * still fences out every read begun before the save ended.
  */
 export const markZoneSave = (cameraId: number) => {
   zoneSaveSeqs.set(cameraId, nextAcceptanceSeq());
 };
-/** The acceptance seq of the camera's latest save start or end in this tab. */
+/** The acceptance seq of the camera's latest {@link markZoneSave} in this tab. */
 export const zoneSaveSeq = (cameraId: number) => zoneSaveSeqs.get(cameraId) ?? 0;
 
 /** A read tagged with the acceptance seq taken when its request began. */
@@ -168,7 +168,8 @@ export function deriveZoneApplication(
   epoch: AcceptanceEpoch,
 ): ZoneApplication {
   const receipt = deriveReceipt(saved, read, draft.phase === "saved", epoch);
-  if (draft.phase === "dirty") {
+  // A denied saved-zone read shows as such, never as an edit to save.
+  if (draft.phase === "dirty" && !isDenied(saved.error)) {
     const elsewhere =
       receipt.kind === "changed_elsewhere" ||
       (draft.base !== null &&

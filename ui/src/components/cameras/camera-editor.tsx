@@ -55,6 +55,7 @@ import {
   decodeSummaryText,
   decodeVerdictPresentation,
 } from "@/lib/decodeCapacity";
+import { useSession } from "@/lib/auth";
 import { detectorInputFor, supervisorDimsFor } from "@/lib/supervisor-frame";
 import {
   deriveZoneApplication,
@@ -206,6 +207,16 @@ type ZoneView = {
   awaiting: boolean;
   generation: number;
 };
+
+/** A zone view with nothing read, showing `zones`. */
+const unreadZoneView = (zones: ZoneConfig[] | undefined): ZoneView => ({
+  synced: zones,
+  base: null,
+  installed: null,
+  savedAt: null,
+  awaiting: false,
+  generation: -1,
+});
 
 const APPLICATION_BADGE: Record<
   ZoneApplication["kind"],
@@ -402,14 +413,7 @@ export function CameraEditor({
   // acceptance epoch; only a stats request begun after it can certify them.
   // The draft stays the full-config write base: a save sends it whole, with
   // the zones on screen, and nothing from the snapshot but its zones.
-  const [zoneView, setZoneView] = useState<ZoneView>(() => ({
-    synced: camera.zones,
-    base: null,
-    installed: null,
-    savedAt: null,
-    awaiting: false,
-    generation: -1,
-  }));
+  const [zoneView, setZoneView] = useState<ZoneView>(() => unreadZoneView(camera.zones));
 
   // The save, its fence and its post-save snapshot read outlive this editor:
   // a reopened one sees the save pending, and its settling refreshes it.
@@ -534,6 +538,31 @@ export function CameraEditor({
     reconciledAt.current = Date.now();
     void qc.refetchQueries({ queryKey: snapshotKey(camera.id), exact: true });
   }, [qc, camera.id, reconcile, pollMs, statsQ.dataUpdatedAt, statsQ.errorUpdatedAt]);
+
+  // What this editor shows and certifies was read with the signed-in role.
+  // A token refresh can carry another role (or user) without unmounting the
+  // editor, and a denied read means the access is gone: either drops the
+  // edit and the acceptance state, fencing out every read begun before, and
+  // a role change reads the saved zones again as the new role.
+  const user = useSession()?.user;
+  const authority = user ? `${user.id}:${user.role}` : "";
+  const denied = [snapQ.error, statsQ.error].some(isDenied);
+  const heldAs = useRef({ authority, denied });
+  useEffect(() => {
+    const was = heldAs.current;
+    heldAs.current = { authority, denied };
+    const changed = authority !== was.authority;
+    if (!changed && (!denied || was.denied)) return;
+    markZoneSave(camera.id);
+    onvifEndpointTouched.current = Boolean(camera.onvif?.endpoint);
+    setDraft(camera);
+    setError(null);
+    setZoneView(unreadZoneView(camera.zones));
+    if (changed) {
+      restartQuery(qc, snapshotKey(camera.id));
+      restartQuery(qc, statsKey(camera.id));
+    }
+  }, [qc, camera, authority, denied]);
 
   const set = <K extends keyof CameraConfig>(
     k: K,
