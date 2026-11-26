@@ -62,6 +62,7 @@ import { detectorInputFor, supervisorDimsFor } from "@/lib/supervisor-frame";
 import {
   deriveZoneApplication,
   isDenied,
+  isZonesRevisionConflict,
   markZoneSave,
   nextAcceptanceSeq,
   parseConfigSnapshot,
@@ -221,7 +222,10 @@ type SavedZones = { zones: ZoneConfig[] | undefined; revision: string | null };
  * The camera's saved zones, read again just before a save: from the config
  * snapshot, with their revision, or, when that read fails (a role that may
  * save but not read it, say), from the camera list the draft came from,
- * with no revision. Throws only when both reads fail.
+ * with no revision. Throws only when both reads fail. The save expects the
+ * snapshot's revision, so another save landing after this read is refused
+ * (409), never overwritten. The list gives no revision to expect: that save
+ * is unconditional, as before, and still overwrites one landing after it.
  */
 async function rereadSavedZones(cameraId: number): Promise<SavedZones> {
   try {
@@ -445,13 +449,24 @@ export function CameraEditor({
   // a reopened one sees the save pending, and its settling refreshes it.
   const mutation = useMutation({
     mutationKey: saveKey(camera.id),
-    mutationFn: (cfg: CameraConfig) => upsertCamera(cfg),
+    mutationFn: ({ cfg, expected }: { cfg: CameraConfig; expected?: string }) =>
+      upsertCamera(cfg, expected),
     onMutate: () => markZoneSave(camera.id),
     onSuccess: () => {
       if (!isNew) toast.success("Camera saved");
       onSaved(isNew);
     },
-    onError: (e: unknown) => setError(e instanceof Error ? e.message : String(e)),
+    // A refused save is never retried: the saved zones it raced are read
+    // again on settling, rebasing a clean view or showing an edit as
+    // changed elsewhere, and the operator saves again.
+    onError: (e: unknown) =>
+      setError(
+        isZonesRevisionConflict(e)
+          ? "Not saved: someone saved this camera's zones while this save was on its way, so nothing was changed. Check the zones and save again."
+          : e instanceof Error
+            ? e.message
+            : String(e),
+      ),
     // A failed PUT may still have committed: read what is saved either way.
     onSettled: () => {
       markZoneSave(camera.id);
@@ -497,7 +512,7 @@ export function CameraEditor({
     if (clean) setDraft((d) => ({ ...d, zones: snap.body.settings.zones }));
   }
 
-  const sentZones = mutation.isPending ? mutation.variables?.zones : zoneView.synced;
+  const sentZones = mutation.isPending ? mutation.variables?.cfg.zones : zoneView.synced;
   const zoneDraft: ZoneDraftState = {
     phase:
       sketching || draft.zones !== sentZones ? "dirty" : saving ? "saving" : zoneView.awaiting ? "saved" : "clean",
@@ -637,8 +652,11 @@ export function CameraEditor({
     // saved now, not as last read here, so an unrelated edit never reverts
     // another operator's newer zones. Edited zones, a drawing in progress
     // included (it freezes the zones it was drawn over), are sent as shown:
-    // the status says when they were changed elsewhere.
+    // the status says when they were changed elsewhere. Unedited zones
+    // re-read with their revision are sent expecting it (see
+    // `rereadSavedZones`).
     let cfg = draft;
+    let expected: string | undefined;
     if (!isNew && !sketching && draft.zones === zoneView.synced) {
       setChecking(true);
       let saved: SavedZones;
@@ -654,6 +672,7 @@ export function CameraEditor({
         setChecking(false);
       }
       const { zones, revision } = saved;
+      expected = revision ?? undefined;
       const changed =
         revision !== null
           ? revision !== zoneView.base
@@ -664,12 +683,12 @@ export function CameraEditor({
         setDraft((d) => (d.zones === draft.zones ? { ...d, zones } : d));
       }
     }
-    mutation.mutate(cfg, {
+    mutation.mutate({ cfg, expected }, {
       // Not called once `resetSave` fenced the save. The PUT answer carries
       // no revision and is not applied: the post-save snapshot and a fresh
       // receipt decide. Typing since the save began stays, because the
       // draft is never replaced by the answer.
-      onSuccess: (_saved, cfg) =>
+      onSuccess: (_saved, { cfg }) =>
         setZoneView((v) => ({
           ...v,
           savedAt: Date.now(),

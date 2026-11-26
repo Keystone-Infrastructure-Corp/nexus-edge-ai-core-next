@@ -1022,6 +1022,112 @@ test.describe("zone application", () => {
     await expect(zoneRow(page, "Mine")).toBeVisible();
   });
 
+  /**
+   * Park the editor's next save of camera `id` until `release`, then land
+   * another operator's save of `zones` first: after the editor re-read the
+   * saved zones, before its save reaches the engine.
+   */
+  async function raceSave(page: Page, id: number, zones: Zone[]) {
+    let seen = () => {};
+    let release = () => {};
+    const parked = new Promise<void>((resolve) => (seen = resolve));
+    const opened = new Promise<void>((resolve) => (release = resolve));
+    let raced = false;
+    await page.route(
+      (url) => url.pathname === `/api/v1/cameras/${id}`,
+      async (route) => {
+        // The other operator's save, and every later request, go straight through.
+        if (route.request().method() !== "PUT" || raced) return route.fallback();
+        raced = true;
+        seen();
+        await opened;
+        await saveZonesElsewhere(page, id, zones);
+        await route.continue();
+      },
+    );
+    return { parked, release };
+  }
+
+  const expectedRevision = (r: Request) => new URL(r.url()).searchParams.get("expected_zones_revision");
+  const conflict = /^Not saved: someone saved this camera's zones while this save was on its way/;
+
+  test("a save overtaken by another operator's zone save after its re-read is refused, then rebased", async ({
+    page,
+  }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+    const mine = await zonesRevision(page, id);
+
+    await page.locator("#cam-name").fill("e2e zones renamed");
+    const race = await raceSave(page, id, [DOCK]);
+    race.release();
+    receipt.set(applied(2));
+    const put = page.waitForRequest(isPut(id));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    const sent = await put;
+    expect(expectedRevision(sent)).toBe(mine);
+    expect((await sent.response())?.status()).toBe(409);
+
+    // Nothing was overwritten; the clean view rebases on their zones and
+    // keeps the rename, for the operator to save again.
+    const cams = await engine<Array<{ id: number; name: string; zones: Zone[] }>>(page, "GET", "/cameras");
+    expect(cams.find((c) => c.id === id)).toMatchObject({ name: "e2e zones", zones: [DOCK] });
+    await expect(page.getByText(conflict)).toBeVisible();
+    await expect(zoneRow(page, "Loading dock")).toBeVisible();
+    await expect(zoneRow(page, "Door")).toHaveCount(0);
+    await expect(page.locator("#cam-name")).toHaveValue("e2e zones renamed");
+    await expect(status).toContainText("Applied to camera", POLL);
+
+    const theirs = await zonesRevision(page, id);
+    receipt.set(applied(3));
+    const again = page.waitForRequest(isPut(id));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    const resent = await again;
+    expect(expectedRevision(resent)).toBe(theirs);
+    expect(resent.postDataJSON()).toMatchObject({ name: "e2e zones renamed", zones: [DOCK] });
+    expect((await resent.response())?.ok()).toBe(true);
+    await expect(status).toContainText("Applied to camera", POLL);
+  });
+
+  test("a zone edit typed during a save another operator's save overtook stays unsaved and is not resent", async ({
+    page,
+  }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+    let puts = 0;
+    page.on("request", (r) => {
+      if (isPut(id)(r)) puts += 1;
+    });
+
+    await page.locator("#cam-name").fill("e2e zones renamed");
+    const race = await raceSave(page, id, [DOCK]);
+    const put = page.waitForRequest(isPut(id));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    await race.parked;
+    await zoneRow(page, "Door").getByRole("textbox").fill("Mine");
+    receipt.set(applied(2));
+    race.release();
+    expect((await (await put).response())?.status()).toBe(409);
+
+    await expect(page.getByText(conflict)).toBeVisible();
+    await expect(status).toContainText("Unsaved changes; zones changed elsewhere", POLL);
+    await expect(zoneRow(page, "Mine")).toBeVisible();
+    await page.waitForTimeout(2_000);
+    expect(puts, "the editor's refused save and the other operator's, no retry").toBe(2);
+    const cams = await engine<Array<{ id: number; name: string; zones: Zone[] }>>(page, "GET", "/cameras");
+    expect(cams.find((c) => c.id === id)).toMatchObject({ name: "e2e zones", zones: [DOCK] });
+  });
+
   const isCameraList = (r: Request) =>
     r.method() === "GET" && new URL(r.url()).pathname === "/api/v1/cameras";
 

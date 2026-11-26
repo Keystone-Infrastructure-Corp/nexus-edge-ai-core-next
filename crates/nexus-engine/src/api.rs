@@ -1633,14 +1633,25 @@ fn validate_analysis_url(ingest: &nexus_config::CameraIngest) -> Result<(), ApiE
     Ok(())
 }
 
+/// Query of `PUT /cameras/{id}`.
+#[derive(Debug, serde::Deserialize)]
+struct UpsertCameraQuery {
+    /// SPEC-088 — save only while the stored zones still have this revision
+    /// (the config snapshot's `zones_revision`); otherwise answer 409
+    /// `zones_revision_conflict` with the current one and write nothing.
+    /// Absent, the save is unconditional, as before.
+    expected_zones_revision: Option<String>,
+}
+
 async fn upsert_camera(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
+    Query(q): Query<UpsertCameraQuery>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     session: Option<crate::auth::require_role::SessionContext>,
     Json(mut cam): Json<CameraConfig>,
-) -> Result<Json<CameraConfig>, ApiError> {
+) -> Result<Response, ApiError> {
     cam.id = id;
     validate_analysis_url(&cam.ingest)?;
     cam.validate_finite()
@@ -1663,6 +1674,25 @@ async fn upsert_camera(
     // SPEC-088 — no other save commits, and no read requests, between this
     // commit and the request below, so the registry sees saves in order.
     let saving = s.frame_stats.zone_application().saves().write().await;
+    // Read under the lock every row writer holds, so no save lands between
+    // this check and the commit. A missing or unreadable row never matches.
+    if let Some(expected) = q.expected_zones_revision {
+        let current = s
+            .store
+            .list_readable_cameras()
+            .await?
+            .0
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(|c| nexus_pipeline::zone_application::zone_revision(&c.zones));
+        if current.as_deref() != Some(expected.as_str()) {
+            let body = serde_json::json!({
+                "error": "zones_revision_conflict",
+                "zones_revision": current,
+            });
+            return Ok((StatusCode::CONFLICT, Json(body)).into_response());
+        }
+    }
     // M6 Phase 4 Step 4.1 (tx-merge) — the domain mutation
     // and the success audit row commit together in one SQLite
     // tx. If the audit write fails, the tx drops and the camera
@@ -1725,7 +1755,7 @@ async fn upsert_camera(
             &serde_json::json!({ "kind": "camera", "action": "upsert", "camera_id": id }),
         )
         .await;
-    Ok(Json(cam))
+    Ok(Json(cam).into_response())
 }
 
 /// `POST /cameras` — create a new camera with a server-assigned
@@ -8426,6 +8456,113 @@ mod tests {
             state_of(&app, id).await,
             "applying",
             "g1's acknowledgement from before B certified the A saved after it"
+        );
+    }
+
+    /// `PUT /api/v1/cameras/{id}` of `camera`, naming the zones revision it
+    /// expects saved when given: status and body.
+    async fn put_camera_expecting(
+        app: axum::Router,
+        camera: nexus_config::CameraConfig,
+        expected: Option<String>,
+    ) -> (StatusCode, serde_json::Value) {
+        let query = expected.map_or(String::new(), |rev| {
+            format!("?expected_zones_revision={rev}")
+        });
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/api/v1/cameras/{}{query}", camera.id))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&camera).unwrap()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    /// SPEC-088 — a camera save naming the zones revision it expects saves
+    /// only while the stored zones still have it. A stale one answers 409
+    /// `zones_revision_conflict` with the current revision and writes
+    /// nothing; the current one saves; a save naming none saves as before.
+    #[tokio::test]
+    async fn a_camera_save_expecting_a_stale_zones_revision_conflicts_and_writes_nothing() {
+        use nexus_pipeline::zone_application::zone_revision;
+        async fn stored(store: &Store) -> (String, Vec<nexus_config::ZoneConfig>) {
+            let cam = store.list_cameras().await.unwrap()[0].clone();
+            (cam.name, cam.zones)
+        }
+        let (app, store, _dir) = build_test_router(None).await;
+        store_default_camera(&store, true).await;
+        let mut saved = store.list_cameras().await.unwrap()[0].clone();
+        saved.zones = vec![snapshot_zone("a", 0.1)];
+        store.upsert_camera(&saved).await.unwrap();
+        let current = zone_revision(&saved.zones);
+
+        let mut edit = saved.clone();
+        edit.name = "renamed".into();
+        edit.zones = vec![snapshot_zone("b", 0.2)];
+        let stale = Some(zone_revision(&[]));
+        let (status, body) = put_camera_expecting(app.clone(), edit.clone(), stale).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "zones_revision_conflict", "zones_revision": current })
+        );
+        assert_eq!(
+            stored(&store).await,
+            (saved.name.clone(), saved.zones.clone()),
+            "a refused save wrote"
+        );
+
+        let (status, body) = put_camera_expecting(app.clone(), edit.clone(), Some(current)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            stored(&store).await,
+            (edit.name.clone(), edit.zones.clone())
+        );
+
+        edit.zones.clear();
+        let (status, body) = put_camera_expecting(app, edit.clone(), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored(&store).await, (edit.name, edit.zones));
+    }
+
+    /// SPEC-088 — the expectation is checked inside the camera save lock: a
+    /// save another writer commits while this one waits for the lock is seen,
+    /// so the waiting save conflicts instead of overwriting it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zones_revision_expectation_is_checked_inside_the_save_lock() {
+        use nexus_pipeline::zone_application::zone_revision;
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let mine = store.list_cameras().await.unwrap()[0].clone();
+        let mut theirs = mine.clone();
+        theirs.zones = vec![snapshot_zone("b", 0.3)];
+        let frame_stats = state.frame_stats.clone();
+        let registry = frame_stats.zone_application();
+        let app = super::router(state);
+
+        // Another writer is mid-save, holding the lock (for reading, so the
+        // save queued behind it shows: a queued writer makes `try_read` fail).
+        let other = registry.saves().read().await;
+        let expected = Some(zone_revision(&mine.zones));
+        let save = tokio::spawn(put_camera_expecting(app.clone(), mine.clone(), expected));
+        while registry.saves().try_read().is_ok() && !save.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        store.upsert_camera(&theirs).await.unwrap();
+        drop(other);
+
+        let (status, body) = save.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["zones_revision"], zone_revision(&theirs.zones));
+        assert_eq!(
+            store.list_cameras().await.unwrap()[0].zones,
+            theirs.zones,
+            "the queued save overwrote the zones saved ahead of it"
         );
     }
 

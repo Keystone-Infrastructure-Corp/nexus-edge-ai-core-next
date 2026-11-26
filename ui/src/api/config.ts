@@ -35,11 +35,17 @@ export function createCamera(camera: CameraConfig): Promise<CameraConfig> {
 
 /// Update an existing camera. `camera.id` MUST be a non-zero
 /// positive i64 that already exists in the engine. For creates
-/// use `createCamera`.
-export function updateCamera(camera: CameraConfig): Promise<CameraConfig> {
+/// use `createCamera`. SPEC-088 — with `expectedZonesRevision` the
+/// engine saves only while the stored zones still have that revision;
+/// otherwise it answers 409 `zones_revision_conflict` and writes nothing.
+export function updateCamera(
+  camera: CameraConfig,
+  expectedZonesRevision?: string,
+): Promise<CameraConfig> {
   return api.put<CameraConfig>(
     `/cameras/${encodeURIComponent(String(camera.id))}`,
     camera,
+    { query: { expected_zones_revision: expectedZonesRevision } },
   );
 }
 
@@ -47,11 +53,14 @@ export function updateCamera(camera: CameraConfig): Promise<CameraConfig> {
 /// and PUT for existing ones. Most call sites should use this
 /// directly; `createCamera` / `updateCamera` are available for
 /// the rare flows that know upfront which they want.
-export function upsertCamera(camera: CameraConfig): Promise<CameraConfig> {
+export function upsertCamera(
+  camera: CameraConfig,
+  expectedZonesRevision?: string,
+): Promise<CameraConfig> {
   if (!camera.id || camera.id <= 0) {
     return createCamera(camera);
   }
-  return updateCamera(camera);
+  return updateCamera(camera, expectedZonesRevision);
 }
 
 export function deleteCamera(id: number): Promise<void> {
