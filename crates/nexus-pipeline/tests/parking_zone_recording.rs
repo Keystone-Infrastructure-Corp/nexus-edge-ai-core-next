@@ -839,6 +839,56 @@ async fn a_reused_id_within_the_motion_bounds_is_alerted_and_recorded_until_its_
     );
 }
 
+/// A tracker that hands a large parked car's id to a box 30 px away, inside
+/// the 40 px anchor radius and both motion bounds, while the car stays put
+/// under a new id. Either may be the car, so the old id inherits no parked
+/// verdict: it is alerted and recorded, as the new id is, until its own
+/// dwell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ambiguous_id_inside_the_anchor_radius_is_alerted_and_recorded_until_its_own_dwell() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let times = every(690, 0, 30_000);
+    let swap = first_at(&times, 10_000);
+    // 256 px, then 286 px, on a 1024x576 frame; a 512x518 px box.
+    let (parked_x, moved_x) = (0.25, 0.25 + 30.0 / 1024.0);
+    let big = |id, x| Car {
+        id,
+        size: (0.5, 0.9),
+        ..car(x, 0.5)
+    };
+    let mut shots = shots(&times, |k, _| {
+        if k < swap {
+            vec![big(7, parked_x)]
+        } else {
+            vec![big(7, moved_x), big(9, parked_x)]
+        }
+    });
+    for shot in &mut shots {
+        shot.size = (1024, 576);
+    }
+    let mut s = Scenario::v2(shots);
+    s.scripted_ids = true;
+    let o = run(s, dir.path()).await;
+    let dwelled = first_at(&times, times[swap] + 5_000);
+    for (k, &ms) in times.iter().enumerate() {
+        if k < swap {
+            assert_eq!(o.static_at(k, parked_x, 0.5), ms >= 5_000, "{ms} ms");
+        } else {
+            let want = k >= dwelled;
+            assert_eq!(o.static_at(k, moved_x, 0.5), want, "old id at {ms} ms");
+            assert_eq!(o.static_at(k, parked_x, 0.5), want, "new id at {ms} ms");
+        }
+    }
+    assert_eq!(o.fired("any_vehicle"), vec![0, swap, swap]);
+    // Both ids are born at the swap and die at their own dwell; the clip
+    // stays open from the parked car's arrival until the post-roll after.
+    let (at, died) = (times[swap], times[dwelled]);
+    assert_eq!(o.motion_at(MotionEventKind::Born), vec![0, at, at]);
+    assert_eq!(o.motion_at(MotionEventKind::Died), vec![5_520, died, died]);
+    assert_eq!(o.clips, vec![(0, Some(26_220))]);
+    assert_eq!(o.anchors, vec![(256.0, 288.0)]);
+}
+
 /// A stream resized mid-dwell: every candidate starts over in the new
 /// geometry, so the car is visible, and alerted as the new box it is, until
 /// it dwells again.

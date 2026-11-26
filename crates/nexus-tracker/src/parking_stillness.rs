@@ -171,6 +171,11 @@ impl StillnessWindow {
     pub fn miss(&mut self) {
         self.candidate = None;
     }
+
+    /// Where the pending window's first sample was observed, if one is open.
+    pub fn first_center(&self) -> Option<(f64, f64)> {
+        self.candidate.map(|c| c.first_center)
+    }
 }
 
 fn distance(a: (f64, f64), b: (f64, f64)) -> f64 {

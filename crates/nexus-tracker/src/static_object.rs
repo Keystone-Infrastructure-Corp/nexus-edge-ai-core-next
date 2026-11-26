@@ -719,32 +719,46 @@ impl StaticObjectFilter {
                         .last
                         .is_some_and(|(_, ms)| at_ms > ms && (at_ms - ms) as f64 <= max_gap_ms);
                     t.last = Some((center, at_ms));
-                    // Seen away from where it parked: its next episode. Only
-                    // an owner seen leaving an anchor no other object still
-                    // stands at erases it; otherwise it is left to expire.
-                    if let Some(p) = t
-                        .parked_at
-                        .filter(|&p| !inside || distance(p, center) > match_dist)
-                    {
+                    // Seen away from where it parked, or with another object
+                    // nearer where its stillness began (its anchor once that
+                    // window ended) than it is, which may be the one that
+                    // parked: its next episode. Not nearer the anchor: an id
+                    // that dwelled afresh beside it matches the same anchor.
+                    // Only an owner seen leaving an anchor no other object
+                    // still stands at erases it; otherwise it is left to expire.
+                    if let Some(p) = t.parked_at {
+                        let left = !inside || distance(p, center) > match_dist;
+                        let began = t
+                            .window
+                            .first_center()
+                            .map_or(p, |(x, y)| (x as f32, y as f32));
                         let swapped = observed.iter().any(|(id, l, c)| {
-                            *id != o.track_id && *l == label && distance(*c, p) <= match_dist
+                            *id != o.track_id
+                                && *l == label
+                                && if left {
+                                    distance(*c, p) <= match_dist
+                                } else {
+                                    distance(*c, began) < distance(center, began)
+                                }
                         });
-                        if t.owner && !swapped {
-                            if let Some(i) = anchors
-                                .iter()
-                                .position(|a| a.label == label && (a.center_x, a.center_y) == p)
-                            {
-                                anchors.remove(i);
-                                dirty = true;
+                        if left || swapped {
+                            if t.owner && !swapped {
+                                if let Some(i) = anchors
+                                    .iter()
+                                    .position(|a| a.label == label && (a.center_x, a.center_y) == p)
+                                {
+                                    anchors.remove(i);
+                                    dirty = true;
+                                }
                             }
+                            // An identity another object may hold borrows no dwell.
+                            if swapped {
+                                t.window.miss();
+                            }
+                            t.parked_at = None;
+                            t.owner = false;
+                            t.alert_epoch += 1;
                         }
-                        // An identity another object may hold borrows no dwell.
-                        if swapped {
-                            t.window.miss();
-                        }
-                        t.parked_at = None;
-                        t.owner = false;
-                        t.alert_epoch += 1;
                     }
                     still =
                         t.window
@@ -2453,21 +2467,35 @@ mod tests {
         }
     }
 
-    /// A large parked car's id seen 50 px away, inside the ID-reuse step and
-    /// the drift bound, while another track stands at its anchor: that
-    /// ambiguous identity borrows no dwell and erases no anchor.
+    /// A large parked car's id seen 50 px away, out of the anchor radius, or
+    /// 30 px away, inside it, both inside the ID-reuse step and the drift
+    /// bound, while another track stands at its anchor: that ambiguous
+    /// identity borrows no dwell and erases no anchor. Once it has its own
+    /// dwell it stays parked beside the other. With nothing else at its
+    /// anchor, the same 30 px creep keeps the owner parked in its episode.
     #[test]
     fn v2_an_ambiguous_identity_cannot_borrow_a_large_boxs_dwell() {
-        let mut f = v2_filter();
-        for ms in capture_ms(1.45, 0, 6_900) {
-            v2_step(&mut f, ms, HD, vec![big_car(1, 400.0)]);
+        // (name, the id's new x, another track at the anchor, anchors after)
+        let cases = [
+            ("50 px", 450.0, true, vec![(400.0, 500.0), (450.0, 500.0)]),
+            ("30 px", 430.0, true, vec![(400.0, 500.0)]),
+            ("30 px, alone", 430.0, false, vec![(400.0, 500.0)]),
+        ];
+        for (name, x, other, anchors) in cases {
+            let mut f = v2_filter();
+            for ms in capture_ms(1.45, 0, 6_900) {
+                v2_step(&mut f, ms, HD, vec![big_car(1, 400.0)]);
+            }
+            for ms in capture_ms(1.45, 7_590, 20_000) {
+                let mut objs = vec![big_car(1, x)];
+                objs.extend(other.then(|| big_car(9, 400.0)));
+                let out = v2_step(&mut f, ms, HD, objs);
+                let (parked, episode) = if other { (ms >= 12_590, 1) } else { (true, 0) };
+                assert_eq!(is_object_static(&out[0]), parked, "{name}: {ms} ms");
+                assert_eq!(epoch_of(&out[0]), episode, "{name}: {ms} ms");
+            }
+            assert_eq!(anchor_centers(&f), anchors, "{name}");
         }
-        for ms in capture_ms(1.45, 7_590, 14_000) {
-            let out = v2_step(&mut f, ms, HD, vec![big_car(1, 450.0), big_car(9, 400.0)]);
-            assert_eq!(is_object_static(&out[0]), ms >= 12_590, "{ms} ms");
-            assert_eq!(epoch_of(&out[0]), 1, "{ms} ms");
-        }
-        assert_eq!(anchor_centers(&f), vec![(400.0, 500.0), (450.0, 500.0)]);
     }
 
     /// A parked car whose detection drops out keeps its episode but not its
