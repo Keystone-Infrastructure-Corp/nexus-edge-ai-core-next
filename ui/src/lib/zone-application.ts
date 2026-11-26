@@ -443,6 +443,9 @@ function deriveReceipt(
   };
 
   const zones = verdict(body.zones_runtime, snapshot.zones_revision, epoch.generation, "zones");
-  if (zones.kind !== "applied" || snapshot.parking_revision === undefined) return zones;
-  return verdict(body.parking_runtime, snapshot.parking_revision, epoch.parkingGeneration ?? -1, "parking settings");
+  if (snapshot.parking_revision === undefined || zones.kind === "changed_elsewhere") return zones;
+  const parking = verdict(body.parking_runtime, snapshot.parking_revision, epoch.parkingGeneration ?? -1, "parking settings");
+  // A policy-only save elsewhere moves only the parking revision: it is
+  // loaded whatever the zones' state, a disabled camera's included.
+  return zones.kind === "applied" || parking.kind === "changed_elsewhere" ? parking : zones;
 }

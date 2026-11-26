@@ -1474,6 +1474,22 @@ test.describe("zone application", () => {
       return seen;
     }
 
+    /** Hold every read of camera `id`'s saved settings until `release`. */
+    async function holdSnapshots(page: Page, id: number) {
+      let seen = () => {};
+      let release = () => {};
+      const parked = new Promise<void>((resolve) => (seen = resolve));
+      const opened = new Promise<void>((resolve) => (release = resolve));
+      let reads = 0;
+      await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, async (route) => {
+        reads += 1;
+        seen();
+        await opened;
+        await route.continue();
+      });
+      return { parked, release, reads: () => reads };
+    }
+
     /** Open the camera with both receipts applied. */
     async function openApplied(page: Page, id: number) {
       const receipt = await controlReceipt(page, id);
@@ -1642,6 +1658,30 @@ test.describe("zone application", () => {
       release();
       await expect(policy(page).dwell).toHaveValue("20", POLL);
       await expect(status).toContainText("Applied to camera", POLL);
+    });
+
+    test("a disabled camera loads another operator's policy-only save, though its zones are inactive", async ({
+      page,
+    }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      // The engine's own receipts: the camera is disabled, so both are inactive.
+      await page.goto(`/cameras/${id}`);
+      const status = page.getByTestId("zone-application");
+      await expect(status).toContainText("Saved; applies when enabled");
+      await expect(policy(page).dwell).toHaveValue("10");
+
+      // Their save moves the parking revision only; the zone receipt stays inactive on the same zones.
+      await saveElsewhere(page, id, { parking_policy_v2: POLICY_B });
+      const reload = await holdSnapshots(page, id);
+      await steadyRead(page);
+      await expect(status).toContainText("Parking settings changed elsewhere; loading them", POLL);
+      await expect.poll(reload.reads, POLL).toBe(1);
+      await expect(policy(page).dwell).toHaveValue("10");
+
+      reload.release();
+      await expect(policy(page).dwell).toHaveValue("20", POLL);
+      await expect(status).toContainText("Saved; applies when enabled", POLL);
     });
 
     test("an unsaved policy edit survives another operator's policy save and is never Applied", async ({
