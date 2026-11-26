@@ -1707,6 +1707,69 @@ mod controller {
         assert!(c.rec.calls().iter().any(|call| call == "closed 2 media=5"));
     }
 
+    /// Codex review 4: observed decides when it uses evidence. Activity at T
+    /// closes its clip once its 1 s post-roll runs out. The next frame,
+    /// captured at T + 0.5 s, is analysed for 1.5 s: seeing no one it
+    /// reopens nothing. Seeing someone it is new evidence, which opens a new
+    /// file at once (its pre-roll reaching back past the capture) for that
+    /// instant only, so the next analysis without new activity closes it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_analysis_reopens_no_expired_window() {
+        for late_observed in [0, 1] {
+            let mut cfg = observed(1);
+            cfg.policy = Some(RecordingPolicyConfig {
+                mode: RecordingPolicyMode::Observed,
+                analysis_stale_after_ms: 10_000,
+            });
+            let mut c = cam(cfg, 5_000, false, false).await;
+            c.healthy().await;
+            c.until(3, "closed 1 ").await;
+            let t = c.elapsed_ms();
+            let active = c
+                .frame_within(t, AnalysisOutcome::Success, 1, quiet(), LONG)
+                .await
+                .unwrap();
+            assert_eq!(active.clip.map(|h| h.clip_id), Some(2));
+            let until = |c: &Cam, ms: u64| Duration::from_millis(ms.saturating_sub(c.elapsed_ms()));
+            tokio::time::sleep(until(&c, t + 500)).await;
+            let (mono, wall) = c.clock(t + 500);
+            let arrived = c.producer.arrived(mono, wall);
+            c.send(RecordingCommand::Evidence(arrived), LONG)
+                .await
+                .unwrap();
+            c.until(2, "closed 2 ").await;
+            tokio::time::sleep(until(&c, t + 2_000)).await;
+            let counts = EvidenceCounts {
+                observed: late_observed,
+                ..EvidenceCounts::default()
+            };
+            let late =
+                c.producer
+                    .analysed(mono, wall, AnalysisOutcome::Success, counts, Some(quiet()));
+            let receipt = c
+                .send(RecordingCommand::Evidence(late), LONG)
+                .await
+                .unwrap();
+            if late_observed == 0 {
+                tokio::time::sleep(SHORT).await;
+                assert!(receipt.clip.is_none(), "{:#?}", c.rec.calls());
+                assert_eq!(
+                    c.rec
+                        .calls()
+                        .last()
+                        .map(|call| call.starts_with("closed 2 ")),
+                    Some(true),
+                    "no reopen: {:#?}",
+                    c.rec.calls()
+                );
+            } else {
+                assert_eq!(receipt.clip.map(|h| h.clip_id), Some(3));
+                let next = c.now(AnalysisOutcome::Success, 0).await;
+                assert!(next.clip.is_none(), "{:#?}", c.rec.calls());
+            }
+        }
+    }
+
     /// A source lost before the minimum is reached ends the hold: the clip
     /// closes with the partial media it has rather than staying open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

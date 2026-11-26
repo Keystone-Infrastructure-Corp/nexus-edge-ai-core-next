@@ -171,6 +171,11 @@ impl RecordingActivityPolicy {
         }
     }
 
+    /// Capture time of the latest activity: qualifying evidence, an alert or a recovery.
+    pub fn last_activity_ms(&self) -> Option<u64> {
+        self.last_activity_ms
+    }
+
     /// Explicit alert recording: activity independent of the detector's evidence.
     pub fn alert(&mut self, captured_ms: u64) {
         self.activity(captured_ms);

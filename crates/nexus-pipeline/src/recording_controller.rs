@@ -731,7 +731,8 @@ impl Controller {
                 alert,
             );
             if self.observed {
-                error = self.drive(intent, e.captured_mono, e.captured_at).await;
+                // Decided now, so acted on now: the writer's clock never runs back.
+                error = self.drive(intent, now, wall).await;
             }
         }
         if let Some(motion) = &e.motion {
