@@ -2318,6 +2318,109 @@ mod tests {
         );
     }
 
+    /// SPEC-088 review 9 — the pass that finds an ended supervisor's
+    /// generation no longer running can come while that supervisor's final
+    /// close is still pending. It stops the camera the long way: it waits
+    /// out [`SUPERVISOR_STOP_TIMEOUT`], aborts the supervisor inside its
+    /// close and drains the camera. Until the drain succeeds no replacement
+    /// starts and A never reads applied.
+    #[tokio::test]
+    async fn a_pass_during_a_pending_final_close_aborts_and_drains_before_replacing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let end_source = Arc::new(tokio::sync::Notify::new());
+        let recorder = Arc::new(ClipLogRecorder {
+            close_gate: Some(tokio::sync::Semaphore::new(0)),
+            end_first_source: Some(end_source.clone()),
+            ..ClipLogRecorder::default()
+        });
+        let args = Arc::new(reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await);
+        let a = zone_revision(&[]);
+
+        reconcile(&args).await.expect("first pass");
+        wait_until(
+            "precondition: the supervisor applied A and holds an open clip",
+            || recorder.opens() == 1 && status(&args, &a).state == ZoneApplicationState::Applied,
+        )
+        .await;
+        let original = entry_of(&args.handles, 7);
+        let is_original = |h: &HandleMap| {
+            h.lock()
+                .get(&7)
+                .is_some_and(|e| Arc::ptr_eq(&e.task, &original.task))
+        };
+        end_source.notify_one();
+        wait_until("the supervisor's final close began", || {
+            recorder.calls_of(7) == [ClipCall::Open(1), ClipCall::Close(1)]
+        })
+        .await;
+        // The first drain does not finish within its bound.
+        recorder.drains.lock().push_back(Drain::Stalls);
+
+        // Both bounds elapse on the paused clock; every virtual second the
+        // test records what the camera reads as.
+        tokio::time::pause();
+        let began = tokio::time::Instant::now();
+        let pass = tokio::spawn({
+            let args = args.clone();
+            async move { reconcile(&args).await }
+        });
+        let mut seen = Vec::new();
+        while !pass.is_finished() {
+            seen.push((status(&args, &a).state, is_original(&args.handles)));
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let waited = began.elapsed();
+        pass.await
+            .expect("pass task")
+            .expect("pass during the pending close");
+        tokio::time::resume();
+        let aborted_and_kept = original.task.is_finished() && is_original(&args.handles);
+        let before_drain = recorder.calls_of(7);
+        recorder
+            .close_gate
+            .as_ref()
+            .expect("closes are gated")
+            .add_permits(1 << 16);
+        reconcile(&args).await.expect("pass whose drain succeeds");
+        wait_until("the replacement applied A", || {
+            let s = status(&args, &a);
+            s.state == ZoneApplicationState::Applied && s.generation > original.zone_generation
+        })
+        .await;
+        let calls = recorder.calls_of(7);
+        abort_all(&args.handles);
+
+        assert!(
+            waited >= SUPERVISOR_STOP_TIMEOUT * 2,
+            "the pass did not wait out the stop and then the drain: {waited:?}"
+        );
+        assert!(
+            aborted_and_kept,
+            "the supervisor was not aborted in its close, or the camera left the map"
+        );
+        assert!(
+            seen.len() > 2
+                && seen
+                    .iter()
+                    .all(|&(state, original)| state != ZoneApplicationState::Applied && original),
+            "a replacement started or A read applied before the drain succeeded: {seen:?}"
+        );
+        assert_eq!(
+            before_drain,
+            [ClipCall::Open(1), ClipCall::Close(1)],
+            "the camera was torn down before its drain succeeded"
+        );
+        assert_eq!(
+            calls[..3],
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved
+            ],
+            "once the drain succeeded, one pass tears the camera down and replaces it"
+        );
+    }
+
     /// BUG-285 review — the restart a behavior edit triggers used to abort
     /// the old supervisor mid-await. `run_camera` finalizes its open motion
     /// clip only after its frame loop ends, which an abort skips, so every
