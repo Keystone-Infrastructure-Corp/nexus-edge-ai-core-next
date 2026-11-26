@@ -779,7 +779,7 @@ mod controller {
         self as rc, Alert, ControllerConfig, ControllerGuard, EpochChange, EvidenceProducer,
         Motion, RecordingCommand, RecordingControl, RecordingError, RecordingReceipt,
     };
-    use nexus_pipeline::recording_diagnostics::{EvidenceCounts, Transition};
+    use nexus_pipeline::recording_diagnostics::{EvidenceCounts, Transition, TransitionTrace};
     use tokio::sync::{watch, Semaphore};
 
     use super::*;
@@ -1472,6 +1472,161 @@ mod controller {
         };
         // [0, 2 s) before recovery, then from the stale wake at 59.501 s.
         assert!((2_000 + 400..=2_000 + 499).contains(&degraded), "{rows:?}");
+    }
+
+    fn trace(c: &Cam) -> TransitionTrace {
+        c.stats
+            .recording_activity()
+            .trace(1, Instant::now(), Utc::now())
+            .unwrap()
+    }
+
+    /// Review 6's class at legacy's file deadline: clip 1 opened at 30 s
+    /// rotates on the controller's clock at 330 s, between a qualifying
+    /// frame's capture (329.5 s) and its use. The rotation changes no traced
+    /// state, so it moves no traced time: the activity starts at its capture
+    /// and the trace has no gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_file_deadline_between_capture_and_use_moves_no_activity() {
+        let mut c = cam(shadow(10_000), 0, false, false).await;
+        for ms in (0..30_000).step_by(1_000) {
+            c.frame(ms, quiet()).await;
+        }
+        c.frame(30_000, live(true)).await;
+        for ms in (31_000..=329_000).step_by(1_000) {
+            c.frame(ms, live(false)).await;
+        }
+        let (mono, wall) = c.clock(329_500);
+        let arrived = c.producer.arrived(mono, wall);
+        c.send(RecordingCommand::Evidence(arrived), LONG)
+            .await
+            .unwrap();
+        c.until(5, "opened 2 ").await;
+        let person = EvidenceCounts {
+            observed: 1,
+            ..EvidenceCounts::default()
+        };
+        let analysed = c.producer.analysed(
+            mono,
+            wall,
+            AnalysisOutcome::Success,
+            person,
+            Some(live(false)),
+        );
+        c.send(RecordingCommand::Evidence(analysed), LONG)
+            .await
+            .unwrap();
+        let trace = trace(&c);
+        let window: Vec<_> = trace
+            .transitions
+            .iter()
+            .filter(|t| t.at_ms >= 329_000)
+            .map(|t| (t.at_ms, t.legacy_open, t.reason))
+            .collect();
+        assert_eq!(
+            window,
+            [(329_500, true, RecordingReason::Activity)],
+            "{trace:#?}"
+        );
+        assert!(!trace.trace_incomplete, "{trace:#?}");
+    }
+
+    /// A change that must be held is reported, inside a minute too:
+    /// analysis goes stale at 4.001 s (last pass captured at 3 s), and the
+    /// frame captured at 3.9 s is used just after. A person there starts
+    /// activity, a failed pass degraded coverage, both at 3.9 s: neither can
+    /// start before the degradation already traced, so each is held there
+    /// and counted as a clock step back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_change_held_behind_a_stale_wake_is_a_reported_gap() {
+        use RecordingReason::{Activity, DegradedCoverage};
+        for (outcome, observed) in [(AnalysisOutcome::Success, 1), (AnalysisOutcome::Failed, 0)] {
+            let mut c = cam(shadow(1_000), 0, false, false).await;
+            for ms in (0..=3_000).step_by(200) {
+                c.frame(ms, quiet()).await;
+            }
+            let (mono, wall) = c.clock(3_900);
+            let arrived = c.producer.arrived(mono, wall);
+            c.send(RecordingCommand::Evidence(arrived), LONG)
+                .await
+                .unwrap();
+            // The stale wake at 4.001 s, then the pass used at about 4.2 s.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let counts = EvidenceCounts {
+                observed,
+                ..EvidenceCounts::default()
+            };
+            let analysed = c
+                .producer
+                .analysed(mono, wall, outcome, counts, Some(quiet()));
+            c.send(RecordingCommand::Evidence(analysed), LONG)
+                .await
+                .unwrap();
+            let trace = trace(&c);
+            let window: Vec<_> = trace
+                .transitions
+                .iter()
+                .filter(|t| t.at_ms > 3_000)
+                .map(|t| (t.at_ms, t.reason))
+                .collect();
+            match window[..] {
+                [(stale, DegradedCoverage), (held, Activity)] if observed > 0 => {
+                    assert!(stale >= 4_001 && held == stale, "{trace:#?}");
+                }
+                [(stale, DegradedCoverage)] if observed == 0 => {
+                    assert!(stale >= 4_001, "{trace:#?}");
+                }
+                _ => panic!("{outcome:?}: {trace:#?}"),
+            }
+            assert!(trace.trace_incomplete, "{outcome:?}: {trace:#?}");
+            assert_eq!(trace.clock_steps_back, 1, "{outcome:?}: {trace:#?}");
+        }
+    }
+
+    /// Observed: an alert drive is the writer's own decision, traced at
+    /// the controller's now (700 ms after its frame, which took that long
+    /// to analyse). The next frame, captured at 200 ms and used after the
+    /// alert, would have started the activity at its capture: it is held
+    /// at the alert, and the trace reports the gap rather than shortening
+    /// the activity silently.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_alert_drive_between_capture_and_use_is_a_reported_gap() {
+        let mut c = observed_and_quiet(1, 5_000).await;
+        let t = c.elapsed_ms();
+        let (mono, wall) = c.clock(t);
+        let arrived = c.producer.arrived(mono, wall);
+        c.send(RecordingCommand::Evidence(arrived), LONG)
+            .await
+            .unwrap();
+        sleep_until(&c, t + 700).await;
+        let analysed = c.producer.analysed(
+            mono,
+            wall,
+            AnalysisOutcome::Success,
+            EvidenceCounts::default(),
+            Some(quiet()),
+        );
+        c.send(RecordingCommand::Evidence(analysed), LONG)
+            .await
+            .unwrap();
+        let event = c.event(t).await;
+        assert_eq!(clip_id(&c.alert(t, &event).await), Some(2));
+        c.frame_within(t + 200, AnalysisOutcome::Success, 1, quiet(), LONG)
+            .await
+            .unwrap();
+        let trace = trace(&c);
+        let opened: Vec<_> = trace
+            .transitions
+            .iter()
+            .filter(|t| t.legacy_open)
+            .map(|t| (t.wall_at, t.reason))
+            .collect();
+        let [.., (alert_at, RecordingReason::Activity)] = opened[..] else {
+            panic!("{trace:#?}");
+        };
+        assert!(alert_at >= c.clock(t + 700).1, "{trace:#?}");
+        assert!(trace.trace_incomplete, "{trace:#?}");
+        assert_eq!(trace.clock_steps_back, 1, "{trace:#?}");
     }
 
     /// A slow open is waited for, never raced: the frames behind it time

@@ -432,9 +432,9 @@ pub struct TransitionTrace {
     pub transitions: Vec<Transition>,
     pub trace_incomplete: bool,
     /// Why it is incomplete: older transitions the full ring dropped, clock
-    /// steps back (that transition, or a change from evidence captured in a
-    /// minute whose row was already written, was held at the previous
-    /// time), and the collector's last failure.
+    /// steps back (a transition, or evidence that would have changed the
+    /// trace earlier, was held at the latest traced time), and the
+    /// collector's last failure.
     pub dropped_transitions: u64,
     pub clock_steps_back: u64,
     pub collector_error: Option<String>,
@@ -637,8 +637,14 @@ pub struct ShadowRecording {
     /// Index and first frame's wall clock of the minute being counted.
     minute: Option<(u64, DateTime<Utc>)>,
     episode: Option<Episode>,
-    /// The latest frame's clock, wall clock and shadow reason.
+    /// The latest traced clock, wall clock and shadow reason.
     last: Option<(u64, DateTime<Utc>, RecordingReason)>,
+    /// Capture of the newest evidence used: none captured before it is used
+    /// after it, so tracing up to it can never hold later evidence.
+    used_ms: Option<u64>,
+    /// The current state was traced later than evidence showed it, and
+    /// that was counted: evidence agreeing with it is no new gap.
+    late: bool,
     shared: Arc<Mutex<ShadowState>>,
 }
 
@@ -717,6 +723,8 @@ impl ShadowRecording {
             minute: None,
             episode: None,
             last: None,
+            used_ms: None,
+            late: false,
             shared,
         })
     }
@@ -786,6 +794,7 @@ impl ShadowRecording {
     ) -> RecordingIntent {
         let origin = *self.shared.lock().origin.get_or_insert(origin);
         let at = millis(captured_mono, origin);
+        self.used_ms = self.used_ms.max(Some(at));
         let now_ms = millis(now, origin).max(at);
         let policy = self.policy.get_or_insert_with(|| {
             RecordingActivityPolicy::new(self.post_roll_ms, self.stale_after_ms, at)
@@ -835,31 +844,46 @@ impl ShadowRecording {
     ///
     /// A minute is cut, and its row written, when [`Self::record`] first
     /// traces past its end: evidence at its capture, once the frontier has
-    /// passed it, or a wake at the controller's now. This timer waits until
-    /// the minute's end is the stale deadline (at most half a minute)
-    /// behind: a frontier still short of it is then stale, so the cut lands
-    /// where a stale-driven transition does, and while analysis is healthy
-    /// the stale deadline wakes first. Evidence used late inside a minute
-    /// not yet cut is credited at its capture; evidence captured in a
-    /// minute already cut is held at the latest traced time, and a change
-    /// it makes there is reported as a gap.
+    /// passed it, or a wake at the controller's now that changes the traced
+    /// state or is this timer's. This timer waits until the minute's end is
+    /// the stale deadline (at most half a minute) behind: a frontier still
+    /// short of it is then stale, so the cut lands where a stale-driven
+    /// transition does, and while analysis is healthy the stale deadline
+    /// wakes first. Evidence used late inside a minute not yet cut is
+    /// credited at its capture; evidence captured in a minute already cut is
+    /// held at the latest traced time, and a change it makes there is
+    /// reported as a gap.
     pub fn next_minute(&self) -> Option<Instant> {
         let origin = self.shared.lock().origin?;
         let (index, _) = self.minute?;
+        Some(origin + std::time::Duration::from_millis(self.cut_ms(index)))
+    }
+
+    /// When the minute timer cuts minute `index`.
+    fn cut_ms(&self, index: u64) -> u64 {
         // shortcut: capped so the wake never passes the next minute's end (one row per cut cannot split it); a stale deadline over 30 s can then cut ahead of a still-fresh frontier, reported as a gap. Write a row per elapsed minute if those deadlines matter.
-        let cut_ms = (index + 1) * MINUTE_MS + self.stale_after_ms.min(MINUTE_MS / 2);
-        Some(origin + std::time::Duration::from_millis(cut_ms))
+        (index + 1) * MINUTE_MS + self.stale_after_ms.min(MINUTE_MS / 2)
     }
 
     /// Trace the state once the writer acted on the latest answer, as of
     /// `captured_mono` read with the wall clock `captured_at`: an
     /// evidence-driven state at its frame's capture, one the policy's
-    /// deadline drove at the caller's now. A time before the latest traced
-    /// one is held there, its wall clock run on with it: evidence used late
-    /// never runs the trace back, and a change from one whose minute is
-    /// already cut is a gap ([`Self::next_minute`]). `writer_clip` is the
-    /// open clip, `held` that it is open only for the minimum duration.
+    /// deadline or the writer decided at the caller's now. `writer_clip` is
+    /// the open clip, `held` that it is open only for the minimum duration.
     /// Returns the summaries this finished.
+    ///
+    /// A wake past the evidence used that changes no traced state, a file
+    /// rotation say, traces nothing until the minute timer is due: evidence
+    /// captured before it may still be used, and keeps its capture time.
+    /// A change at now (going stale; in observed an alert, a retried open or
+    /// the end of a hold, the writer's own decisions) is traced there and
+    /// can come before such evidence. A time before the latest traced one
+    /// is held there, its wall clock run on with it, so the trace never runs
+    /// back; a held record that changes the state, or the newest evidence's
+    /// held policy state that differs from the one traced at its capture (it
+    /// would have started or ended an interval earlier), is counted as a
+    /// clock step back. So a change at now never shortens an
+    /// evidence-driven interval silently.
     pub fn record(
         &mut self,
         captured_mono: Instant,
@@ -867,30 +891,34 @@ impl ShadowRecording {
         writer_clip: Option<ClipId>,
         held: bool,
     ) -> ShadowWrites {
+        use RecordingReason::{Activity, DegradedCoverage, MinimumDuration, PostRoll, Quiet};
         let mut writes = ShadowWrites::default();
         let Some(intent) = self.intent else {
             return writes;
         };
-        let reason = if held {
-            RecordingReason::MinimumDuration
-        } else {
-            intent.reason
-        };
+        let reason = if held { MinimumDuration } else { intent.reason };
         let mut shared = self.shared.lock();
         let origin = *shared.origin.get_or_insert(captured_mono);
-        let mut at = millis(captured_mono, origin);
-        let mut held_past_its_minute = false;
+        let captured = millis(captured_mono, origin);
+        let mut at = captured;
         if let Some((last, ..)) = self.last.filter(|&(last, ..)| last > at) {
-            held_past_its_minute = self
-                .minute
-                .is_some_and(|(current, _)| at / MINUTE_MS < current);
             captured_at += chrono::Duration::milliseconds((last - at) as i64);
             at = last;
         }
+        let state = (writer_clip.is_some(), intent.open, reason);
+        let unchanged = shared
+            .diagnostics
+            .state
+            .is_some_and(|s| (s.legacy_open, s.shadow_open, s.reason) == state);
+        let traced = !(unchanged
+            && self.used_ms.is_some_and(|used| captured > used)
+            && self
+                .minute
+                .is_some_and(|(current, _)| at < self.cut_ms(current)));
         let index = at / MINUTE_MS;
         match self.minute {
             // Forward only: a minute index is written once.
-            Some((current, started)) if index > current => {
+            Some((current, started)) if traced && index > current => {
                 // Closed at its own end; this frame counts in the next one.
                 let counters = shared.diagnostics.take_minute((current + 1) * MINUTE_MS);
                 writes.minute = Some(minute_row(
@@ -909,18 +937,42 @@ impl ShadowRecording {
 
         shared.active_clip = writer_clip;
         let d = &mut shared.diagnostics;
-        if let Some((outcome, counts, summary)) = self.pass.take() {
-            d.observe(outcome, counts, &summary);
+        if traced {
+            let mut failed = false;
+            if let Some((outcome, counts, summary)) = self.pass.take() {
+                failed = outcome == AnalysisOutcome::Failed;
+                d.observe(outcome, counts, &summary);
+            }
+            let then = d
+                .ring
+                .iter()
+                .rev()
+                .find(|t| t.at_ms <= captured)
+                .map(|t| t.reason);
+            let transitions = d.transitions;
+            d.transition(at, captured_at, writer_clip.is_some(), intent.open, reason);
+            let changed = d.transitions > transitions;
+            if at > captured {
+                // Held. Only the newest evidence's state is its own (older evidence moves no frontier back);
+                // degraded coverage is judged when used unless this pass failed; a hold is the writer's own.
+                let driven = matches!(reason, Activity | PostRoll | Quiet)
+                    || (failed && reason == DegradedCoverage);
+                let policy = |r| if r == MinimumDuration { Quiet } else { r };
+                let earlier = driven
+                    && self.used_ms == Some(captured)
+                    && then.is_some_and(|r| policy(r) != reason);
+                if changed || (earlier && !self.late) {
+                    d.step_back();
+                    self.late = true;
+                }
+            } else if changed {
+                self.late = false;
+            }
+            self.last = Some((at, captured_at, reason));
         }
-        let transitions = d.transitions;
-        d.transition(at, captured_at, writer_clip.is_some(), intent.open, reason);
-        if held_past_its_minute && d.transitions > transitions {
-            // A change whose own minute's row is written lands in a later one.
-            d.step_back();
-        }
-        self.last = Some((at, captured_at, reason));
 
         if self.episode.as_ref().map(|e| e.clip_id) != writer_clip {
+            // shortcut: a rotation at a wake that traces nothing splits the clips' elapsed at the latest traced time, not at the rotation; defer the episode row until the trace passes it if per-clip splits must be exact.
             let elapsed = d.elapsed().legacy_open;
             writes.episode = self.episode.take().map(|e| {
                 episode_row(

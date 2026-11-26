@@ -640,7 +640,9 @@ impl Controller {
             .map(|at| at + Duration::from_millis(MAX_CLIP_DURATION_MS as u64))
     }
 
-    /// Act on the controller's own clock: no frame needed.
+    /// Act on the controller's own clock: no frame needed. Its trace moves
+    /// traced time only for a change or a due minute cut
+    /// ([`ShadowRecording::record`]).
     async fn wake(&mut self) {
         let (now, wall) = self.now();
         let stalled = self.writing()
@@ -907,6 +909,9 @@ impl Controller {
         }
         self.flush_deferred_close().await;
         if self.observed {
+            // The writer's own decision, traced now; evidence captured
+            // before it but used after is held there and, if it would have
+            // changed the trace earlier, reported ([`ShadowRecording::record`]).
             let (now, wall) = self.now();
             self.trace(now, wall).await;
         }
