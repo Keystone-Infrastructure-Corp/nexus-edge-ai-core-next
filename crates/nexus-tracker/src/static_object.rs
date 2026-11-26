@@ -22,6 +22,7 @@
 //! filter is already scoped to its camera). The on-disk registry is
 //! the only cross-restart state.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -265,6 +266,27 @@ impl StaticObjectFilter {
     /// tests; no production code should mutate the registry directly.
     pub fn anchors(&self) -> &[StaticAnchor] {
         &self.anchors
+    }
+
+    /// The anchors that take part in suppression on `frame`: all of them
+    /// for a legacy camera; for v2 only those whose center is inside a
+    /// current Parking polygon (outside anchors wait out their TTL).
+    pub fn scoped_anchors(&self, frame: &Frame) -> Cow<'_, [StaticAnchor]> {
+        let Some(v2) = &self.parking_v2 else {
+            return Cow::Borrowed(&self.anchors);
+        };
+        let (fw, fh) = (frame.width.max(1) as f32, frame.height.max(1) as f32);
+        Cow::Owned(
+            self.anchors
+                .iter()
+                .filter(|a| {
+                    v2.zones
+                        .iter()
+                        .any(|z| point_in_normalized_polygon(a.center_x / fw, a.center_y / fh, z))
+                })
+                .cloned()
+                .collect(),
+        )
     }
 
     /// Is `label` eligible for static-anchor promotion on this camera?
@@ -2393,5 +2415,48 @@ mod tests {
             v2_step(&mut lone, ms, HD, vec![coasting(vehicle(1, 400.0, 500.0))]);
         }
         assert!(lone.anchors().is_empty());
+    }
+
+    fn anchor_at(x: f32, y: f32) -> StaticAnchor {
+        StaticAnchor {
+            label: "vehicle.car".into(),
+            center_x: x,
+            center_y: y,
+            last_seen_unix_ms: Some(0),
+        }
+    }
+
+    /// Whether a person standing on (x, y) is stamped near a static vehicle
+    /// when the annotator is handed the filter's scoped anchors.
+    fn stamped_near_anchor(f: &StaticObjectFilter, x: f32, y: f32) -> bool {
+        use crate::annotator::TrackAnnotator;
+        let mut fr = frame(1, 0, 0);
+        (fr.width, fr.height) = HD;
+        let mut objs = vec![person(9, x, y)];
+        TrackAnnotator::new(nexus_config::AnnotatorConfig::default()).annotate(
+            &fr,
+            &[],
+            &f.scoped_anchors(&fr),
+            &mut objs,
+        );
+        objs[0]
+            .attributes
+            .contains_key("motion.near_static_vehicle_id")
+    }
+
+    /// SPEC-077: a v2 camera ignores anchors outside Parking, so the
+    /// annotator must not see them either; legacy still sees every anchor.
+    #[test]
+    fn v2_annotator_sees_only_in_parking_anchors() {
+        let mut v2 = v2_filter();
+        let mut legacy = StaticObjectFilter::new(StaticObjectConfig::default(), 1, None);
+        for f in [&mut v2, &mut legacy] {
+            f.anchors.push(anchor_at(400.0, 500.0)); // stall
+            f.anchors.push(anchor_at(1400.0, 700.0)); // lane, a legacy-era anchor
+        }
+        assert!(stamped_near_anchor(&v2, 400.0, 500.0));
+        assert!(!stamped_near_anchor(&v2, 1400.0, 700.0));
+        assert!(stamped_near_anchor(&legacy, 400.0, 500.0));
+        assert!(stamped_near_anchor(&legacy, 1400.0, 700.0));
     }
 }

@@ -1132,9 +1132,9 @@ async fn run_camera(
                     // can stamp `motion.near_static_vehicle_*`.
                     let anchors = static_filter
                         .as_ref()
-                        .map(|f| f.anchors())
-                        .unwrap_or(&[]);
-                    annotator.annotate(&frame, &zones, anchors, &mut tracked);
+                        .map(|f| f.scoped_anchors(&frame))
+                        .unwrap_or_default();
+                    annotator.annotate(&frame, &zones, &anchors, &mut tracked);
                 }
                 if let Some(sf) = static_filter.as_mut() {
                     let _g = info_span!("frame.static_filter", filter = sf.name()).entered();
