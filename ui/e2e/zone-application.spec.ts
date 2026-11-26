@@ -776,4 +776,77 @@ test.describe("zone application", () => {
     await finish.locator("..").getByRole("button", { name: "Cancel" }).click();
     await expect(status).toContainText("Applied to camera", POLL);
   });
+
+  test("a sketch keeps the zones it was drawn over when another operator's save arrives", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR, DOCK]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    await page.getByRole("button", { name: "New zone" }).click();
+    await clickCanvas(page, 0.3, 0.6);
+    await clickCanvas(page, 0.5, 0.6);
+    await clickCanvas(page, 0.4, 0.8);
+    const finish = page.getByRole("button", { name: "Finish (3 pt)" });
+    await expect(finish).toBeVisible();
+
+    // Another operator removes the Door exclusion, and the editor reads that save.
+    receipt.set(applied(2));
+    await saveZonesElsewhere(page, id, [DOCK]);
+    const remote = page.waitForResponse(
+      async (r) =>
+        new URL(r.url()).pathname === `/api/v1/admin/cameras/${id}/config-snapshot` &&
+        ((await r.json()) as { settings: { zones: Zone[] } }).settings.zones.length === 1,
+    );
+    await steadyRead(page);
+    await remote;
+    await expect(status).toContainText("Unsaved changes; zones changed elsewhere", POLL);
+    await expect(zoneRow(page, "Door")).toBeVisible();
+
+    await finish.click();
+    for (const name of ["Door", "Loading dock", "Zone 3"]) await expect(zoneRow(page, name)).toBeVisible();
+    await expect(status).toContainText("Unsaved changes; zones changed elsewhere", POLL);
+    await neverApplied(page, 1_000);
+
+    const put = page.waitForRequest(
+      (r) => r.method() === "PUT" && new URL(r.url()).pathname === `/api/v1/cameras/${id}`,
+    );
+    await page.getByRole("button", { name: /^save$/i }).click();
+    const sent = ((await put).postDataJSON() as { zones: Zone[] }).zones;
+    expect(sent.slice(0, 2)).toEqual([DOOR, DOCK]);
+    expect(sent.map((z) => z.name)).toEqual(["Door", "Loading dock", "Zone 3"]);
+    await expect(status).toContainText("Applied to camera", POLL);
+  });
+
+  test("a sketch cancelled after another operator's save shows that save", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    await page.getByRole("button", { name: "New zone" }).click();
+    await clickCanvas(page, 0.6, 0.6);
+    receipt.set(applied(2));
+    await saveZonesElsewhere(page, id, [DOCK]);
+    const remote = page.waitForResponse(
+      async (r) =>
+        new URL(r.url()).pathname === `/api/v1/admin/cameras/${id}/config-snapshot` &&
+        ((await r.json()) as { settings: { zones: Zone[] } }).settings.zones[0]?.id === DOCK.id,
+    );
+    await steadyRead(page);
+    await remote;
+    await expect(zoneRow(page, "Door")).toBeVisible();
+
+    const finish = page.getByRole("button", { name: /^Finish/ });
+    await finish.locator("..").getByRole("button", { name: "Cancel" }).click();
+    await expect(zoneRow(page, "Loading dock")).toBeVisible();
+    await expect(zoneRow(page, "Door")).toHaveCount(0);
+    await expect(status).toContainText("Applied to camera", POLL);
+  });
 });

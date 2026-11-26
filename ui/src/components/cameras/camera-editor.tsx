@@ -454,10 +454,19 @@ export function CameraEditor({
     retry: false,
     refetchOnWindowFocus: false,
   });
+  // A polygon being drawn is an edit too, though not yet in the draft.
+  const [sketching, setSketching] = useState(false);
   // Install a snapshot read begun after the latest save; a clean view shows
-  // its zones, a dirty edit keeps the operator's.
+  // its zones, a dirty edit keeps the operator's. A sketch holds it until
+  // finished or cancelled: it joins the zones it was drawn over, never newer.
   const snap = snapQ.data;
-  if (snap && snap !== zoneView.installed?.read && !saving && snap.seq > zoneSaveSeq(camera.id)) {
+  if (
+    snap &&
+    snap !== zoneView.installed?.read &&
+    !saving &&
+    !sketching &&
+    snap.seq > zoneSaveSeq(camera.id)
+  ) {
     const clean = draft.zones === zoneView.synced;
     setZoneView((v) => ({
       ...v,
@@ -469,8 +478,6 @@ export function CameraEditor({
   }
 
   const sentZones = mutation.isPending ? mutation.variables?.zones : zoneView.synced;
-  // A polygon being drawn is an edit too, though not yet in the draft.
-  const [sketching, setSketching] = useState(false);
   const zoneDraft: ZoneDraftState = {
     phase:
       sketching || draft.zones !== sentZones ? "dirty" : saving ? "saving" : zoneView.awaiting ? "saved" : "clean",
