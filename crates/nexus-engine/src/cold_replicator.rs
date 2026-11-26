@@ -2797,6 +2797,60 @@ mod tests {
         assert_eq!(c.ordinary.attempted_bytes, 0, "no motion tick ran");
     }
 
+    /// Codex review 9 — the evictor unlinks an alert clip (cutoff `now`, as
+    /// the storage-pressure ladder passes) while its PUT is in flight with
+    /// the bytes already read. The PUT still lands, so the clip counts
+    /// delivered and not lost.
+    #[tokio::test]
+    async fn recording_delivery_alert_clip_evicted_mid_upload_counts_delivered_not_lost() {
+        let (store, _clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 11, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let release = Arc::new(Notify::new());
+        let hook_release = release.clone();
+        *backend.first_put_hook.lock() = Some(Box::pin(async move {
+            hook_release.notified().await;
+        }));
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let upload = {
+            let cfg = announce_cfg(clips_dir.clone(), Arc::new(TunnelOutbox::new()));
+            let store = store.clone();
+            tokio::spawn(async move { alert_upload_pass(&cfg, &store, &registry).await })
+        };
+        for _ in 0..200 {
+            if !backend.put_paths.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(backend.put_paths.lock().len(), 1, "alert put in flight");
+
+        let evicted = crate::alert_clip_evict::reclaim_evictable_alert_clips(
+            &store,
+            &clips_dir,
+            Utc::now(),
+            10,
+        )
+        .await;
+        assert_eq!(evicted, 1, "the hot file is reclaimed mid-upload");
+        release.notify_one();
+        upload.await.unwrap();
+
+        let c = hour_counters(&store).await.alert;
+        assert_eq!(c.delivered_bytes, 11);
+        assert_eq!(
+            (c.evicted_before_upload_bytes, c.evicted_before_upload_count),
+            (0, 0),
+            "delivered, so not lost"
+        );
+    }
+
     /// SPEC-090 — while its PUT is in flight a clip is marked in flight
     /// and still counted in `ready`; once its completion commits it is in
     /// neither.

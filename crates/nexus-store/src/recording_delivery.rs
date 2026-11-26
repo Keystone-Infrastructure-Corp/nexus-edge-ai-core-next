@@ -481,6 +481,42 @@ pub(crate) async fn add_to_bucket(
     Ok(())
 }
 
+/// A clip counted evicted before upload at `evicted_at` was delivered after
+/// all: remove that loss (one clip, `size_bytes`) from the bucket that
+/// counted it. Callers run it once, in the completion's transaction.
+pub(crate) async fn take_back_loss(
+    conn: &mut SqliteConnection,
+    camera_id: CameraId,
+    source: RecordingSource,
+    evicted_at: &str,
+    size_bytes: i64,
+) -> Result<(), StoreError> {
+    let lost = DeliveryCounters::evicted(size_bytes);
+    let minute = crate::motion::parse_ts(evicted_at)?
+        .timestamp()
+        .div_euclid(60)
+        * 60;
+    // Never inserts: a pruned bucket stays gone rather than going negative,
+    // and one before `accounting_since` is left alone, since a clock jump
+    // may have pruned and re-used its minute.
+    sqlx::query(
+        "UPDATE recording_minute_buckets
+            SET evicted_before_upload_bytes = evicted_before_upload_bytes - ?1,
+                evicted_before_upload_count = evicted_before_upload_count - ?2
+          WHERE minute_utc = ?3 AND camera_id = ?4 AND source_kind = ?5
+            AND ?6 >= (SELECT accounting_since FROM recording_delivery_baseline WHERE id = 1)",
+    )
+    .bind(lost.evicted_before_upload_bytes)
+    .bind(lost.evicted_before_upload_count)
+    .bind(minute)
+    .bind(camera_id)
+    .bind(source.as_str())
+    .bind(evicted_at)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 const COUNTER_SUMS: &str = "SUM(generated_bytes), SUM(generated_unknown_size_count),
     SUM(recorded_ms), SUM(delivered_bytes), SUM(attempted_bytes), SUM(retry_count),
     SUM(failure_count), SUM(evicted_before_upload_bytes), SUM(evicted_before_upload_count)";

@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, TimeZone, Utc};
 use nexus_config::{CameraConfig, StoreConfig};
 use nexus_store::{
     AlertClipColdMark, ClipClose, ClipColdMark, DeliveryCounters, DeliveryWindow, NewAlertClip,
@@ -677,6 +677,141 @@ async fn recording_delivery_counts_camera_deletion_as_eviction_before_upload() {
         "the earlier eviction (80) plus the cascaded clip (60), once each"
     );
     assert_eq!(snap.ordinary.ready.count + snap.alert.ready.count, 0);
+}
+
+/// Codex review 9: an upload reads an alert clip, the evictor unlinks it
+/// and counts it lost, then the PUT succeeds. The completion takes the
+/// loss back from the bucket that counted it, so eviction then completion
+/// counts exactly what completion then eviction does, and a duplicate
+/// completion changes nothing.
+#[tokio::test]
+async fn recording_delivery_reconciles_a_loss_when_the_upload_completes_after_eviction() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let started = Utc::now() - Duration::minutes(5);
+    let late = alert_clip(&store, 1, started).await;
+    let early = alert_clip(&store, 2, started).await;
+    for id in [late, early] {
+        store
+            .mark_alert_clip_ready(id, 5_000, 1_000, Some(&"b".repeat(64)))
+            .await
+            .unwrap();
+    }
+    store.mark_alert_clip_evicted(late).await.unwrap();
+    let minute: i64 = sqlx::query_scalar(
+        "SELECT minute_utc FROM recording_minute_buckets WHERE evicted_before_upload_count > 0",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let done = AlertClipColdMark {
+        cold_handle: "cold".into(),
+        cold_path: "a.mp4".into(),
+        cold_uploaded_at: Utc.timestamp_opt(minute + 30, 0).unwrap(),
+    };
+    for id in [late, early] {
+        store
+            .mark_alert_clip_cold_uploaded(id, &done, Some(1_000))
+            .await
+            .unwrap();
+    }
+    store.mark_alert_clip_evicted(early).await.unwrap();
+
+    let sample =
+        |at: i64| store.recording_delivery_stats(move || Utc.timestamp_opt(at, 0).unwrap(), None);
+    let inside = sample(minute + 20).await.unwrap();
+    let after = sample(minute + 120).await.unwrap();
+    for (a, what) in [
+        (inside.since_window_end.alert, "since_window_end"),
+        (hour(&after).core.alert, "1 h window"),
+    ] {
+        assert_eq!(
+            (
+                a.delivered_bytes,
+                a.evicted_before_upload_bytes,
+                a.evicted_before_upload_count
+            ),
+            (2_000, 0, 0),
+            "{what}: both clips delivered, neither lost"
+        );
+    }
+    let cams = &hour(&after).cameras;
+    assert_eq!(
+        cams[0].counters.alert, cams[1].counters.alert,
+        "eviction then completion counts what completion then eviction does"
+    );
+
+    store
+        .mark_alert_clip_cold_uploaded(late, &done, Some(1_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        sample(minute + 120).await.unwrap(),
+        after,
+        "a duplicate completion changes nothing"
+    );
+}
+
+/// A loss whose bucket was pruned, or that was counted before an
+/// accounting restart, is not taken back: no bucket is re-created or
+/// driven negative, and the restarted one keeps its loss.
+#[tokio::test]
+async fn recording_delivery_reconciles_no_loss_outside_kept_buckets() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let started = Utc::now() - Duration::minutes(5);
+    let pruned = alert_clip(&store, 1, started).await;
+    let restarted = alert_clip(&store, 2, started).await;
+    for id in [pruned, restarted] {
+        store
+            .mark_alert_clip_ready(id, 5_000, 1_000, Some(&"b".repeat(64)))
+            .await
+            .unwrap();
+        store.mark_alert_clip_evicted(id).await.unwrap();
+    }
+    sqlx::query("DELETE FROM recording_minute_buckets WHERE camera_id = 1")
+        .execute(store.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE recording_delivery_baseline SET accounting_since = ?")
+        .bind((Utc::now() + Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Millis, true))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    let done = AlertClipColdMark {
+        cold_handle: "cold".into(),
+        cold_path: "a.mp4".into(),
+        cold_uploaded_at: Utc::now(),
+    };
+    for id in [pruned, restarted] {
+        store
+            .mark_alert_clip_cold_uploaded(id, &done, Some(1_000))
+            .await
+            .unwrap();
+    }
+
+    let negative: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM recording_minute_buckets
+          WHERE evicted_before_upload_bytes < 0 OR evicted_before_upload_count < 0",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(negative, 0, "no bucket goes negative");
+    let snap = store
+        .recording_delivery_stats(|| Utc::now() + Duration::minutes(2), None)
+        .await
+        .unwrap();
+    let a = hour(&snap).core.alert;
+    assert_eq!(
+        (
+            a.delivered_bytes,
+            a.evicted_before_upload_bytes,
+            a.evicted_before_upload_count
+        ),
+        (2_000, 1_000, 1),
+        "only the loss counted before the restart stays"
+    );
 }
 
 /// The minute holding the sample is outside every window, so a loss in it

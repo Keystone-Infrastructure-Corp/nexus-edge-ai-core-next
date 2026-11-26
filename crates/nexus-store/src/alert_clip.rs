@@ -14,13 +14,15 @@
 //!       └──build error──> failed
 //! ```
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use nexus_types::CameraId;
 
-use crate::recording_delivery::{add_to_bucket, DeliveryCounters, RecordingSource, ALERT_GATES};
+use crate::recording_delivery::{
+    add_to_bucket, take_back_loss, DeliveryCounters, RecordingSource, ALERT_GATES,
+};
 use crate::{Store, StoreError};
 
 /// Primary key of an `alert_clips` row.
@@ -266,16 +268,22 @@ impl Store {
     /// SPEC-090 — every alert evictor (the delivered/grace sweep and the
     /// missing-file scan) ends here, so an undelivered clip at or after
     /// the enrollment floor is counted as evicted before upload, once.
+    /// The time is kept in `acct_evicted_at` so a PUT that already read
+    /// the file and completes later can take the loss back.
     pub async fn mark_alert_clip_evicted(&self, id: AlertClipId) -> Result<(), StoreError> {
         let floor = self.eviction_floor().await;
+        let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(&format!(
-            "UPDATE alert_clips SET state = 'evicted' WHERE id = ?1 AND state = 'ready'
-             RETURNING camera_id, size_bytes, (cold_uploaded_at IS NULL AND {}) AS lost",
+            "UPDATE alert_clips SET state = 'evicted',
+                    acct_evicted_at = CASE WHEN cold_uploaded_at IS NULL AND {} THEN ?3 END
+              WHERE id = ?1 AND state = 'ready'
+             RETURNING camera_id, size_bytes, acct_evicted_at IS NOT NULL AS lost",
             ALERT_GATES.after_floor
         ))
         .bind(id)
         .bind(floor)
+        .bind(now.to_rfc3339_opts(SecondsFormat::Millis, true))
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(r) = row.filter(|r| r.get::<bool, _>(2)) {
@@ -285,7 +293,7 @@ impl Store {
                 &mut tx,
                 r.get(0),
                 RecordingSource::Alert,
-                Utc::now(),
+                now,
                 &evicted,
             )
             .await?;
@@ -317,22 +325,21 @@ impl Store {
         payload_bytes: Option<i64>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        let res = sqlx::query(
+        let evicted_at: Option<String> = sqlx::query_scalar(
             "UPDATE alert_clips
                 SET cold_handle = ?, cold_path = ?, cold_uploaded_at = ?
-              WHERE id = ?",
+              WHERE id = ?
+              RETURNING acct_evicted_at",
         )
         .bind(&mark.cold_handle)
         .bind(&mark.cold_path)
         .bind(mark.cold_uploaded_at.to_rfc3339())
         .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        if res.rows_affected() == 0 {
-            return Err(StoreError::NotFound(format!("alert_clip id={id}")));
-        }
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("alert_clip id={id}")))?;
         let counted = sqlx::query(
-            "UPDATE alert_clips SET acct_delivered = 1
+            "UPDATE alert_clips SET acct_delivered = 1, acct_evicted_at = NULL
               WHERE id = ? AND acct_delivered = 0
               RETURNING camera_id, size_bytes",
         )
@@ -340,6 +347,9 @@ impl Store {
         .fetch_optional(&mut *tx)
         .await?;
         if let Some(r) = counted {
+            if let Some(at) = evicted_at {
+                take_back_loss(&mut tx, r.get(0), RecordingSource::Alert, &at, r.get(1)).await?;
+            }
             let delivered = DeliveryCounters {
                 delivered_bytes: payload_bytes.unwrap_or_else(|| r.get(1)).max(0),
                 ..DeliveryCounters::default()

@@ -47,6 +47,11 @@ INSERT OR IGNORE INTO recording_delivery_baseline (id, accounting_since)
 ALTER TABLE motion_clips ADD COLUMN acct_generated INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE motion_clips ADD COLUMN acct_delivered INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE alert_clips ADD COLUMN acct_delivered INTEGER NOT NULL DEFAULT 0;
+-- When the evictor counted an alert clip lost (RFC 3339, ms, Z — the
+-- `accounting_since` shape). A PUT that read the file before the unlink
+-- can still complete; its delivery takes that loss back from the same
+-- bucket and clears this.
+ALTER TABLE alert_clips ADD COLUMN acct_evicted_at TEXT;
 
 -- One-time baseline: work that already happened is marked counted, so it
 -- never lands in a bucket. Open clips and the undelivered backlog stay
