@@ -1,6 +1,7 @@
 # Canonical copy: nexus-home/ci/.github/workflows/factory-route.yml. Copy it verbatim.
-# Routes a work-order issue by its factory:<size> label. factory:medium is handled by
-# claude.yml. An assigned issue has been claimed locally and is left alone.
+# Routes a work-order issue by its factory:<size> label. Every build runs on Claude:
+# claude.yml builds factory:small and factory:medium, and this hands factory:large to the
+# owner. An assigned issue has been claimed locally and is left alone.
 name: Factory route
 
 on:
@@ -17,8 +18,7 @@ concurrency:
 jobs:
   route:
     if: >-
-      toJSON(github.event.issue.assignees) == '[]' &&
-      (github.event.label.name == 'factory:small' || github.event.label.name == 'factory:large')
+      toJSON(github.event.issue.assignees) == '[]' && github.event.label.name == 'factory:large'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     env:
@@ -32,28 +32,6 @@ jobs:
           spec="$(gh issue view "$ISSUE" --repo "$REPO" --json labels \
             --jq '.labels[].name | select(test("^spec:SPEC-[0-9]+$")) | ltrimstr("spec:")' | head -n 1)"
           echo "SPEC=$spec" >> "$GITHUB_ENV"
-
-      - name: Assign the Copilot cloud agent
-        if: github.event.label.name == 'factory:small'
-        env:
-          # An App installation token cannot start the Copilot agent; this is the seat holder's PAT.
-          COPILOT_ASSIGN_TOKEN: ${{ secrets.COPILOT_ASSIGN_TOKEN }}
-        run: |
-          # Assigning Copilot starts the build, and work without a spec goes to design first.
-          if [ -z "$SPEC" ]; then
-            gh issue comment "$ISSUE" --repo "$REPO" --body \
-              "factory:small: no \`spec:SPEC-NNN\` label, so there is nothing to build yet. Write and approve a spec first."
-            exit 0
-          fi
-          if [ -z "$COPILOT_ASSIGN_TOKEN" ]; then
-            gh issue comment "$ISSUE" --repo "$REPO" --body \
-              "factory:small: \`COPILOT_ASSIGN_TOKEN\` is not set, so this was not assigned. Owner: assign Copilot on this issue and tell it to build $SPEC with the implement-loop skill."
-            exit 0
-          fi
-          # Every build runs implement-loop; the repo's AGENTS.md says so too, as a backstop.
-          GH_TOKEN="$COPILOT_ASSIGN_TOKEN" gh api --method POST \
-            "/repos/$REPO/issues/$ISSUE/assignees" -f 'assignees[]=copilot-swe-agent[bot]' \
-            -f "agent_assignment[custom_instructions]=Build $SPEC with the implement-loop skill: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md, and follow it on the vault record $SPEC. Its final review runs the requesting-code-review skill." >/dev/null
 
       - name: Hand large builds to the owner
         if: github.event.label.name == 'factory:large'

@@ -38,7 +38,8 @@ jobs:
       (github.event_name == 'issues' && github.event.action == 'opened' &&
         (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')) &&
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.issue.author_association)) ||
-      (github.event_name == 'issues' && github.event.action == 'labeled' && github.event.label.name == 'factory:medium') ||
+      (github.event_name == 'issues' && github.event.action == 'labeled' &&
+        (github.event.label.name == 'factory:small' || github.event.label.name == 'factory:medium')) ||
       (github.event_name == 'pull_request' && github.event.label.name == 'factory:fix-ci' &&
         github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
@@ -88,7 +89,7 @@ jobs:
               --jq '[.labels[].name | select(startswith("spec:")) | sub("^spec:"; "")] | first // ""')
             # The label text goes into the prompt, so accept only the SPEC-NNN shape.
             if ! printf '%s' "$spec" | grep -Eq '^SPEC-[0-9]+$'; then
-              echo "::error::factory:medium needs a spec:SPEC-NNN label (found '${spec}')"
+              echo "::error::a factory build needs a spec:SPEC-NNN label (found '${spec}')"
               exit 1
             fi
             text="Work order #$ISSUE in $REPO. Run implement-loop for $spec: read AGENTS.md, then .agents/skills/implement-loop/SKILL.md, and follow it on the vault record $spec. Work on a new branch. When the loop passes, push it and open a draft pull request whose body starts with \"Closes #$ISSUE\" and carries the ledger. If you stop short, comment on #$ISSUE with what is left and why."
@@ -148,8 +149,12 @@ jobs:
           allowed_bots: ${{ github.event.action == 'labeled' && 'nexus-factory' || '' }}
           # Setting allowed_bots turns off the action's default auto permission mode. The
           # appended rule reaches @claude mentions, which have no prompt of their own.
+          # Builds take the model and effort factory/routing.md gives their size: small
+          # runs Sonnet at medium effort, medium and fix-ci run Opus at high effort.
+          # Mentions keep Claude Code's default.
           claude_args: >-
             ${{ github.event.action == 'labeled' && '--permission-mode auto' || '' }}
+            ${{ github.event.label.name == 'factory:small' && '--model sonnet --effort medium' || github.event.action == 'labeled' && '--model opus --effort high' || '' }}
             --append-system-prompt "Every code change goes through the implement-loop skill:
             read AGENTS.md, then .agents/skills/implement-loop/SKILL.md. A unit or reviewer
             the loop dispatches starts no other loop. Every review goes through the
