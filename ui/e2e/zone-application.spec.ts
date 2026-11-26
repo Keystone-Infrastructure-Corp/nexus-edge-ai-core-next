@@ -2001,5 +2001,47 @@ test.describe("zone application", () => {
       await page.reload();
       await expect(status).toContainText("Applied to camera", POLL);
     });
+
+    test("a held parking edit stays refused across another read without parking, until parking returns", async ({
+      page,
+    }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const { receipt, status } = await openApplied(page, id);
+      await policy(page).dwell.fill("20");
+      const reads = await rollBack(page, id);
+
+      // Another operator's zone save: the editor reads the saved settings
+      // again, still without parking. The held edit is not taken as saved.
+      const before = reads();
+      await saveZonesElsewhere(page, id, [DOOR, STALLS, DOCK]);
+      receipt.set(applied(2));
+      await steadyRead(page);
+      await expect.poll(reads, POLL).toBe(before + 1);
+      await page.waitForTimeout(500);
+      const sent = countPuts(page, id);
+      await save(page);
+      await page.waitForTimeout(500);
+      expect(sent.puts).toBe(0);
+      await expect(page.getByText(refused)).toBeVisible();
+      await expect(status).toContainText("Unsaved changes; zones changed elsewhere", POLL);
+      await neverApplied(page, 2_000);
+
+      // The core reports parking again: the edit shows and saves as edited,
+      // expecting the parking settings it now read.
+      await page.unroute(`**/api/v1/admin/cameras/${id}/config-snapshot`);
+      await saveZonesElsewhere(page, id, [DOCK, STALLS]);
+      receipt.set(applied(3));
+      await steadyRead(page);
+      await expect(policy(page).dwell).toHaveValue("20", POLL);
+      const parking = await parkingRevision(page, id);
+      const put = page.waitForRequest(isPut(id));
+      await save(page);
+      const resent = await put;
+      expect(expectedParking(resent)).toBe(parking);
+      expect(resent.postDataJSON()).toMatchObject({ parking_policy_v2: POLICY_B });
+      expect((await resent.response())?.ok()).toBe(true);
+      await expect(page.getByText(refused)).toHaveCount(0);
+    });
   });
 });
