@@ -293,6 +293,10 @@ pub struct RecordingDeliverySnapshot {
     pub alert: DeliveryQueue,
     /// The aligned 1 h and 24 h windows, in that order.
     pub windows: Vec<DeliveryWindow>,
+    /// The whole core from the windows' `end` to `sampled_at` (the minute
+    /// holding the sample), so a change the queue already shows is never
+    /// outside every counter.
+    pub since_window_end: SourceCounters,
 }
 
 /// Add `d` to the `(minute of at, camera, source)` bucket and prune buckets
@@ -474,6 +478,7 @@ impl Store {
         for secs in WINDOW_SECONDS {
             windows.push(window(&mut tx, end, secs, accounting_since).await?);
         }
+        let (since_window_end, _) = bucket_sums(&mut tx, end, end + Duration::minutes(1)).await?;
         tx.commit().await?;
         Ok(RecordingDeliverySnapshot {
             schema_version: SCHEMA_VERSION,
@@ -482,6 +487,7 @@ impl Store {
             ordinary,
             alert,
             windows,
+            since_window_end,
         })
     }
 }
@@ -544,6 +550,23 @@ async fn window(
     accounting_since: DateTime<Utc>,
 ) -> Result<DeliveryWindow, StoreError> {
     let start = end - Duration::seconds(secs);
+    let (core, cameras) = bucket_sums(conn, start, end).await?;
+    Ok(DeliveryWindow {
+        window_seconds: secs,
+        start,
+        end,
+        complete: start >= accounting_since,
+        core,
+        cameras,
+    })
+}
+
+/// Core and per-camera sums of the buckets in `[start, end)`.
+async fn bucket_sums(
+    conn: &mut SqliteConnection,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<(SourceCounters, Vec<CameraDelivery>), StoreError> {
     let rows = sqlx::query(&format!(
         "SELECT camera_id, source_kind, {COUNTER_SUMS}
            FROM recording_minute_buckets
@@ -576,18 +599,12 @@ async fn window(
         cam_slot.add(&c);
         core_slot.add(&c);
     }
-    Ok(DeliveryWindow {
-        window_seconds: secs,
-        start,
-        end,
-        complete: start >= accounting_since,
-        core,
-        cameras: cameras
-            .into_iter()
-            .map(|(camera_id, counters)| CameraDelivery {
-                camera_id,
-                counters,
-            })
-            .collect(),
-    })
+    let cameras = cameras
+        .into_iter()
+        .map(|(camera_id, counters)| CameraDelivery {
+            camera_id,
+            counters,
+        })
+        .collect();
+    Ok((core, cameras))
 }

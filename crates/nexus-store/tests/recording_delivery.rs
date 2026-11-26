@@ -675,6 +675,42 @@ async fn recording_delivery_counts_camera_deletion_as_eviction_before_upload() {
     assert_eq!(snap.ordinary.ready.count + snap.alert.ready.count, 0);
 }
 
+/// The minute holding the sample is outside every window, so a loss in it
+/// is reported in `since_window_end`: an eviction at 12:00:05 sampled at
+/// 12:00:20 empties the queue while the complete windows show no loss.
+#[tokio::test]
+async fn recording_delivery_reports_loss_since_the_window_end() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let id = closed_clip(&store, 1, Utc::now() - Duration::hours(1), 500, true).await;
+    store.cascade_delete_clip_metadata(id).await.unwrap();
+    let minute: i64 = sqlx::query_scalar(
+        "SELECT minute_utc FROM recording_minute_buckets WHERE evicted_before_upload_count > 0",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    let sampled = Utc.timestamp_opt(minute + 20, 0).unwrap();
+
+    let snap = store.recording_delivery_stats(sampled, None).await.unwrap();
+    assert_eq!(
+        snap.ordinary.ready.count, 0,
+        "the queue already reads empty"
+    );
+    for w in &snap.windows {
+        assert_eq!(w.core.ordinary.evicted_before_upload_count, 0);
+    }
+    let since = snap.since_window_end.ordinary;
+    assert_eq!(
+        (
+            since.evicted_before_upload_bytes,
+            since.evicted_before_upload_count
+        ),
+        (500, 1)
+    );
+    assert_eq!(snap.since_window_end.alert, DeliveryCounters::default());
+}
+
 /// Windows are whole UTC minutes ending at the start of the sample's
 /// minute; a clip finalized one millisecond before the hour belongs to
 /// the previous hour.
