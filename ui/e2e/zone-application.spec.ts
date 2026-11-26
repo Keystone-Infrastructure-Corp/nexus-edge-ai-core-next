@@ -604,4 +604,23 @@ test.describe("zone application", () => {
     await expect(zoneRow(page, "Door")).toBeVisible();
     await expect(status).toContainText("Applied to camera", POLL);
   });
+
+  test("a sketch in progress is an unsaved change, never Applied", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const receipt = await controlReceipt(page, cameraId);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${cameraId}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    await page.getByRole("button", { name: "New zone" }).click();
+    await clickCanvas(page, 0.6, 0.6);
+    await expect(status).toContainText("Unsaved changes");
+    // Across the editor's next scheduled stats read.
+    await neverApplied(page, 6_000);
+
+    const finish = page.getByRole("button", { name: /^Finish/ });
+    await finish.locator("..").getByRole("button", { name: "Cancel" }).click();
+    await expect(status).toContainText("Applied to camera", POLL);
+  });
 });

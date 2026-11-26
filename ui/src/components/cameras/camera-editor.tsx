@@ -480,9 +480,11 @@ export function CameraEditor({
   }
 
   const sentZones = mutation.isPending ? mutation.variables?.zones : zoneView.synced;
+  // A polygon being drawn is an edit too, though not yet in the draft.
+  const [sketching, setSketching] = useState(false);
   const zoneDraft: ZoneDraftState = {
     phase:
-      draft.zones !== sentZones ? "dirty" : saving ? "saving" : zoneView.awaiting ? "saved" : "clean",
+      sketching || draft.zones !== sentZones ? "dirty" : saving ? "saving" : zoneView.awaiting ? "saved" : "clean",
     base: zoneView.base,
   };
   const saved: SavedSnapshot = {
@@ -1208,6 +1210,7 @@ export function CameraEditor({
             isNew={isNew}
             zones={draft.zones ?? []}
             onChange={(z) => set("zones", z)}
+            onSketchingChange={setSketching}
           />
         </SheetSection>
 

@@ -57,13 +57,18 @@ export function ZonesEditor({
   isNew,
   zones,
   onChange,
+  onSketchingChange,
 }: {
   cameraId: number;
   isNew: boolean;
   zones: ZoneConfig[];
   onChange: (zones: ZoneConfig[]) => void;
+  /** Whether a polygon is being drawn with at least one vertex: an unsaved edit. */
+  onSketchingChange: (sketching: boolean) => void;
 }) {
   const [mode, setMode] = useState<ZonesEditorMode>({ type: "idle" });
+  const sketching = mode.type === "drawing" && mode.points.length > 0;
+  useEffect(() => onSketchingChange(sketching), [sketching, onSketchingChange]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [drawError, setDrawError] = useState<string | null>(null);
   const [snapshotKey, setSnapshotKey] = useState(() => Date.now());
