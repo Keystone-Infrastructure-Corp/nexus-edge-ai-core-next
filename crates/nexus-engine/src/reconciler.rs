@@ -2038,6 +2038,41 @@ mod tests {
         wedged: Mutex<Vec<sqlx::pool::PoolConnection<sqlx::Sqlite>>>,
         /// What the next drains do, in order; once used up, each succeeds.
         drains: Mutex<std::collections::VecDeque<Drain>>,
+        /// When set, a close is logged as it begins and then waits for a
+        /// permit of this gate.
+        close_gate: Option<tokio::sync::Semaphore>,
+        /// When set, a camera's first frame source ends once this is
+        /// notified, as [`SourceUntil`].
+        end_first_source: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    /// Delivers frames until `end` is notified, then returns as
+    /// [`SourceThatEnds`] does.
+    struct SourceUntil {
+        camera_id: CameraId,
+        end: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl nexus_pipeline::FrameSource for SourceUntil {
+        async fn run(
+            self: Box<Self>,
+            tx: tokio::sync::mpsc::Sender<nexus_types::Frame>,
+        ) -> Result<(), nexus_pipeline::FrameSourceError> {
+            let frames = Box::new(nexus_pipeline::VirtualSource {
+                camera_id: self.camera_id,
+                width: 512,
+                height: 288,
+                fps: 10,
+            });
+            tokio::select! {
+                _ = frames.run(tx) => {}
+                () = self.end.notified() => {}
+            }
+            Err(nexus_pipeline::FrameSourceError::Backend(
+                "upstream session ended".into(),
+            ))
+        }
     }
 
     /// A [`ClipLogRecorder`] drain that does not succeed.
@@ -2140,6 +2175,9 @@ mod tests {
             self.calls
                 .lock()
                 .push((handle.camera_id, ClipCall::Close(handle.clip_id)));
+            if let Some(gate) = &self.close_gate {
+                gate.acquire().await.expect("gate is never closed").forget();
+            }
             Ok(ClipMeta {
                 clip_id: handle.clip_id,
                 camera_id: handle.camera_id,
@@ -2184,7 +2222,18 @@ mod tests {
             &self,
             camera_id: CameraId,
         ) -> Option<Box<dyn nexus_pipeline::FrameSource + Send>> {
-            *self.sources_built.lock().entry(camera_id).or_insert(0) += 1;
+            let built = {
+                let mut counts = self.sources_built.lock();
+                let n = counts.entry(camera_id).or_insert(0);
+                *n += 1;
+                *n
+            };
+            if let Some(end) = self.end_first_source.as_ref().filter(|_| built == 1) {
+                return Some(Box::new(SourceUntil {
+                    camera_id,
+                    end: end.clone(),
+                }));
+            }
             Some(Box::new(nexus_pipeline::VirtualSource {
                 camera_id,
                 width: 512,
@@ -2192,6 +2241,80 @@ mod tests {
                 fps: 10,
             }))
         }
+    }
+
+    /// SPEC-088 review 8 — a supervisor that applied its zones and whose
+    /// source then ends with a clip open runs them no more from that moment,
+    /// not from when its final close returns, which can take as long as the
+    /// recorder's drain. Until then the read said applied, and the
+    /// reconciler's no-change guard, which asks the registry whether the
+    /// generation still runs, kept the camera. Once the close completes, a
+    /// pass restarts the camera as for any supervisor that ended on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supervisor_ending_with_its_final_close_pending_stops_reading_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let end_source = Arc::new(tokio::sync::Notify::new());
+        let recorder = Arc::new(ClipLogRecorder {
+            close_gate: Some(tokio::sync::Semaphore::new(0)),
+            end_first_source: Some(end_source.clone()),
+            ..ClipLogRecorder::default()
+        });
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        let a = zone_revision(&[]);
+
+        reconcile(&args).await.expect("first pass");
+        wait_until(
+            "precondition: the supervisor applied A and holds an open clip",
+            || recorder.opens() == 1 && status(&args, &a).state == ZoneApplicationState::Applied,
+        )
+        .await;
+        let original = entry_of(&args.handles, 7);
+        end_source.notify_one();
+        wait_until("the supervisor's final close began", || {
+            recorder.calls_of(7) == [ClipCall::Open(1), ClipCall::Close(1)]
+        })
+        .await;
+        let pending = status(&args, &a);
+        let runs = args
+            .frame_stats
+            .zone_application()
+            .runs(7, original.zone_generation);
+        let ended_mid_close = original.task.is_finished();
+        recorder
+            .close_gate
+            .as_ref()
+            .expect("closes are gated")
+            .add_permits(1 << 16);
+        wait_until("the supervisor ended once its close completed", || {
+            original.task.is_finished()
+        })
+        .await;
+        reconcile(&args).await.expect("pass that restarts it");
+        wait_until("the replacement applied A", || {
+            let s = status(&args, &a);
+            s.state == ZoneApplicationState::Applied && s.generation > original.zone_generation
+        })
+        .await;
+        let replaced = !Arc::ptr_eq(&entry_of(&args.handles, 7).task, &original.task);
+        abort_all(&args.handles);
+
+        assert!(
+            !ended_mid_close,
+            "precondition: the close was still pending"
+        );
+        assert_eq!(
+            (pending.applied_revision, pending.state, pending.error_code),
+            (Some(a), ZoneApplicationState::Applying, None),
+            "an ended supervisor read applied while its final close was pending"
+        );
+        assert!(
+            !runs,
+            "the registry still counted the ended generation as running, so a pass would keep it"
+        );
+        assert!(
+            replaced,
+            "the pass after the close did not restart the camera"
+        );
     }
 
     /// BUG-285 review — the restart a behavior edit triggers used to abort

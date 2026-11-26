@@ -1572,6 +1572,24 @@ async fn run_camera(
         }
         }
 
+        // A stop request is the reconciler replacing or removing this
+        // generation. Ending on its own before any frame is a failure; after
+        // one, nothing runs its zones any more. Said before the teardown
+        // below, whose final close can wait out the recorder's drain.
+        if !*stop.borrow() {
+            let registry = stats.zone_application();
+            if zones_acknowledged.is_some() {
+                registry.stop(cfg.id, zone_generation);
+            } else if let Some(request) = registry.current_request(cfg.id, zone_generation) {
+                registry.fail(
+                    cfg.id,
+                    zone_generation,
+                    request,
+                    crate::zone_application::ZoneApplicationError::SupervisorExited,
+                );
+            }
+        }
+
         // Pipeline ended — close any clip still open so its row
         // doesn't sit forever with NULL ended_at.
         post_roll.reset();
@@ -1590,22 +1608,6 @@ async fn run_camera(
         // shutdown path.
         let _ = clip_opened_at;
         emitter.forget_camera(cfg.id);
-        // A stop request is the reconciler replacing or removing this
-        // generation. Ending on its own before any frame is a failure; after
-        // one, nothing runs its zones any more.
-        if !*stop.borrow() {
-            let registry = stats.zone_application();
-            if zones_acknowledged.is_some() {
-                registry.stop(cfg.id, zone_generation);
-            } else if let Some(request) = registry.current_request(cfg.id, zone_generation) {
-                registry.fail(
-                    cfg.id,
-                    zone_generation,
-                    request,
-                    crate::zone_application::ZoneApplicationError::SupervisorExited,
-                );
-            }
-        }
 
         let _ = bus
             .publish(
