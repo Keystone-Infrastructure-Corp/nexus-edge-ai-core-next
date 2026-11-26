@@ -62,11 +62,11 @@ import { detectorInputFor, supervisorDimsFor } from "@/lib/supervisor-frame";
 import {
   deriveZoneApplication,
   isDenied,
-  isZonesRevisionConflict,
   markZoneSave,
   nextAcceptanceSeq,
   parseConfigSnapshot,
   receiptGeneration,
+  revisionConflict,
   zoneApplicationPollMs,
   zoneSaveSeq,
   type AcceptanceEpoch,
@@ -255,11 +255,11 @@ type Saved = { camera: CameraConfig; tuple: ZoneTuple; revision: string | null; 
  * leaves `draft`'s parking fields as they are). When that read fails (a
  * role that may save but not read it, say) they are the listed ones, with
  * no revision. Throws when the list cannot be read. The save expects the
- * snapshot's zones revision, so another zone save landing after this read
- * is refused (409), never overwritten. The list gives no revision to
- * expect: that save is unconditional, as before, and still overwrites one
- * landing after it, as does a save landing after the list read in any
- * other field.
+ * snapshot's zones and parking revisions, so another zone or parking save
+ * landing after this read is refused (409), never overwritten. The list
+ * gives no revision to expect: that save is unconditional, as before, and
+ * still overwrites one landing after it, as does a save landing after the
+ * list read in any other field.
  */
 async function rereadSaved(cameraId: number, zones: boolean, draft: ZoneTuple): Promise<Saved> {
   let snap: CameraConfigSnapshot | null = null;
@@ -592,24 +592,26 @@ export function CameraEditor({
   // a reopened one sees the save pending, and its settling refreshes it.
   const mutation = useMutation({
     mutationKey: saveKey(camera.id),
-    mutationFn: ({ cfg, expected }: { cfg: CameraConfig; expected?: string }) =>
-      upsertCamera(cfg, expected),
+    mutationFn: ({ cfg, expected, expectedParking }: { cfg: CameraConfig; expected?: string; expectedParking?: string }) =>
+      upsertCamera(cfg, expected, expectedParking),
     onMutate: () => markZoneSave(camera.id),
     onSuccess: () => {
       if (!isNew) toast.success("Camera saved");
       onSaved(isNew);
     },
-    // A refused save is never retried: the saved zones it raced are read
-    // again on settling, rebasing a clean view or showing an edit as
-    // changed elsewhere, and the operator saves again.
-    onError: (e: unknown) =>
+    // A refused save is never retried: the saved zones and parking settings
+    // it raced are read again on settling, rebasing a clean view or showing
+    // an edit as changed elsewhere, and the operator saves again.
+    onError: (e: unknown) => {
+      const raced = revisionConflict(e);
       setError(
-        isZonesRevisionConflict(e)
-          ? "Not saved: someone else saved this camera's zones since they were last read here, so nothing was changed. Check the zones and save again."
+        raced
+          ? `Not saved: someone else saved this camera's ${raced} since they were last read here, so nothing was changed. Check the ${raced} and save again.`
           : e instanceof Error
             ? e.message
             : String(e),
-      ),
+      );
+    },
     // A failed PUT may still have committed: read what is saved either way.
     onSettled: () => {
       markZoneSave(camera.id);
@@ -823,8 +825,10 @@ export function CameraEditor({
       return;
     }
     // The save replaces the camera's zones and parking settings whole,
-    // expecting the zones revision it replaces, so a zone save from elsewhere
-    // it has not read is refused (409), never overwritten. Unedited ones go
+    // expecting the zones and parking revisions it replaces, both from one
+    // snapshot read (no parking revision where the snapshot has none), so a
+    // zone or parking save from elsewhere it has not read is refused (409),
+    // never overwritten. Unedited ones go
     // out as saved now, not as last read here, so an unrelated edit never
     // reverts another operator's newer ones; they expect their re-read
     // revision (see `rereadSaved`). Edited ones, a drawing in progress
@@ -839,6 +843,7 @@ export function CameraEditor({
     let cfg = draft;
     const read = snap && snap.seq > zoneSaveSeq(camera.id) ? snap : zoneView.installed?.read;
     let expected = read?.body.zones_revision;
+    let expectedParking = read?.body.parking_revision;
     const parkingClean = sameParking(draft, zoneView.synced);
     if (!isNew) {
       const tupleClean = !sketching && draft.zones === zoneView.synced.zones && (parkingClean || !parkingShown);
@@ -864,6 +869,7 @@ export function CameraEditor({
       if (tupleClean) {
         const { tuple, revision, parkingRevision } = saved;
         expected = revision ?? undefined;
+        expectedParking = parkingRevision ?? undefined;
         const changed =
           revision !== null
             ? revision !== zoneView.base || parkingRevision !== zoneView.parkingBase
@@ -878,7 +884,7 @@ export function CameraEditor({
         }
       }
     }
-    mutation.mutate({ cfg, expected }, {
+    mutation.mutate({ cfg, expected, expectedParking }, {
       // Not called once `resetSave` fenced the save. The PUT answer carries
       // no revision and its zones (and parking settings, where the engine
       // reports parking) are not applied: the post-save snapshot and a fresh

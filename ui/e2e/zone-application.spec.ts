@@ -1126,10 +1126,10 @@ test.describe("zone application", () => {
 
   /**
    * Park the editor's next save of camera `id` until `release`, then land
-   * another operator's save of `zones` first: after the editor re-read the
+   * another operator's save with `patch` first: after the editor re-read the
    * saved zones, before its save reaches the engine.
    */
-  async function raceSave(page: Page, id: number, zones: Zone[]) {
+  async function raceSave(page: Page, id: number, patch: Record<string, unknown>) {
     let seen = () => {};
     let release = () => {};
     const parked = new Promise<void>((resolve) => (seen = resolve));
@@ -1143,7 +1143,7 @@ test.describe("zone application", () => {
         raced = true;
         seen();
         await opened;
-        await saveZonesElsewhere(page, id, zones);
+        await saveElsewhere(page, id, patch);
         await route.continue();
       },
     );
@@ -1167,7 +1167,7 @@ test.describe("zone application", () => {
 
     await zoneRow(page, "Door").getByRole("textbox").fill("Mine");
     await expect(status).toContainText("Unsaved changes");
-    const race = await raceSave(page, id, [DOCK]);
+    const race = await raceSave(page, id, { zones: [DOCK] });
     race.release();
     receipt.set(applied(2));
     const put = page.waitForRequest(isPut(id));
@@ -1210,7 +1210,7 @@ test.describe("zone application", () => {
     const mine = await zonesRevision(page, id);
 
     await page.locator("#cam-name").fill("e2e zones renamed");
-    const race = await raceSave(page, id, [DOCK]);
+    const race = await raceSave(page, id, { zones: [DOCK] });
     race.release();
     receipt.set(applied(2));
     const put = page.waitForRequest(isPut(id));
@@ -1256,7 +1256,7 @@ test.describe("zone application", () => {
     });
 
     await page.locator("#cam-name").fill("e2e zones renamed");
-    const race = await raceSave(page, id, [DOCK]);
+    const race = await raceSave(page, id, { zones: [DOCK] });
     const put = page.waitForRequest(isPut(id));
     await page.getByRole("button", { name: /^save$/i }).click();
     await race.parked;
@@ -1457,6 +1457,7 @@ test.describe("zone application", () => {
     });
     const optIn = (page: Page) => page.getByLabel("Use parking zones (v2)");
     const save = (page: Page) => page.getByRole("button", { name: /^save$/i }).click();
+    const expectedParking = (r: Request) => new URL(r.url()).searchParams.get("expected_parking_revision");
 
     async function parkingRevision(page: Page, id: number): Promise<string> {
       const revision = (await snapshot(page, id)).parking_revision;
@@ -1673,18 +1674,76 @@ test.describe("zone application", () => {
       const { receipt, status } = await openApplied(page, id);
 
       await saveElsewhere(page, id, { parking_policy_v2: POLICY_B });
+      const [zones, theirs] = [await zonesRevision(page, id), await parkingRevision(page, id)];
       await expect(policy(page).dwell).toHaveValue("10");
       await page.locator("#cam-name").fill("e2e zones renamed");
       receipt.set(applied(2));
       const put = page.waitForRequest(isPut(id));
       await save(page);
-      const body = (await put).postDataJSON() as Record<string, unknown>;
+      const sent = await put;
+      // The clean save expects both revisions of its re-read.
+      expect(expectedRevision(sent)).toBe(zones);
+      expect(expectedParking(sent)).toBe(theirs);
+      const body = sent.postDataJSON() as Record<string, unknown>;
       expect(body.parking_policy_v2).toEqual(POLICY_B);
       expect(body.zones).toEqual([DOOR, STALLS]);
       expect(body.name).toBe("e2e zones renamed");
       expect(body.onvif).toEqual(ONVIF);
+      expect((await sent.response())?.ok()).toBe(true);
       await expect(policy(page).dwell).toHaveValue("20");
       await expect(status).toContainText("Applied to camera", POLL);
+    });
+
+    test("a policy edit saved over another operator's unread policy save is refused, then sent as edited", async ({
+      page,
+    }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const zones = await zonesRevision(page, id);
+      const mine = await parkingRevision(page, id);
+      const { receipt, status } = await openApplied(page, id);
+
+      await policy(page).dwell.fill("5");
+      await expect(status).toContainText("Unsaved changes");
+      // Their policy-only save lands after this editor's last read: the zones
+      // revision stays, so only the parking revision can refuse the edit.
+      const race = await raceSave(page, id, { parking_policy_v2: POLICY_B });
+      race.release();
+      receipt.set(applied(2));
+      const put = page.waitForRequest(isPut(id));
+      await save(page);
+      const sent = await put;
+      expect(expectedRevision(sent)).toBe(zones);
+      expect(expectedParking(sent)).toBe(mine);
+      expect((await sent.response())?.status()).toBe(409);
+      const retries = countPuts(page, id);
+
+      // Their policy stays saved; the edit stays, shown as over their save,
+      // and is not sent again on its own.
+      const cams = await engine<Array<{ id: number; parking_policy_v2: unknown }>>(page, "GET", "/cameras");
+      expect(cams.find((c) => c.id === id)?.parking_policy_v2).toEqual(POLICY_B);
+      await expect(
+        page.getByText(/^Not saved: someone else saved this camera's parking settings since they were last read here/),
+      ).toBeVisible();
+      await expect(status).toContainText("Unsaved changes; parking settings changed elsewhere", POLL);
+      await expect(policy(page).dwell).toHaveValue("5");
+      await neverApplied(page, 2_000);
+      expect(retries.puts).toBe(0);
+
+      // Saved again, knowingly over their policy: the edit replaces it.
+      const theirs = await parkingRevision(page, id);
+      expect(theirs).not.toBe(mine);
+      receipt.set(applied(3));
+      const again = page.waitForRequest(isPut(id));
+      await save(page);
+      const resent = await again;
+      expect(expectedRevision(resent)).toBe(zones);
+      expect(expectedParking(resent)).toBe(theirs);
+      expect(resent.postDataJSON()).toMatchObject({ parking_policy_v2: { ...POLICY_A, dwell_secs: 5 } });
+      expect((await resent.response())?.ok()).toBe(true);
+      await expect(status).toContainText("Applied to camera", POLL);
+      const saved = await engine<Array<{ id: number; parking_policy_v2: unknown }>>(page, "GET", "/cameras");
+      expect(saved.find((c) => c.id === id)?.parking_policy_v2).toEqual({ ...POLICY_A, dwell_secs: 5 });
     });
 
     test("a zone success with a missing, invalid or older parking receipt is never Applied", async ({ page }) => {

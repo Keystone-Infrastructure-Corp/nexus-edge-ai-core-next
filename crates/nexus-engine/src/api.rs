@@ -1672,6 +1672,10 @@ struct UpsertCameraQuery {
     /// `zones_revision_conflict` with the current one and write nothing.
     /// Absent, the save is unconditional, as before.
     expected_zones_revision: Option<String>,
+    /// SPEC-077 — the same for the parking tuple (the snapshot's
+    /// `parking_revision`), checked after the zones, with 409
+    /// `parking_revision_conflict`: a policy-only save moves no zones revision.
+    expected_parking_revision: Option<String>,
 }
 
 /// A camera write's body: the camera, and beside it SPEC-089's request-only
@@ -1759,6 +1763,20 @@ async fn upsert_camera(
             let body = serde_json::json!({
                 "error": "zones_revision_conflict",
                 "zones_revision": current,
+            });
+            return Ok((StatusCode::CONFLICT, Json(body)).into_response());
+        }
+    }
+    // SPEC-077 — and the expected parking revision, in the same read.
+    if let Some(want) = q.expected_parking_revision {
+        let current = cameras
+            .iter()
+            .find(|c| c.id == id)
+            .map(nexus_pipeline::zone_application::parking_revision);
+        if current.as_deref() != Some(want.as_str()) {
+            let body = serde_json::json!({
+                "error": "parking_revision_conflict",
+                "parking_revision": current,
             });
             return Ok((StatusCode::CONFLICT, Json(body)).into_response());
         }
@@ -10035,9 +10053,29 @@ mod tests {
         camera: nexus_config::CameraConfig,
         expected: Option<String>,
     ) -> (StatusCode, serde_json::Value) {
-        let query = expected.map_or(String::new(), |rev| {
-            format!("?expected_zones_revision={rev}")
-        });
+        put_camera_expecting_revisions(app, camera, expected, None).await
+    }
+
+    /// `PUT /api/v1/cameras/{id}` of `camera`, naming the zones and the
+    /// parking revisions it expects saved, each when given: status and body.
+    async fn put_camera_expecting_revisions(
+        app: axum::Router,
+        camera: nexus_config::CameraConfig,
+        zones: Option<String>,
+        parking: Option<String>,
+    ) -> (StatusCode, serde_json::Value) {
+        let params: Vec<String> = [
+            ("expected_zones_revision", zones),
+            ("expected_parking_revision", parking),
+        ]
+        .into_iter()
+        .filter_map(|(key, rev)| rev.map(|rev| format!("{key}={rev}")))
+        .collect();
+        let query = if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        };
         let mut req = Request::builder()
             .method(Method::PUT)
             .uri(format!("/api/v1/cameras/{}{query}", camera.id))
@@ -10132,6 +10170,131 @@ mod tests {
             store.list_cameras().await.unwrap()[0].zones,
             theirs.zones,
             "the queued save overwrote the zones saved ahead of it"
+        );
+    }
+
+    /// `camera` with its v2 dwell set to `dwell_secs`: a policy-only edit.
+    fn with_dwell(
+        mut camera: nexus_config::CameraConfig,
+        dwell_secs: f64,
+    ) -> nexus_config::CameraConfig {
+        if let Some(policy) = camera.behavior.parking_policy_v2.as_mut() {
+            policy.dwell_secs = dwell_secs;
+        }
+        camera
+    }
+
+    /// SPEC-077 — a camera save naming the parking revision it expects saves
+    /// only while the stored parking tuple still has it, checked after the
+    /// zones revision. A policy-only save moves no zones revision, so only
+    /// this sees it: a stale one answers 409 `parking_revision_conflict` with
+    /// the current revision and writes nothing; the current one saves; a save
+    /// naming none saves as before; a camera not stored never matches.
+    #[tokio::test]
+    async fn a_camera_save_expecting_a_stale_parking_revision_conflicts_and_writes_nothing() {
+        use nexus_pipeline::zone_application::{parking_revision, zone_revision};
+        async fn stored(store: &Store) -> (String, Option<nexus_config::ParkingPolicyV2>) {
+            let cams = store.list_cameras().await.unwrap();
+            assert_eq!(cams.len(), 1, "a refused save created a camera");
+            (cams[0].name.clone(), cams[0].behavior.parking_policy_v2)
+        }
+        let (app, store, _dir) = build_test_router(None).await;
+        store_default_camera(&store, true).await;
+        let saved = snapshot_parked(store.list_cameras().await.unwrap()[0].clone());
+        store.upsert_camera(&saved).await.unwrap();
+        let (zones, current) = (zone_revision(&saved.zones), parking_revision(&saved));
+        let before = (saved.name.clone(), saved.behavior.parking_policy_v2);
+
+        let mut edit = with_dwell(saved.clone(), 20.0);
+        edit.name = "renamed".into();
+        let stale = Some(parking_revision(&with_dwell(saved.clone(), 5.0)));
+        let put = |camera, zones, parking| {
+            put_camera_expecting_revisions(app.clone(), camera, zones, parking)
+        };
+        let (status, body) = put(edit.clone(), Some(zones.clone()), stale.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "parking_revision_conflict", "parking_revision": current })
+        );
+        assert_eq!(stored(&store).await, before, "a refused save wrote");
+
+        // The zones are checked first.
+        let (status, body) = put(edit.clone(), Some(zone_revision(&[])), stale).await;
+        assert_eq!(body["error"], "zones_revision_conflict", "{body}");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(stored(&store).await, before, "a refused save wrote");
+
+        let (status, body) = put(edit.clone(), Some(zones), Some(current)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            stored(&store).await,
+            (edit.name.clone(), edit.behavior.parking_policy_v2)
+        );
+
+        let edit = with_dwell(edit, 30.0);
+        let (status, body) = put(edit.clone(), None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let after = (edit.name.clone(), edit.behavior.parking_policy_v2);
+        assert_eq!(stored(&store).await, after);
+
+        let mut missing = edit.clone();
+        missing.id += 1;
+        let (status, body) = put(missing, None, Some(parking_revision(&edit))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "parking_revision_conflict", "parking_revision": null })
+        );
+        assert_eq!(stored(&store).await, after, "a refused save wrote");
+    }
+
+    /// SPEC-077 — the parking expectation is checked inside the same save
+    /// lock: a policy-only save another writer commits while this one waits
+    /// for the lock is seen, so the waiting save conflicts instead of
+    /// overwriting it, though the zones revision it expects still holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parking_revision_expectation_is_checked_inside_the_save_lock() {
+        use nexus_pipeline::zone_application::{parking_revision, zone_revision};
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let mine = snapshot_parked(store.list_cameras().await.unwrap()[0].clone());
+        store.upsert_camera(&mine).await.unwrap();
+        let theirs = with_dwell(mine.clone(), 20.0);
+        let frame_stats = state.frame_stats.clone();
+        let registry = frame_stats.zone_application();
+        let app = super::router(state);
+
+        // Another writer is mid-save, holding the lock (for reading, so the
+        // save queued behind it shows: a queued writer makes `try_read` fail).
+        let other = registry.saves().read().await;
+        let save = tokio::spawn(put_camera_expecting_revisions(
+            app.clone(),
+            mine.clone(),
+            Some(zone_revision(&mine.zones)),
+            Some(parking_revision(&mine)),
+        ));
+        while registry.saves().try_read().is_ok() && !save.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        store.upsert_camera(&theirs).await.unwrap();
+        drop(other);
+
+        let (status, body) = save.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "parking_revision_conflict",
+                "parking_revision": parking_revision(&theirs),
+            })
+        );
+        assert_eq!(
+            store.list_cameras().await.unwrap()[0]
+                .behavior
+                .parking_policy_v2,
+            theirs.behavior.parking_policy_v2,
+            "the queued save overwrote the parking settings saved ahead of it"
         );
     }
 

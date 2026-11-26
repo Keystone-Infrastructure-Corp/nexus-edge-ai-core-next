@@ -189,11 +189,18 @@ export type ZoneApplication =
 export const isDenied = (error: unknown) =>
   error instanceof ApiError && (error.status === 401 || error.status === 403);
 
-/** The engine refused a save: its stored zones were no longer the revision the save expected. Nothing was written. */
-export const isZonesRevisionConflict = (error: unknown) =>
-  error instanceof ApiError &&
-  error.status === 409 &&
-  (error.body as { error?: unknown } | undefined)?.error === "zones_revision_conflict";
+/**
+ * What the engine refused a save over: its stored zones, or (SPEC-077) its
+ * parking settings, were no longer the revision the save expected. Nothing
+ * was written. Undefined for any other error.
+ */
+export function revisionConflict(error: unknown): Subject | undefined {
+  if (!(error instanceof ApiError) || error.status !== 409) return undefined;
+  const code = (error.body as { error?: unknown } | undefined)?.error;
+  if (code === "zones_revision_conflict") return "zones";
+  if (code === "parking_revision_conflict") return "parking settings";
+  return undefined;
+}
 
 /** The supervisor generation a stats read's receipt reports, when it parses. */
 export const receiptGeneration = (
