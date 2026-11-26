@@ -160,6 +160,7 @@ pub struct StaticObjectFilter {
 /// inside a parking zone suppresses a track.
 struct ParkingV2 {
     params: StillnessParams,
+    max_gap_ms: f64,
     /// Normalized polygons of the camera's parking zones.
     zones: Vec<Vec<(f32, f32)>>,
     /// Capture milliseconds count from the first classified frame.
@@ -176,9 +177,15 @@ struct V2Track {
     alert_epoch: u64,
     /// The `seq` of the last frame that carried this track.
     seen_seq: u64,
-    /// Where the track's current parked episode began: the center at its
-    /// first qualified dwell.
+    /// The last observed center and its capture ms.
+    last: Option<((f32, f32), u64)>,
+    /// The anchor of the track's current parked episode (with persistence
+    /// off, the center of its first qualified dwell).
     parked_at: Option<(f32, f32)>,
+    /// Owns `parked_at`: observed there after a qualified dwell and seen on
+    /// every frame since, within the observation gap and the ID-reuse step.
+    /// Only an owner seen leaving erases the anchor.
+    owner: bool,
 }
 
 impl StaticObjectFilter {
@@ -236,6 +243,7 @@ impl StaticObjectFilter {
         )?;
         self.parking_v2 = Some(ParkingV2 {
             params,
+            max_gap_ms: policy.max_observation_gap_secs * 1000.0,
             zones: zones
                 .iter()
                 .filter(|z| z.kind == ZoneKind::Parking)
@@ -586,13 +594,41 @@ impl StaticObjectFilter {
     /// timed by monotonic capture milliseconds. Coasting frames and
     /// frames a track is missing from only end its window. Track age,
     /// update counts and movement EMAs never credit stillness.
+    ///
+    /// Anchors are bookkeeping, never a verdict: a track is static only on
+    /// its own qualified dwell. Only then does it place, match or refresh
+    /// an anchor, and only one whose center is also inside a parking zone,
+    /// so anchors outside the zones age out on their TTL.
     fn classify_v2(&mut self, frame: &Frame, objects: &mut [TrackedObject]) {
         let eligible: Vec<bool> = objects
             .iter()
             .map(|o| self.is_anchor_eligible(&o.label))
             .collect();
+        // Each observed eligible object, to tell a departure from an
+        // identity swap: the parked car still at its anchor.
+        let observed: Vec<(TrackId, String, (f32, f32))> = objects
+            .iter()
+            .zip(&eligible)
+            .filter(|(_, e)| **e)
+            .filter_map(|(o, _)| {
+                Some((
+                    o.track_id,
+                    o.label.to_lowercase(),
+                    o.detection_bbox?.center(),
+                ))
+            })
+            .collect();
+        let frame_ms = frame.captured_at.timestamp_millis();
         let match_dist = self.cfg.match_distance_pixels.max(1) as f32;
-        let Some(v2) = self.parking_v2.as_mut() else {
+        let reset_px = self.cfg.track_id_reuse_reset_pixels as f32;
+        let persistence = self.cfg.persistence_enabled;
+        let mut dirty = false;
+        let Self {
+            parking_v2,
+            anchors,
+            ..
+        } = self;
+        let Some(v2) = parking_v2.as_mut() else {
             return;
         };
         let origin = *v2.origin.get_or_insert(frame.captured_mono);
@@ -605,6 +641,8 @@ impl StaticObjectFilter {
             // Pixels of the old geometry say nothing about the new one.
             for t in v2.tracks.values_mut() {
                 t.window.miss();
+                t.last = None;
+                t.owner = false;
                 if t.parked_at.take().is_some() {
                     t.alert_epoch += 1;
                 }
@@ -618,7 +656,7 @@ impl StaticObjectFilter {
                 .iter()
                 .any(|z| point_in_normalized_polygon(x / fw, y / fh, z))
         };
-        let params = v2.params;
+        let (params, max_gap_ms) = (v2.params, v2.max_gap_ms);
         for (o, eligible) in objects.iter_mut().zip(eligible) {
             if !eligible {
                 continue;
@@ -627,11 +665,15 @@ impl StaticObjectFilter {
                 window: StillnessWindow::new(params),
                 alert_epoch: 0,
                 seen_seq: 0,
+                last: None,
                 parked_at: None,
+                owner: false,
             });
-            // Missing from the last frame: nothing observed it there.
+            // Missing from the last frame: nothing observed it there, and a
+            // tracker may have given its id to another object.
             if t.seen_seq + 1 != v2.seq {
                 t.window.miss();
+                t.owner = false;
             }
             t.seen_seq = v2.seq;
             let mut still = false;
@@ -639,21 +681,85 @@ impl StaticObjectFilter {
                 Some(b) => {
                     let center = b.center();
                     let inside = in_parking(center);
+                    let label = o.label.to_lowercase();
+                    t.owner &= t.last.is_some_and(|(p, ms)| {
+                        at_ms > ms
+                            && (at_ms - ms) as f64 <= max_gap_ms
+                            && (reset_px <= 0.0 || distance(p, center) <= reset_px)
+                    });
+                    t.last = Some((center, at_ms));
                     still =
                         t.window
                             .observe(at_ms, center, (b.x2 - b.x1).hypot(b.y2 - b.y1), inside);
-                    // Seen away from where it parked: its next episode.
-                    if t.parked_at
-                        .is_some_and(|p| !inside || distance(p, center) > match_dist)
+                    // Seen away from where it parked: its next episode. Only
+                    // an owner seen leaving an anchor no other object still
+                    // stands at erases it; otherwise it is left to expire.
+                    if let Some(p) = t
+                        .parked_at
+                        .filter(|&p| !inside || distance(p, center) > match_dist)
                     {
+                        let swapped = observed.iter().any(|(id, l, c)| {
+                            *id != o.track_id && *l == label && distance(*c, p) <= match_dist
+                        });
+                        if t.owner && !swapped {
+                            if let Some(i) = anchors
+                                .iter()
+                                .position(|a| a.label == label && (a.center_x, a.center_y) == p)
+                            {
+                                anchors.remove(i);
+                                dirty = true;
+                            }
+                        }
                         t.parked_at = None;
+                        t.owner = false;
                         t.alert_epoch += 1;
                     }
                     if still {
-                        t.parked_at.get_or_insert(center);
+                        let own = t.parked_at.filter(|_| t.owner);
+                        let parked_at = if persistence {
+                            // Its own anchor, else one in parking within
+                            // the match radius, else a new one here. An
+                            // anchor never moves (BUG-258).
+                            let i = anchors
+                                .iter()
+                                .position(|a| {
+                                    a.label == label && Some((a.center_x, a.center_y)) == own
+                                })
+                                .or_else(|| {
+                                    anchors.iter().position(|a| {
+                                        let at = (a.center_x, a.center_y);
+                                        a.label == label
+                                            && distance(at, center) <= match_dist
+                                            && in_parking(at)
+                                    })
+                                });
+                            match i {
+                                Some(i) => {
+                                    anchors[i].last_seen_unix_ms = Some(frame_ms);
+                                    (anchors[i].center_x, anchors[i].center_y)
+                                }
+                                None => {
+                                    anchors.push(StaticAnchor {
+                                        label,
+                                        center_x: center.0,
+                                        center_y: center.1,
+                                        last_seen_unix_ms: Some(frame_ms),
+                                    });
+                                    dirty = true;
+                                    center
+                                }
+                            }
+                        } else {
+                            t.parked_at.unwrap_or(center)
+                        };
+                        t.parked_at = Some(parked_at);
+                        t.owner = true;
                     }
                 }
-                None => t.window.miss(),
+                None => {
+                    t.window.miss();
+                    t.owner = false;
+                }
             }
             if still {
                 o.attributes
@@ -663,6 +769,9 @@ impl StaticObjectFilter {
                 ALERT_EPOCH_ATTRIBUTE_KEY.into(),
                 Value::Number(t.alert_epoch.into()),
             );
+        }
+        if dirty {
+            self.save_registry();
         }
     }
 
@@ -2097,5 +2206,192 @@ mod tests {
             let want = if x - 400.0 > 40.0 { 1 } else { 0 };
             assert_eq!(epoch(&out[0]), want, "x = {x}");
         }
+    }
+
+    fn anchor_centers(f: &StaticObjectFilter) -> Vec<(f32, f32)> {
+        f.anchors()
+            .iter()
+            .map(|a| (a.center_x, a.center_y))
+            .collect()
+    }
+
+    fn epoch_of(o: &TrackedObject) -> u64 {
+        o.attributes[ALERT_EPOCH_ATTRIBUTE_KEY]
+            .as_u64()
+            .expect("epoch")
+    }
+
+    /// Hold `cars` (track, x, y) still at 1.45 fps until 6.9 s; the last
+    /// frame's objects.
+    fn park_all(f: &mut StaticObjectFilter, cars: &[(TrackId, f32, f32)]) -> Vec<TrackedObject> {
+        let mut out = Vec::new();
+        for ms in capture_ms(1.45, 0, 6_900) {
+            out = v2_step(
+                f,
+                ms,
+                HD,
+                cars.iter().map(|&(id, x, y)| vehicle(id, x, y)).collect(),
+            );
+        }
+        out
+    }
+
+    fn v2_filter_with_ttl(anchor_ttl_secs: u32) -> StaticObjectFilter {
+        let cfg = StaticObjectConfig {
+            anchor_ttl_secs,
+            ..Default::default()
+        };
+        StaticObjectFilter::new(cfg, 1, None)
+            .with_parking_policy(&v2_policy(), &stalls())
+            .expect("valid policy")
+    }
+
+    /// Both the car and the anchor must be inside a parking zone: an anchor
+    /// from before the zones, 30 px across the lane line from a stall, is
+    /// neither matched nor refreshed nor moved, and ages out; a car parked
+    /// in the lane places none.
+    #[test]
+    fn v2_anchors_are_placed_matched_and_refreshed_only_inside_parking() {
+        let mut f = v2_filter_with_ttl(10);
+        f.anchors.push(StaticAnchor {
+            label: "vehicle.car".into(),
+            center_x: 980.0,
+            center_y: 500.0,
+            last_seen_unix_ms: Some(0),
+        });
+        let cars = [(1, 950.0, 500.0), (2, 1400.0, 700.0)];
+        let out = park_all(&mut f, &cars);
+        assert!(is_object_static(&out[0]) && !is_object_static(&out[1]));
+        assert_eq!(anchor_centers(&f), vec![(980.0, 500.0), (950.0, 500.0)]);
+        assert_eq!(f.anchors()[0].last_seen_unix_ms, Some(0));
+        for ms in capture_ms(1.45, 7_600, 11_000) {
+            v2_step(
+                &mut f,
+                ms,
+                HD,
+                cars.iter().map(|&(id, x, y)| vehicle(id, x, y)).collect(),
+            );
+        }
+        assert_eq!(
+            anchor_centers(&f),
+            vec![(950.0, 500.0)],
+            "the outside one expired"
+        );
+    }
+
+    /// A car crawling past two parked cars, through each one's anchor radius:
+    /// it is never hidden, keeps one alert episode, and both anchors and
+    /// both parked verdicts stay.
+    #[test]
+    fn v2_a_passing_car_cannot_claim_erase_or_reset_an_anchor() {
+        let mut f = v2_filter();
+        let parked = [(1, 300.0, 500.0), (3, 300.0, 700.0)];
+        park_all(&mut f, &parked);
+        let anchors = anchor_centers(&f);
+        assert_eq!(anchors.len(), 2);
+        for (k, ms) in capture_ms(1.45, 7_600, 20_000).into_iter().enumerate() {
+            let mut objs: Vec<_> = parked.iter().map(|&(id, x, y)| vehicle(id, x, y)).collect();
+            objs.push(vehicle(2, 320.0, 300.0 + 30.0 * k as f32));
+            let out = v2_step(&mut f, ms, HD, objs);
+            assert!(
+                is_object_static(&out[0]) && is_object_static(&out[1]),
+                "{ms} ms"
+            );
+            assert!(!is_object_static(&out[2]), "passer hidden at {ms} ms");
+            assert_eq!(epoch_of(&out[2]), 0, "passer's episode at {ms} ms");
+        }
+        assert_eq!(anchor_centers(&f), anchors);
+    }
+
+    /// An owner seen driving out of its anchor's radius erases that anchor.
+    #[test]
+    fn v2_an_owner_seen_leaving_erases_its_anchor() {
+        let mut f = v2_filter();
+        park_all(&mut f, &[(1, 400.0, 500.0)]);
+        assert_eq!(anchor_centers(&f), vec![(400.0, 500.0)]);
+        let mut x = 400.0;
+        for ms in capture_ms(1.45, 7_600, 11_000) {
+            x += 15.0;
+            v2_step(&mut f, ms, HD, vec![vehicle(1, x, 500.0)]);
+            assert_eq!(f.anchors().is_empty(), x - 400.0 > 40.0, "x = {x}");
+        }
+    }
+
+    /// Each way an owner's track can come back as possibly another object:
+    /// the anchor stays, to expire on its TTL, and the moving object is
+    /// visible in a new alert episode.
+    #[test]
+    fn v2_an_ambiguous_identity_leaves_the_anchor_to_expire() {
+        let away = || vehicle(1, 450.0, 500.0);
+        // (name, frames as (capture ms, objects))
+        type Case = (&'static str, Vec<(i64, Vec<TrackedObject>)>);
+        let cases: Vec<Case> = vec![
+            (
+                "a jump past the ID-reuse step",
+                vec![(7_600, vec![vehicle(1, 465.0, 500.0)])],
+            ),
+            (
+                "another track still at the anchor",
+                vec![(7_600, vec![away(), vehicle(9, 400.0, 500.0)])],
+            ),
+            (
+                "after a coasting frame",
+                vec![
+                    (7_600, vec![coasting(vehicle(1, 400.0, 500.0))]),
+                    (8_300, vec![away()]),
+                ],
+            ),
+            (
+                "after a frame without the track (a reused id)",
+                vec![(7_600, vec![]), (8_300, vec![away()])],
+            ),
+            ("after an observation gap", vec![(11_000, vec![away()])]),
+        ];
+        for (name, frames) in cases {
+            let mut f = v2_filter_with_ttl(10);
+            park_all(&mut f, &[(1, 400.0, 500.0)]);
+            let mut last = Vec::new();
+            for (ms, objs) in frames {
+                last = v2_step(&mut f, ms, HD, objs);
+            }
+            assert_eq!(anchor_centers(&f), vec![(400.0, 500.0)], "{name}");
+            assert!(!is_object_static(&last[0]), "{name}");
+            assert_eq!(epoch_of(&last[0]), 1, "{name}");
+            v2_step(&mut f, 17_000, HD, vec![vehicle(1, 600.0, 500.0)]);
+            assert!(f.anchors().is_empty(), "{name}: expired on its TTL");
+        }
+    }
+
+    /// A parked car whose detection drops out keeps its episode but not its
+    /// anchor: coasting refreshes nothing, and it reclaims the same anchor
+    /// only after a fresh observed dwell. A lone arrival that then only
+    /// coasts places no anchor.
+    #[test]
+    fn v2_a_reacquired_car_reclaims_its_anchor_only_after_a_fresh_dwell() {
+        let mut f = v2_filter();
+        park_all(&mut f, &[(1, 400.0, 500.0)]);
+        let refreshed = |f: &StaticObjectFilter| f.anchors()[0].last_seen_unix_ms;
+        let before = refreshed(&f);
+        for ms in [7_600, 8_300] {
+            v2_step(&mut f, ms, HD, vec![coasting(vehicle(1, 400.0, 500.0))]);
+        }
+        for ms in capture_ms(1.45, 9_000, 16_000) {
+            let out = v2_step(&mut f, ms, HD, vec![vehicle(1, 400.0, 500.0)]);
+            let qualified = ms >= 14_000;
+            assert_eq!(is_object_static(&out[0]), qualified, "{ms} ms");
+            assert_eq!(epoch_of(&out[0]), 0, "the same parked episode");
+            if !qualified {
+                assert_eq!(refreshed(&f), before, "{ms} ms");
+            }
+        }
+        assert_eq!(anchor_centers(&f), vec![(400.0, 500.0)]);
+        assert!(refreshed(&f) > before);
+
+        let mut lone = v2_filter();
+        v2_step(&mut lone, 0, HD, vec![vehicle(1, 400.0, 500.0)]);
+        for ms in capture_ms(1.45, 690, 20_000) {
+            v2_step(&mut lone, ms, HD, vec![coasting(vehicle(1, 400.0, 500.0))]);
+        }
+        assert!(lone.anchors().is_empty());
     }
 }
