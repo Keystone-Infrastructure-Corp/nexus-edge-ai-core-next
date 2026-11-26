@@ -510,6 +510,28 @@ fn a_stale_gap_resets_the_success_run() {
     assert_eq!(state(&mut p, resumed + 2_500), OPEN_ACTIVITY);
 }
 
+/// A healthy, quiet consumer reads one success after a gap past the stale
+/// deadline: analysis was not sustained, so it is degraded until three
+/// passes span two seconds, fed by summaries or by observations alike.
+#[test]
+fn a_gap_seen_while_healthy_degrades_until_the_gate() {
+    let (mut producer, mut p) = summary_fed_healthy_at_30s();
+    p.apply_summary(producer.push(success(45_000, 0)), 45_000);
+    assert_eq!(state(&mut p, 45_000), OPEN_DEGRADED, "the gap was seen");
+    p.apply_summary(producer.push(success(46_000, 0)), 46_000);
+    assert_eq!(state(&mut p, 46_000), OPEN_DEGRADED, "two passes in 1 s");
+    p.apply_summary(producer.push(success(47_000, 0)), 47_000);
+    assert_eq!(state(&mut p, 47_000), OPEN_ACTIVITY, "three over 2 s");
+
+    let mut p = healthy_quiet_at_30s();
+    p.observe(success(45_000, 0));
+    assert_eq!(state(&mut p, 45_000), OPEN_DEGRADED, "the gap was seen");
+    p.observe(success(46_000, 0));
+    assert_eq!(state(&mut p, 46_000), OPEN_DEGRADED);
+    p.observe(success(47_000, 0));
+    assert_eq!(state(&mut p, 47_000), OPEN_ACTIVITY);
+}
+
 #[test]
 fn a_recovered_run_read_after_it_went_stale_does_not_recover() {
     let mut producer = Producer::new();

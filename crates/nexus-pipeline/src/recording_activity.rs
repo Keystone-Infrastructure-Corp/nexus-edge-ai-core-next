@@ -119,6 +119,13 @@ impl RecordingActivityPolicy {
         {
             self.degrade(at);
         }
+        // A run that began after the last success seen here was broken
+        // since: by a failure, or by a stale gap no tick saw.
+        if let (Some(run), Some(seen)) = (summary.run, self.last_success_ms) {
+            if run.first_ms > seen {
+                self.degrade(seen.saturating_add(self.stale_after_ms));
+            }
+        }
         self.last_success_ms = self.last_success_ms.max(summary.last_success_ms);
         let fresh_run = summary
             .run
@@ -145,6 +152,13 @@ impl RecordingActivityPolicy {
                 // A reordered pass proves nothing newer about health.
                 if self.last_success_ms.is_some_and(|s| at <= s) {
                     return;
+                }
+                // A gap past the stale deadline no tick saw: health was not sustained.
+                if let Some(s) = self
+                    .last_success_ms
+                    .filter(|&s| at - s > self.stale_after_ms)
+                {
+                    self.degrade(s + self.stale_after_ms);
                 }
                 if self.degraded {
                     self.count_recovery(at);
