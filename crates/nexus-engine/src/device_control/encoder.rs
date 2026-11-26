@@ -18,6 +18,9 @@ use crate::auth::require_role::SessionContext;
 use crate::discovery::onvif_encoder::{self, VideoEncoderConfig, VideoEncoderOptions};
 use crate::discovery::onvif_media::{self, ProfileStream};
 
+/// Max length of encoder error text that leaves the edge.
+const ERR_CAP: usize = 200;
+
 // ---------------------------------------------------------------------------
 // Encoder
 // ---------------------------------------------------------------------------
@@ -57,7 +60,7 @@ pub async fn encoder_get(
     let configs =
         onvif_encoder::get_video_encoder_configurations(&t.endpoint, &t.username, &t.password)
             .await
-            .map_err(gateway_err)?;
+            .map_err(enc_err)?;
     let selected = q.configuration_token.as_deref();
     if selected.is_some_and(|tok| !configs.iter().any(|c| c.token == tok)) {
         return Err(unknown_token());
@@ -105,11 +108,7 @@ pub async fn encoder_put(
     let t = onvif_target(&s, id).await?;
     let checked = tokio::time::timeout(PUT_READ_BUDGET, check_selected(&t, &req.config))
         .await
-        .unwrap_or_else(|_| {
-            Err(gateway_err(
-                "encoder read timed out; nothing written".into(),
-            ))
-        });
+        .unwrap_or_else(|_| Err(enc_err("encoder read timed out; nothing written".into())));
     if let Err(ApiError(status, e)) = checked {
         audit(
             &s,
@@ -124,15 +123,35 @@ pub async fn encoder_put(
         .await;
         return Err(ApiError(status, e));
     }
-    let res = onvif_encoder::set_video_encoder_configuration(
-        &t.endpoint,
-        &t.username,
-        &t.password,
-        &req.config,
-        req.force_persistence,
-    )
-    .await;
+    let res = set_config(&t, &req.config, req.force_persistence).await;
     finish_void(&s, &ctx, &headers, peer.ip(), ACTION, id, res).await
+}
+
+async fn set_config(t: &OnvifTarget, c: &VideoEncoderConfig, force: bool) -> Result<(), String> {
+    onvif_encoder::set_video_encoder_configuration(&t.endpoint, &t.username, &t.password, c, force)
+        .await
+        .map_err(|e| sanitize_err(&e))
+}
+
+/// Camera error text reaches the HTTP response and the audit log, so no
+/// URL (a fault can echo a credential-bearing stream URI, R5b) and at most
+/// [`ERR_CAP`] chars leave the edge.
+fn sanitize_err(e: &str) -> String {
+    let words: Vec<&str> = e
+        .split_whitespace()
+        .map(|w| {
+            if w.contains("://") || w.contains('@') {
+                "[redacted]"
+            } else {
+                w
+            }
+        })
+        .collect();
+    words.join(" ").chars().take(ERR_CAP).collect()
+}
+
+fn enc_err(e: String) -> ApiError {
+    gateway_err(sanitize_err(&e))
 }
 
 fn unknown_token() -> ApiError {
@@ -148,7 +167,7 @@ async fn check_selected(t: &OnvifTarget, new: &VideoEncoderConfig) -> Result<(),
     let configs =
         onvif_encoder::get_video_encoder_configurations(&t.endpoint, &t.username, &t.password)
             .await
-            .map_err(gateway_err)?;
+            .map_err(enc_err)?;
     let current = configs
         .iter()
         .find(|c| c.token == new.token)
@@ -161,7 +180,7 @@ async fn check_selected(t: &OnvifTarget, new: &VideoEncoderConfig) -> Result<(),
         None,
     )
     .await
-    .map_err(gateway_err)?;
+    .map_err(enc_err)?;
     check_write(new, current, &options).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))
 }
 
@@ -549,6 +568,69 @@ mod tests {
         let (bindings, reason) = bind_recording(&configs, &profiles, &rec(SUB));
         assert_eq!(reason, Some("recording_profile_unbound"));
         assert_eq!(bindings, vec![b("VE_main", &["P1"], None)]);
+    }
+
+    const LEAK: &str = "rtsp://user:pass@10.0.0.9:554/s?token=abc http://user:pass@cam/x";
+
+    /// Camera stub: valid configs, SOAP faults (echoing credential-bearing
+    /// URIs) for options, profiles and set.
+    async fn fault_camera() -> OnvifTarget {
+        async fn h(body: String) -> (StatusCode, String) {
+            if body.contains("GetVideoEncoderConfigurations") {
+                return (
+                    StatusCode::OK,
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body><trt:GetVideoEncoderConfigurationsResponse><trt:Configurations token="VE"><tt:Name>m</tt:Name></trt:Configurations></trt:GetVideoEncoderConfigurationsResponse></s:Body></s:Envelope>"#.into(),
+                );
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code><s:Reason><s:Text xml:lang="en">bad {LEAK} {}</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#,
+                    "x".repeat(500)
+                ),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, axum::Router::new().fallback(h)).await;
+        });
+        OnvifTarget {
+            endpoint: format!("http://{addr}/onvif/device_service"),
+            username: "admin".into(),
+            password: "secret".into(),
+        }
+    }
+
+    fn assert_clean(text: &str) {
+        assert!(!text.contains("user:pass@"), "{text}");
+        assert!(!text.contains("://"), "{text}");
+        assert!(!text.contains("token=abc"), "{text}");
+        assert!(text.chars().count() <= ERR_CAP, "{text}");
+        assert!(text.contains("soap fault"), "keeps a stable reason: {text}");
+    }
+
+    #[tokio::test]
+    async fn options_fault_with_credential_uri_is_sanitized() {
+        let t = fault_camera().await;
+        let ApiError(_, e) = check_selected(&t, &cfg("VE")).await.unwrap_err();
+        assert_clean(&e);
+    }
+
+    #[tokio::test]
+    async fn set_fault_with_credential_uri_is_sanitized() {
+        let t = fault_camera().await;
+        let e = set_config(&t, &cfg("VE"), false).await.unwrap_err();
+        assert_clean(&e);
+    }
+
+    #[tokio::test]
+    async fn binding_read_fault_surfaces_only_a_reason_code() {
+        let t = fault_camera().await;
+        let (b, reason) =
+            recording_bindings(&t, &[cfg("VE")], &rec(MAIN), Duration::from_secs(4)).await;
+        assert!(b.is_none());
+        assert_eq!(reason, Some("profiles_unavailable"));
     }
 
     #[tokio::test]
