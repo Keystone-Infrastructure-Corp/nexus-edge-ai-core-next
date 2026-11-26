@@ -873,14 +873,18 @@ impl Controller {
     async fn alert(&mut self, alert: Alert) -> Option<RecordingError> {
         let mut error = None;
         // Without alert recording an alert only links: it is not activity.
-        if self.observed && self.cfg.record_motion_clip_on_alert {
+        // Nor is one whose every event already has its clip: a replay.
+        if self.observed
+            && self.cfg.record_motion_clip_on_alert
+            && !self.all_linked(&alert.event_ids).await
+        {
+            // Decided now, so acted on now: the writer's clock never runs back.
+            let (now, wall) = self.now();
             let intent = self
                 .shadow
                 .as_mut()
-                .map_or(UNVERIFIED, |s| s.alert(alert.captured_mono));
-            error = self
-                .drive(intent, alert.captured_mono, alert.captured_at)
-                .await;
+                .map_or(UNVERIFIED, |s| s.alert(alert.captured_mono, now));
+            error = self.drive(intent, now, wall).await;
         }
         // Linked only to a clip that opened; a refusal is on the receipt.
         match self.clip {
@@ -1194,6 +1198,16 @@ impl Controller {
                 );
             }
         }
+    }
+
+    /// Whether every one of `event_ids` already has its clip.
+    async fn all_linked(&self, event_ids: &[String]) -> bool {
+        for event_id in event_ids {
+            if !matches!(self.store.get_event_clip_id(event_id).await, Ok(Some(_))) {
+                return false;
+            }
+        }
+        !event_ids.is_empty()
     }
 
     /// Link alert events to `handle`. An event already linked keeps its

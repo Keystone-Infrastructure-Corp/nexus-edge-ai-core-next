@@ -1853,6 +1853,43 @@ mod controller {
         assert!(calls.last().unwrap().starts_with("closed 2 "), "{calls:#?}");
     }
 
+    /// Codex review 5, P1 3: an alert replayed after its clip closed is no
+    /// new activity: it opens nothing and its event keeps its link. A
+    /// different alert captured as early but delivered after the close is
+    /// new: its activity counts from the analysis frontier, so it opens a
+    /// clip that keeps a full post-roll.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replayed_alert_opens_nothing_and_a_late_new_one_keeps_its_post_roll() {
+        // No pre-roll: the minimum-duration hold keeps each clip (and its link).
+        let mut c = observed_and_quiet(2, 0).await;
+        let t = c.elapsed_ms();
+        c.frame(t, quiet()).await;
+        let event = c.event(t).await;
+        assert_eq!(clip_id(&c.alert(t, &event).await), Some(2));
+        c.analysing_until(5, "closed 2 ").await;
+
+        let replayed = c.alert(t, &event).await;
+        assert!(replayed.clip.is_none(), "{:#?}", c.rec.calls());
+        assert!(
+            c.rec.calls().last().unwrap().starts_with("closed 2 "),
+            "{:#?}",
+            c.rec.calls()
+        );
+        assert_eq!(c.linked(&event).await, Some(2), "the first link stays");
+
+        let late = c.event(t + 1).await;
+        assert_eq!(clip_id(&c.alert(t, &late).await), Some(3));
+        assert_eq!(c.linked(&late).await, Some(3));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let held = c.now(AnalysisOutcome::Success, 0).await;
+        assert_eq!(
+            clip_id(&held),
+            Some(3),
+            "a full post-roll from the frontier"
+        );
+        c.analysing_until(5, "closed 3 ").await;
+    }
+
     /// A source lost before the minimum is reached ends the hold: the clip
     /// closes with the partial media it has rather than staying open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

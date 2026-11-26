@@ -793,15 +793,15 @@ impl ShadowRecording {
         intent
     }
 
-    /// An explicit alert captured at `captured_mono`.
-    pub fn alert(&mut self, captured_mono: Instant) -> RecordingIntent {
+    /// An explicit alert captured at `captured_mono`, used at `now`.
+    pub fn alert(&mut self, captured_mono: Instant, now: Instant) -> RecordingIntent {
         let origin = *self.shared.lock().origin.get_or_insert(captured_mono);
         let at = millis(captured_mono, origin);
         let policy = self.policy.get_or_insert_with(|| {
             RecordingActivityPolicy::new(self.post_roll_ms, self.stale_after_ms, at)
         });
         policy.alert(at);
-        let intent = policy.tick(at);
+        let intent = policy.tick(millis(now, origin).max(at));
         self.intent = Some(intent);
         intent
     }

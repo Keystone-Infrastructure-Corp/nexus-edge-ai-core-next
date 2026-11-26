@@ -180,9 +180,13 @@ impl RecordingActivityPolicy {
         }
     }
 
-    /// Explicit alert recording: activity independent of the detector's evidence.
+    /// Explicit alert recording: activity independent of the detector's
+    /// evidence. An alert comes on its own channel and may be captured
+    /// behind the frontier; as new activity it counts from the frontier, so
+    /// a late alert still keeps a full post-roll. A replayed alert is not
+    /// new: the caller drops it.
     pub fn alert(&mut self, captured_ms: u64) {
-        self.activity(captured_ms);
+        self.activity(captured_ms.max(self.last_success_ms.unwrap_or(0)));
     }
 
     /// Degraded coverage once the newest successful analysis is older than

@@ -152,6 +152,10 @@ fn explicit_alert_opens_and_holds_post_roll() {
     p.alert(30_500);
     assert_eq!(state(&mut p, 30_500), OPEN_ACTIVITY);
     assert_eq!(closing_pass(&mut p, 31_000), 30_500 + POST_ROLL);
+    // Captured behind the frontier, a late alert counts from it: a full post-roll.
+    p.alert(35_000);
+    assert_eq!(state(&mut p, 40_500), OPEN_ACTIVITY);
+    assert_eq!(closing_pass(&mut p, 41_000), 40_500 + POST_ROLL);
 }
 
 #[test]
