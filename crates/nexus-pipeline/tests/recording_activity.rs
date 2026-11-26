@@ -88,6 +88,35 @@ fn state(p: &mut RecordingActivityPolicy, now: u64) -> (bool, RecordingReason) {
     (i.open, i.reason)
 }
 
+/// SPEC-089 Task 3: the controller sleeps until the policy's answer can
+/// change on its own: the post-roll end or the stale deadline, never while
+/// degraded (only evidence ends that). Each instant is the first the answer
+/// differs.
+#[test]
+fn the_next_change_is_the_post_roll_end_or_the_stale_deadline() {
+    let mut p = RecordingActivityPolicy::new(POST_ROLL, STALE, 0);
+    assert_eq!(
+        p.next_change_ms(0),
+        None,
+        "degraded until evidence recovers it"
+    );
+    let mut p2 = healthy_quiet_at_30s();
+    // The last success was at 30 s: stale after 40 s.
+    assert_eq!(p2.next_change_ms(30_000), Some(40_001));
+    p2.observe(success(31_000, 1));
+    assert_eq!(
+        p2.next_change_ms(31_000),
+        Some(41_000),
+        "post-roll end first"
+    );
+    assert_eq!(state(&mut p2, 40_999), OPEN_ACTIVITY);
+    assert_eq!(state(&mut p2, 41_000), CLOSED);
+    assert_eq!(p2.next_change_ms(41_000), Some(41_001), "then staleness");
+    assert_eq!(state(&mut p2, 41_001), OPEN_DEGRADED);
+    p.observe(success(0, 0));
+    assert_eq!(p.next_change_ms(0), None);
+}
+
 const OPEN_ACTIVITY: (bool, RecordingReason) = (true, RecordingReason::Activity);
 const OPEN_POST_ROLL: (bool, RecordingReason) = (true, RecordingReason::PostRoll);
 const OPEN_DEGRADED: (bool, RecordingReason) = (true, RecordingReason::DegradedCoverage);

@@ -209,6 +209,10 @@ pub struct GstClipRecorder {
     /// Clips whose writer was finalized but whose row step failed, kept
     /// until a retry completes it, whoever awaited the close (SPEC-088).
     unfinalized: Arc<PlMutex<HashMap<ClipId, Unfinalized>>>,
+    /// Per open clip, the media its writer has pushed so far in ms, retained
+    /// pre-roll included (SPEC-089 minimum-duration hold). Set by the open
+    /// and its live pump; read by [`ClipRecorder::inflight_media_ms`].
+    media_written: Arc<PlRwLock<HashMap<ClipId, Arc<AtomicU64>>>>,
     /// Every running open/close task holds a receiver; `shutdown` waits
     /// on `closed()` until none is left (SPEC-088 Z-4).
     in_flight: watch::Sender<()>,
@@ -448,6 +452,7 @@ impl GstClipRecorder {
             open: Arc::new(Mutex::new(HashMap::new())),
             epoch_ended: Arc::new(PlRwLock::new(HashMap::new())),
             unfinalized: Arc::new(PlMutex::new(HashMap::new())),
+            media_written: Arc::new(PlRwLock::new(HashMap::new())),
             in_flight: watch::channel(()).0,
             camera_in_flight: PlMutex::new(HashMap::new()),
             shutting_down: Arc::new(PlMutex::new(false)),
@@ -797,6 +802,7 @@ struct Writers {
     unfinalized: Arc<PlMutex<HashMap<ClipId, Unfinalized>>>,
     in_flight: watch::Sender<()>,
     shutting_down: Arc<PlMutex<bool>>,
+    media_written: Arc<PlRwLock<HashMap<ClipId, Arc<AtomicU64>>>>,
 }
 
 impl GstClipRecorder {
@@ -807,6 +813,7 @@ impl GstClipRecorder {
             bus: self.bus.clone(),
             open: self.open.clone(),
             epoch_ended: self.epoch_ended.clone(),
+            media_written: self.media_written.clone(),
             unfinalized: self.unfinalized.clone(),
             in_flight: self.in_flight.clone(),
             shutting_down: self.shutting_down.clone(),
@@ -996,6 +1003,7 @@ impl Writers {
         // Taken only by the close that won the clip: a racing close of the
         // same clip (shutdown's drain) must not take its epoch flag.
         let epoch_ended = self.epoch_ended.write().remove(&handle.clip_id);
+        self.media_written.write().remove(&handle.clip_id);
         let failure = state.health.guard(UNFINALIZED);
 
         // Step 1: signal the live pump to stop and wait for it. Once
@@ -1521,6 +1529,7 @@ impl ClipRecorder for GstClipRecorder {
             let (gate_tx, gate_rx) = oneshot::channel::<PumpGate>();
             let (pump_stop_tx, pump_stop_rx) = oneshot::channel();
             let epoch_ended = Arc::new(AtomicBool::new(false));
+            let media_written = Arc::new(AtomicU64::new(0));
             let pump_handle = tokio::spawn(run_live_pump(
                 args.camera_id,
                 codec,
@@ -1533,6 +1542,7 @@ impl ClipRecorder for GstClipRecorder {
                 pump_stop_rx,
                 clip_epoch,
                 epoch_ended.clone(),
+                media_written.clone(),
             ));
 
             let appsrc_for_blocking = appsrc.clone();
@@ -1610,6 +1620,12 @@ impl ClipRecorder for GstClipRecorder {
             });
 
             writers.epoch_ended.write().insert(clip_id, epoch_ended);
+            // The pump only raises it, and only once its gate has opened.
+            media_written.fetch_max(
+                media_duration_ms(preroll_last_written_pts_ns) as u64,
+                Ordering::AcqRel,
+            );
+            writers.media_written.write().insert(clip_id, media_written);
             writers.open.lock().await.insert(
                 clip_id,
                 OpenState {
@@ -1702,6 +1718,13 @@ impl ClipRecorder for GstClipRecorder {
             .read()
             .get(&handle.clip_id)
             .is_some_and(|ended| ended.load(Ordering::Acquire))
+    }
+
+    fn inflight_media_ms(&self, handle: ClipHandle) -> Option<u64> {
+        self.media_written
+            .read()
+            .get(&handle.clip_id)
+            .map(|ms| ms.load(Ordering::Acquire))
     }
 
     async fn shutdown(&self) {
@@ -2679,6 +2702,7 @@ async fn run_live_pump(
     mut stop: oneshot::Receiver<()>,
     mut clip_epoch: Option<u64>,
     epoch_ended: Arc<AtomicBool>,
+    media_written: Arc<AtomicU64>,
 ) -> PumpStats {
     let mut stats = PumpStats::default();
     let mut pending: Option<NalSample> = None;
@@ -2917,6 +2941,10 @@ async fn run_live_pump(
     }
 
     loop {
+        media_written.fetch_max(
+            media_duration_ms(last_written_pts_ns) as u64,
+            Ordering::AcqRel,
+        );
         tokio::select! {
             biased;
             _ = &mut stop => {
@@ -5571,6 +5599,8 @@ mod epoch_tests {
         stats: PumpStats,
         /// Buffers that left appsrc: what the prepend and the pump pushed.
         pushed: usize,
+        /// The media the pump reported written while it still ran.
+        media_ms: u64,
         _dir: tempfile::TempDir,
     }
 
@@ -5611,6 +5641,7 @@ mod epoch_tests {
         let (gate_tx, gate_rx) = oneshot::channel();
         let (stop_tx, stop_rx) = oneshot::channel();
         let epoch_ended = Arc::new(AtomicBool::new(false));
+        let media_written = Arc::new(AtomicU64::new(0));
         let mut pump = tokio::spawn(run_live_pump(
             1,
             CodecKind::H264,
@@ -5621,6 +5652,7 @@ mod epoch_tests {
             stop_rx,
             snapshot.first().map(|s| s.epoch),
             epoch_ended.clone(),
+            media_written.clone(),
         ));
         gate_tx
             .send(PumpGate {
@@ -5632,12 +5664,13 @@ mod epoch_tests {
         for s in live {
             tx.send(s).unwrap();
         }
-        let (pump_ended, stats) =
+        let (pump_ended, stats, media_ms) =
             match tokio::time::timeout(Duration::from_millis(1500), &mut pump).await {
-                Ok(stats) => (true, stats.unwrap()),
+                Ok(stats) => (true, stats.unwrap(), media_written.load(Ordering::Acquire)),
                 Err(_) => {
+                    let media_ms = media_written.load(Ordering::Acquire);
                     let _ = stop_tx.send(());
-                    (false, pump.await.unwrap())
+                    (false, pump.await.unwrap(), media_ms)
                 }
             };
         finish(&pipeline, &appsrc);
@@ -5649,6 +5682,7 @@ mod epoch_tests {
             ended_on_epoch_change: epoch_ended.load(Ordering::Acquire),
             stats,
             pushed: pushed.load(Ordering::Relaxed),
+            media_ms,
             _dir: dir,
         }
     }
@@ -5858,6 +5892,11 @@ mod epoch_tests {
         assert_eq!(clip.stats.dropped, 0, "leading deltas are not lag");
         let ms = media_duration_ms(clip.stats.last_written_pts_ns);
         assert!((ms - 2000).abs() <= 50, "40 frames at 20 fps: {ms} ms");
+        // SPEC-089: what the minimum-duration hold reads while the clip records.
+        assert_eq!(
+            clip.media_ms, ms as u64,
+            "live media readable before the close"
+        );
     }
 
     /// #375: an empty-snapshot clip takes its epoch from its first keyframe.
@@ -6342,6 +6381,130 @@ mod epoch_tests {
 
         assert_eq!(writer.current_state(), gst::State::Null);
         assert!(finalized_playable(&store, &clips_dir, clip.clip_id).await);
+    }
+
+    /// SPEC-089 Task 3: the recording controller drives the real recorder
+    /// over an encoded pre-roll. Its open reports that pre-roll as media
+    /// while it records, a resize rotates the file and the stop finalizes
+    /// the last one; every finalized MP4 decodes from offset 0 and hashes to
+    /// its row, and nothing is registered or in flight once the recorder
+    /// has shut down.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_recording_controller_finalizes_every_clip_playable() {
+        use crate::recording_activity::AnalysisOutcome;
+        use crate::recording_controller::{
+            ControllerConfig, EpochChange, EvidenceProducer, Motion, RecordingCommand,
+            COMMAND_TIMEOUT,
+        };
+        use sha2::{Digest, Sha256};
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 10, CodecKind::H264).unwrap();
+        ing.shutdown();
+        for sample in encode(15, "main", 60, Duration::ZERO) {
+            ing.push_preroll_for_test(sample);
+        }
+        let rec = Arc::new(
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap(),
+        );
+        let (stop, stop_rx) = watch::channel(false);
+        let (control, _guard) = crate::recording_controller::spawn(
+            ControllerConfig {
+                camera_id: 1,
+                generation: 1,
+                policy: None,
+                tracker: "bytetrack".into(),
+                post_roll_secs: 10,
+                pre_roll_secs: 10,
+                max_clip_bytes: 0,
+                record_motion_clip_on_alert: false,
+                frame_width: 320,
+                frame_height: 240,
+                observed_enabled: false,
+            },
+            rec.clone(),
+            store.clone(),
+            Arc::new(crate::stats::FrameStatsRegistry::new()),
+            stop_rx,
+        );
+        let mut evidence = EvidenceProducer::new(1, None);
+        let (t0, w0) = (std::time::Instant::now(), Utc::now());
+        let mut frame = |secs: u64, born: bool| {
+            evidence.analysed(
+                t0 + Duration::from_secs(secs),
+                w0 + chrono::Duration::seconds(secs as i64),
+                AnalysisOutcome::Success,
+                Default::default(),
+                Some(Motion {
+                    live: true,
+                    born,
+                    ..Motion::default()
+                }),
+            )
+        };
+        let first = control
+            .request(RecordingCommand::Evidence(frame(0, true)), COMMAND_TIMEOUT)
+            .await
+            .unwrap()
+            .clip
+            .expect("a born track opens a clip");
+        let media = rec.inflight_media_ms(first).unwrap();
+        assert!(media >= 3_000, "four seconds of pre-roll: {media} ms");
+        let resized = EpochChange {
+            captured_at: w0 + chrono::Duration::seconds(5),
+            frame_width: 320,
+            frame_height: 240,
+        };
+        let rotated = control
+            .request(
+                RecordingCommand::StreamEpochChanged(resized),
+                COMMAND_TIMEOUT,
+            )
+            .await
+            .unwrap();
+        assert!(rotated.clip.is_none());
+        let second = control
+            .request(RecordingCommand::Evidence(frame(6, false)), COMMAND_TIMEOUT)
+            .await
+            .unwrap()
+            .clip
+            .expect("the live track reopens after the rotation");
+        assert_ne!(first.clip_id, second.clip_id);
+        let stopped = control
+            .request(RecordingCommand::Stop, COMMAND_TIMEOUT)
+            .await
+            .unwrap();
+        assert!(stopped.clip.is_none());
+        tokio::time::timeout(Duration::from_secs(10), stop.closed())
+            .await
+            .expect("the controller ends once it finalized");
+        rec.shutdown().await;
+
+        assert!(rec.open.lock().await.is_empty(), "a clip left registered");
+        for clip in [first, second] {
+            assert!(finalized_playable(&store, &clips_dir, clip.clip_id).await);
+            let row = store.get_clip(clip.clip_id).await.unwrap().unwrap();
+            let bytes = std::fs::read(clips_dir.join(row.hot_path.unwrap())).unwrap();
+            let hash = format!("{:x}", Sha256::digest(&bytes));
+            assert_eq!(
+                row.sha256.as_deref(),
+                Some(hash.as_str()),
+                "clip {}",
+                clip.clip_id
+            );
+        }
+        let day = clips_dir.join("1").join(w0.format("%Y-%m-%d").to_string());
+        let in_flight: Vec<_> = std::fs::read_dir(&day)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".partial.mp4"))
+            .collect();
+        assert!(in_flight.is_empty(), "in-flight files left: {in_flight:?}");
     }
 
     /// SPEC-088 Z-4: an open cancelled after its writer started, with four

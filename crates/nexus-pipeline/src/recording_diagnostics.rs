@@ -1,7 +1,7 @@
-//! SPEC-089 Task 2: the fresh-evidence recording policy run in shadow beside
-//! legacy recording, and its bounded diagnostics. Nothing here opens, closes
-//! or rotates a file: legacy keeps every recorder call, and shadow only
-//! measures what the policy would have done on the same frames.
+//! SPEC-089: the fresh-evidence recording policy and its bounded
+//! diagnostics. Nothing here opens, closes or rotates a file: the camera's
+//! [`crate::recording_controller`] does, from legacy's decisions in shadow
+//! mode (the policy is only measured) or from the policy's in observed mode.
 //!
 //! Memory per camera is fixed: a [`TRANSITION_RING`]-entry ring, a
 //! fixed-size [`EvidenceSummary`] and counters. What is persisted is one row
@@ -23,7 +23,7 @@ use tracing::warn;
 
 use crate::recording_activity::{
     is_observed, AnalysisOutcome, EvidenceSummary, Observation, RecordingActivityPolicy,
-    RecordingReason,
+    RecordingIntent, RecordingReason,
 };
 
 /// Transition summaries kept per camera. Dropping an older one marks the
@@ -49,6 +49,13 @@ pub struct ReasonMs {
     pub post_roll: u64,
     pub degraded_coverage: u64,
     pub quiet: u64,
+    /// Only observed mode holds a writer for the minimum duration; absent at zero.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub minimum_duration: u64,
+}
+
+fn is_zero(ms: &u64) -> bool {
+    *ms == 0
 }
 
 impl ReasonMs {
@@ -58,6 +65,7 @@ impl ReasonMs {
             RecordingReason::PostRoll => &mut self.post_roll,
             RecordingReason::DegradedCoverage => &mut self.degraded_coverage,
             RecordingReason::Quiet => &mut self.quiet,
+            RecordingReason::MinimumDuration => &mut self.minimum_duration,
         } += ms;
     }
 
@@ -67,6 +75,7 @@ impl ReasonMs {
             post_roll: self.post_roll - earlier.post_roll,
             degraded_coverage: self.degraded_coverage - earlier.degraded_coverage,
             quiet: self.quiet - earlier.quiet,
+            minimum_duration: self.minimum_duration - earlier.minimum_duration,
         }
     }
 }
@@ -361,6 +370,7 @@ impl RecordingDiagnostics {
 /// A camera's shadow runtime, shared by its supervisor and stats readers.
 #[derive(Debug)]
 pub struct ShadowState {
+    mode: RecordingPolicyMode,
     generation: u64,
     policy_revision: String,
     /// Origin of the policy's millisecond clock: the generation's first frame.
@@ -379,7 +389,7 @@ pub struct RecordingActivityRuntime {
     pub generation: u64,
     /// Content revision of the policy running.
     pub policy_revision: String,
-    /// Legacy's open motion clip.
+    /// The open motion clip of whichever side writes: legacy, or observed's policy.
     pub active_clip_id: Option<ClipId>,
     #[serde(flatten)]
     pub diagnostics: DiagnosticsSnapshot,
@@ -407,7 +417,7 @@ impl RecordingActivityRegistry {
         let now_ms = s.origin.map_or(0, |origin| millis(now, origin));
         Some(RecordingActivityRuntime {
             schema_version: 1,
-            mode: RecordingPolicyMode::Shadow,
+            mode: s.mode,
             generation: s.generation,
             policy_revision: s.policy_revision.clone(),
             active_clip_id: s.active_clip,
@@ -416,7 +426,7 @@ impl RecordingActivityRegistry {
     }
 }
 
-fn millis(at: Instant, origin: Instant) -> u64 {
+pub(crate) fn millis(at: Instant, origin: Instant) -> u64 {
     u64::try_from(at.saturating_duration_since(origin).as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -434,6 +444,7 @@ fn reason_str(reason: RecordingReason) -> &'static str {
         RecordingReason::PostRoll => "post_roll",
         RecordingReason::DegradedCoverage => "degraded_coverage",
         RecordingReason::Quiet => "quiet",
+        RecordingReason::MinimumDuration => "minimum_duration",
     }
 }
 
@@ -453,18 +464,59 @@ pub struct ShadowWrites {
     pub episode: Option<RecordingActivityEpisode>,
 }
 
-/// The fresh-evidence policy in shadow for one supervisor generation: fed
-/// the frames legacy decides on, after the same zone and static filters.
+/// The tracker backend `nexus_tracker` names `name`, if it has an
+/// observed/predicted contract the policy can rely on.
+pub fn tracker_backend(name: &str) -> Option<TrackerBackendKind> {
+    match name {
+        "bytetrack" => Some(TrackerBackendKind::Bytetrack),
+        "iou-naive" => Some(TrackerBackendKind::IouNaive),
+        _ => None,
+    }
+}
+
+/// Classify a frame's tracks: `dynamic` are those left after static
+/// suppression, of `total` tracked after the zone filters dropped `excluded`.
+pub fn evidence_counts<'a>(
+    backend: TrackerBackendKind,
+    dynamic: impl Iterator<Item = &'a TrackedObject>,
+    total: usize,
+    excluded: usize,
+) -> EvidenceCounts {
+    let (mut observed, mut seen) = (0u32, 0u32);
+    for t in dynamic {
+        seen += 1;
+        observed += u32::from(is_observed(backend, t));
+    }
+    EvidenceCounts {
+        observed,
+        predicted: seen - observed,
+        stationary: u32::try_from(total)
+            .unwrap_or(u32::MAX)
+            .saturating_sub(seen),
+        excluded: u32::try_from(excluded).unwrap_or(u32::MAX),
+    }
+}
+
+/// The fresh-evidence policy for one supervisor generation, with its
+/// diagnostics: fed the frames legacy decides on, after the same zone and
+/// static filters. In shadow mode it is only measured; in observed mode the
+/// recording controller writes what it intends.
 pub struct ShadowRecording {
     camera_id: CameraId,
     generation: u64,
     backend: TrackerBackendKind,
     post_roll_ms: u64,
     stale_after_ms: u64,
+    /// What [`Self::frame`] reduces itself; the controller passes the producer's.
     sequence: u64,
     summary: EvidenceSummary,
     /// Built at the first frame: degraded coverage counts from healthy ingest.
     policy: Option<RecordingActivityPolicy>,
+    /// The policy's latest answer, which [`Self::record`] traces.
+    intent: Option<RecordingIntent>,
+    /// A pass [`Self::evidence`] applied, counted once [`Self::record`] has
+    /// closed any minute it ended.
+    pass: Option<(AnalysisOutcome, EvidenceCounts, EvidenceSummary)>,
     /// Index and first frame's wall clock of the minute being counted.
     minute: Option<(u64, DateTime<Utc>)>,
     episode: Option<Episode>,
@@ -475,8 +527,8 @@ pub struct ShadowRecording {
 
 impl ShadowRecording {
     /// `None` for legacy, and for a tracker with no observed/predicted
-    /// contract. `observed` is not implemented in this build: it runs as
-    /// shadow, so legacy still writes the footage.
+    /// contract. `observed` runs as shadow, so legacy still writes the
+    /// footage: nothing activates observed recording yet (SPEC-089 Task 4).
     pub fn start(
         registry: &RecordingActivityRegistry,
         camera_id: CameraId,
@@ -490,26 +542,46 @@ impl ShadowRecording {
         if policy.mode == RecordingPolicyMode::Observed {
             warn!(
                 camera_id,
-                "recording_policy observed is not implemented yet; running shadow, legacy records"
+                "recording_policy observed cannot be activated yet; running shadow, legacy records"
             );
         }
-        // The names `nexus_tracker` gives its backends.
-        let backend = match tracker {
-            "bytetrack" => TrackerBackendKind::Bytetrack,
-            "iou-naive" => TrackerBackendKind::IouNaive,
-            other => {
-                warn!(
-                    camera_id,
-                    tracker = other,
-                    "recording_policy shadow needs a tracker with an observed/predicted contract; not running"
-                );
-                return None;
-            }
+        Self::start_as(
+            registry,
+            camera_id,
+            generation,
+            policy,
+            RecordingPolicyMode::Shadow,
+            tracker,
+            post_roll_secs,
+            pre_roll_secs,
+        )
+    }
+
+    /// [`Self::start`] reporting `mode` as the one running.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start_as(
+        registry: &RecordingActivityRegistry,
+        camera_id: CameraId,
+        generation: u64,
+        policy: RecordingPolicyConfig,
+        mode: RecordingPolicyMode,
+        tracker: &str,
+        post_roll_secs: u32,
+        pre_roll_secs: u32,
+    ) -> Option<Self> {
+        let Some(backend) = tracker_backend(tracker) else {
+            warn!(
+                camera_id,
+                tracker,
+                "recording_policy shadow needs a tracker with an observed/predicted contract; not running"
+            );
+            return None;
         };
         let stale_after_ms = policy.analysis_stale_after_ms;
         let shared = registry.start(
             camera_id,
             ShadowState {
+                mode,
                 generation,
                 policy_revision: format!("sha256:{:x}", Sha256::digest(to_json(&policy))),
                 origin: None,
@@ -526,6 +598,8 @@ impl ShadowRecording {
             sequence: 0,
             summary: EvidenceSummary::new(generation, stale_after_ms),
             policy: None,
+            intent: None,
+            pass: None,
             minute: None,
             episode: None,
             last: None,
@@ -533,31 +607,19 @@ impl ShadowRecording {
         })
     }
 
-    /// Classify a frame's tracks: `dynamic` are those left after static
-    /// suppression, of `total` tracked after the zone filters dropped `excluded`.
+    /// [`evidence_counts`] with this policy's tracker backend.
     pub fn counts<'a>(
         &self,
         dynamic: impl Iterator<Item = &'a TrackedObject>,
         total: usize,
         excluded: usize,
     ) -> EvidenceCounts {
-        let (mut observed, mut seen) = (0u32, 0u32);
-        for t in dynamic {
-            seen += 1;
-            observed += u32::from(is_observed(self.backend, t));
-        }
-        EvidenceCounts {
-            observed,
-            predicted: seen - observed,
-            stationary: u32::try_from(total)
-                .unwrap_or(u32::MAX)
-                .saturating_sub(seen),
-            excluded: u32::try_from(excluded).unwrap_or(u32::MAX),
-        }
+        evidence_counts(self.backend, dynamic, total, excluded)
     }
 
-    /// One analysis pass. `alert` is an explicit alert recording on this
-    /// frame; `legacy_clip` is legacy's open clip once the frame is done.
+    /// One analysis pass, reduced here. `alert` is an explicit alert
+    /// recording on this frame; `legacy_clip` is legacy's open clip once the
+    /// frame is done.
     pub fn frame(
         &mut self,
         captured_mono: Instant,
@@ -567,12 +629,8 @@ impl ShadowRecording {
         alert: bool,
         legacy_clip: Option<ClipId>,
     ) -> ShadowWrites {
-        let mut shared = self.shared.lock();
-        let origin = *shared.origin.get_or_insert(captured_mono);
+        let origin = *self.shared.lock().origin.get_or_insert(captured_mono);
         let at = millis(captured_mono, origin);
-        let policy = self.policy.get_or_insert_with(|| {
-            RecordingActivityPolicy::new(self.post_roll_ms, self.stale_after_ms, at)
-        });
         self.sequence += 1;
         self.summary.reduce(
             self.generation,
@@ -586,13 +644,95 @@ impl ShadowRecording {
                 outcome,
             },
         );
+        let summary = self.summary;
+        self.evidence(
+            origin,
+            captured_mono,
+            Some((outcome, counts)),
+            &summary,
+            alert,
+        );
+        self.record(captured_mono, captured_at, legacy_clip, false)
+    }
+
+    /// Apply a producer's coalesced `summary`, reduced on a clock that
+    /// starts at `origin`, as of the frame captured at `captured_mono`.
+    /// `analysis` is that frame's own pass, counted by [`Self::record`].
+    pub fn evidence(
+        &mut self,
+        origin: Instant,
+        captured_mono: Instant,
+        analysis: Option<(AnalysisOutcome, EvidenceCounts)>,
+        summary: &EvidenceSummary,
+        alert: bool,
+    ) -> RecordingIntent {
+        let origin = *self.shared.lock().origin.get_or_insert(origin);
+        let at = millis(captured_mono, origin);
+        let policy = self.policy.get_or_insert_with(|| {
+            RecordingActivityPolicy::new(self.post_roll_ms, self.stale_after_ms, at)
+        });
         if alert {
             policy.alert(at);
         }
-        policy.apply_summary(&self.summary, at);
+        policy.apply_summary(summary, at);
         let intent = policy.tick(at);
+        self.intent = Some(intent);
+        if let Some((outcome, counts)) = analysis {
+            self.pass = Some((outcome, counts, *summary));
+        }
+        intent
+    }
 
+    /// An explicit alert captured at `captured_mono`.
+    pub fn alert(&mut self, captured_mono: Instant) -> RecordingIntent {
+        let origin = *self.shared.lock().origin.get_or_insert(captured_mono);
+        let at = millis(captured_mono, origin);
+        let policy = self.policy.get_or_insert_with(|| {
+            RecordingActivityPolicy::new(self.post_roll_ms, self.stale_after_ms, at)
+        });
+        policy.alert(at);
+        let intent = policy.tick(at);
+        self.intent = Some(intent);
+        intent
+    }
+
+    /// The policy's answer at `now` with no new evidence; `None` before any.
+    pub fn tick(&mut self, now: Instant) -> Option<RecordingIntent> {
+        let origin = self.shared.lock().origin?;
+        let intent = self.policy.as_mut()?.tick(millis(now, origin));
+        self.intent = Some(intent);
+        Some(intent)
+    }
+
+    /// When [`Self::tick`] can next answer differently without new evidence.
+    pub fn next_change(&self, now: Instant) -> Option<Instant> {
+        let origin = self.shared.lock().origin?;
+        let at = self.policy.as_ref()?.next_change_ms(millis(now, origin))?;
+        Some(origin + std::time::Duration::from_millis(at))
+    }
+
+    /// Trace the state once the writer acted on the latest answer:
+    /// `writer_clip` is the open clip, `held` that it is open only for the
+    /// minimum duration. Returns the summaries this finished.
+    pub fn record(
+        &mut self,
+        captured_mono: Instant,
+        captured_at: DateTime<Utc>,
+        writer_clip: Option<ClipId>,
+        held: bool,
+    ) -> ShadowWrites {
         let mut writes = ShadowWrites::default();
+        let Some(intent) = self.intent else {
+            return writes;
+        };
+        let reason = if held {
+            RecordingReason::MinimumDuration
+        } else {
+            intent.reason
+        };
+        let mut shared = self.shared.lock();
+        let origin = *shared.origin.get_or_insert(captured_mono);
+        let at = millis(captured_mono, origin);
         let index = at / MINUTE_MS;
         match self.minute {
             // Forward only: a minute index is written once.
@@ -612,13 +752,15 @@ impl ShadowRecording {
             Some(_) => {}
         }
 
-        shared.active_clip = legacy_clip;
+        shared.active_clip = writer_clip;
         let d = &mut shared.diagnostics;
-        d.observe(outcome, counts, &self.summary);
-        d.transition(at, legacy_clip.is_some(), intent.open, intent.reason);
-        self.last = Some((at, captured_at, intent.reason));
+        if let Some((outcome, counts, summary)) = self.pass.take() {
+            d.observe(outcome, counts, &summary);
+        }
+        d.transition(at, writer_clip.is_some(), intent.open, reason);
+        self.last = Some((at, captured_at, reason));
 
-        if self.episode.as_ref().map(|e| e.clip_id) != legacy_clip {
+        if self.episode.as_ref().map(|e| e.clip_id) != writer_clip {
             let elapsed = d.elapsed().legacy_open;
             writes.episode = self.episode.take().map(|e| {
                 episode_row(
@@ -627,21 +769,21 @@ impl ShadowRecording {
                     &shared.policy_revision,
                     e,
                     captured_at,
-                    intent.reason,
+                    reason,
                     elapsed,
                 )
             });
-            self.episode = legacy_clip.map(|clip_id| Episode {
+            self.episode = writer_clip.map(|clip_id| Episode {
                 clip_id,
                 opened_at: captured_at,
-                open_reason: intent.reason,
+                open_reason: reason,
                 elapsed_at_open: elapsed,
             });
         }
         writes
     }
 
-    /// The supervisor ended and closed legacy's clip: flush what is open,
+    /// The supervisor ended and its clip was closed: flush what is open,
     /// through the last frame (time after it was not traced).
     pub fn finish(&mut self) -> ShadowWrites {
         let mut writes = ShadowWrites::default();

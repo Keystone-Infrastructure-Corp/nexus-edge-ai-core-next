@@ -8,16 +8,15 @@
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
 use nexus_inference::{label_matches_any_prompt, Detector};
 use nexus_rules::RuleEvaluator;
-use nexus_store::{MotionEventKind, NewMotionEvent, Store};
+use nexus_store::Store;
 use nexus_tracker::{
-    filter_excluded_zones, filter_zone_min_area, is_object_static, MotionDecision,
-    MotionEventEmitter, MotionKind, StaticObjectFilter, TrackAnnotator, Tracker,
+    filter_excluded_zones, filter_zone_min_area, is_object_static, MotionEventEmitter, MotionKind,
+    StaticObjectFilter, TrackAnnotator, Tracker,
 };
 use nexus_types::{
     AlertEvent, BBox, CameraId, Frame, FrameMetadata, FrameMetadataLite, PipelineState,
@@ -33,28 +32,18 @@ use crate::entity_sighting::{
     EntityLocalPersist, EntityLocalSeed, SightingHook, SightingScheduler,
 };
 use crate::gate::MotionGate;
-use crate::post_roll::{PostRoll, PostRollAction};
-use crate::recorder::{
-    ClipFinal, ClipHandle, ClipRecorder, OpenClip, RecorderError, MAX_CLIP_DURATION_MS,
-};
+use crate::recorder::ClipRecorder;
 use crate::recording_activity::AnalysisOutcome;
-use crate::recording_diagnostics::{EvidenceCounts, ShadowRecording, ShadowWrites};
+use crate::recording_controller::{
+    Alert, ControllerConfig, ControllerGuard, EpochChange, EvidenceProducer, Motion,
+    RecordingCommand, RecordingControl, RecordingReceipt, COMMAND_TIMEOUT,
+};
+use crate::recording_diagnostics::{evidence_counts, tracker_backend, EvidenceCounts};
 use crate::sink_router::{AlertClipScheduleGate, SinkRouter};
 use crate::skip_policy::DetectorSkipPolicy;
 use crate::source::{FrameSource, VirtualSource};
 use crate::static_clear::StaticAnchorClearRegistry;
 use crate::stats::FrameStatsRegistry;
-
-/// How often (in analysis frames) the supervisor stats the in-flight
-/// clip file to enforce the `max_clip_bytes` byte cap. Statting every
-/// frame would add a syscall to the per-frame fast path for no
-/// benefit — a runaway stream takes many frames to balloon — so we
-/// sample. The cost of sampling is that the on-disk file can overrun
-/// the cap by up to one interval's worth of growth before rotation
-/// fires; the cold-upload quarantine ceiling
-/// (`max_cold_upload_bytes = max_clip_bytes * 2`) absorbs that
-/// overshoot.
-const SIZE_STAT_INTERVAL_FRAMES: u32 = 60;
 
 /// JPEG quality for alert snapshot thumbnails written at rule-fire.
 /// Matches the live-view low-bitrate encoder — high enough for a
@@ -231,14 +220,18 @@ pub struct CameraHandle {
     pub camera_id: CameraId,
     pub task: JoinHandle<()>,
     /// Send `true` to stop the supervisor gracefully: it finishes the frame
-    /// it is on, closes its open motion clip and returns. Aborting `task`
-    /// instead skips that close and abandons the clip. `closed()` resolves
-    /// once the supervisor has returned, since its receiver drops with it.
-    /// Dropping this sender requests nothing.
+    /// it is on (a detect still running is dropped), its recording controller
+    /// closes the open motion clip, and it returns. Aborting `task` leaves
+    /// that close to the controller, which decides nothing more and finalizes
+    /// the clip once `true` is sent here or this sender is dropped (SPEC-089).
+    /// `closed()` resolves once both have ended: each holds a receiver.
     pub stop: watch::Sender<bool>,
     /// SPEC-088 — the zone generation this supervisor runs, which the
     /// reconciler names when it stops it.
     pub zone_generation: u64,
+    /// SPEC-089 — the camera's recording controller, for a live
+    /// `recording_policy` change.
+    pub recording: RecordingControl,
 }
 
 /// Aborts its task on drop, so a task the supervisor spawns ends with it —
@@ -317,6 +310,26 @@ pub fn spawn_camera(
     // generation that must acknowledge it, both fixed before the task runs.
     let zone_revision = crate::zone_application::zone_revision(&cfg.zones);
     let zone_generation = stats.zone_application().start(camera_id, &zone_revision);
+    // SPEC-089 — the only owner of this generation's motion clips.
+    let (recording, recording_guard) = crate::recording_controller::spawn(
+        ControllerConfig {
+            camera_id,
+            generation: zone_generation,
+            policy: cfg.behavior.recording_policy,
+            tracker: tracker.name().to_owned(),
+            post_roll_secs: clips_cfg.post_roll_secs,
+            pre_roll_secs: clips_cfg.pre_roll_secs,
+            max_clip_bytes: clips_cfg.max_clip_bytes,
+            record_motion_clip_on_alert: clips_cfg.record_motion_clip_on_alert,
+            frame_width: supervisor_w,
+            frame_height: supervisor_h,
+            observed_enabled: false,
+        },
+        recorder.clone(),
+        store.clone(),
+        stats.clone(),
+        stop_rx.clone(),
+    );
     let task = tokio::spawn(run_camera(
         cfg,
         detector,
@@ -345,12 +358,15 @@ pub fn spawn_camera(
         stop_rx,
         zone_generation,
         zone_revision,
+        recording.clone(),
+        recording_guard,
     ));
     CameraHandle {
         camera_id,
         task,
         stop,
         zone_generation,
+        recording,
     }
 }
 
@@ -362,15 +378,34 @@ async fn next_frame_or_stop(
     latest: &mut watch::Receiver<Option<Frame>>,
     stop: &mut watch::Receiver<bool>,
 ) -> bool {
-    let stop_requested = async {
-        if stop.wait_for(|requested| *requested).await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    };
     tokio::select! {
         biased;
-        () = stop_requested => false,
+        () = stop_requested(stop) => false,
         changed = latest.changed() => changed.is_ok(),
+    }
+}
+
+/// Resolves once a stop is requested; never for a dropped stop sender.
+async fn stop_requested(stop: &mut watch::Receiver<bool>) {
+    if stop.wait_for(|requested| *requested).await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// SPEC-089 — hand one command to the camera's recording controller and
+/// wait for its receipt. A controller that does not answer is reported, and
+/// the frame goes on: analysis never waits on recording without bound.
+async fn record(
+    control: &RecordingControl,
+    camera_id: nexus_types::CameraId,
+    command: RecordingCommand,
+) -> Option<RecordingReceipt> {
+    match control.request(command, COMMAND_TIMEOUT).await {
+        Ok(receipt) => Some(receipt),
+        Err(e) => {
+            warn!(camera_id, "recording controller: {e}");
+            None
+        }
     }
 }
 
@@ -403,6 +438,10 @@ async fn run_camera(
     mut stop: watch::Receiver<bool>,
     zone_generation: u64,
     zone_revision: String,
+    recording: RecordingControl,
+    // Dropped however this task ends, which is what tells the controller
+    // to finalize a clip this supervisor can no longer close itself.
+    _recording_guard: ControllerGuard,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -527,11 +566,10 @@ async fn run_camera(
         // because some other camera bumped its counter previously.
         let mut last_static_clear_seq = static_clear.current(cfg.id);
 
-        // Motion-event emitter + per-camera clip handle. Single
-        // open clip at a time per camera: opens on the first Born
-        // event when no clip is open, closes on the frame where the
-        // last live track disappears. clip_id is stamped on every
-        // motion_events row before insert (schema invariant).
+        // Motion-event emitter. Its decisions and live-track count go to the
+        // camera's recording controller (SPEC-089), which owns the one open
+        // clip and stamps its clip_id on every motion_events row (schema
+        // invariant).
         let mut emitter = MotionEventEmitter::new(clips_cfg.motion_events_sample_hz);
         // Phase 5.6 · slice 4c-ii — per-camera entity-sighting
         // scheduler. Drives the engine's [`SightingHook`] (default
@@ -550,13 +588,6 @@ async fn run_camera(
             sighting_cfg.crowded_emit_interval,
         )
         .with_first_emit_jitter();
-        let mut current_clip: Option<ClipHandle> = None;
-        // Failed opens and rotations must retain demand independently of motion sampling.
-        let mut pending_open = false;
-        let mut open_retry_at: Option<Instant> = None;
-        let mut open_retry_delay = Duration::from_millis(500);
-        let mut open_panic_refused = false;
-        let mut open_error_logged = false;
         // Alert snapshot output dir — created once per camera task so the
         // per-alert write path (below) never races a mkdir. Failure to
         // create it is non-fatal: snapshots are best-effort and the
@@ -569,44 +600,16 @@ async fn run_camera(
                 "failed to create alert snapshot dir (snapshots disabled for this camera): {e}"
             );
         }
-        // Monotonic capture stamp of the frame the open clip started on.
-        // Used to enforce the M2.1 MAX_CLIP_DURATION_MS bound — once the
-        // open clip exceeds 5min we force-close it and (if motion
-        // or post-roll is still active) reopen a fresh one.
-        // Reset to None on every close.
-        let mut clip_opened_at: Option<std::time::Instant> = None;
-        // Byte cap on the in-flight clip. A corrupt camera H.264
-        // stream can balloon a single short clip to multiple GiB
-        // long before the 5-min duration cap fires, and such a clip
-        // wedges the cold replicator (it can't finish a multi-GiB
-        // upload inside the SAS window). We stat the partial file
-        // every `SIZE_STAT_INTERVAL_FRAMES` while a clip is open and
-        // rotate on the same path as the duration cap once it crosses
-        // `max_clip_bytes`. `0` disables the guard.
-        let max_clip_bytes = clips_cfg.max_clip_bytes;
-        let mut frames_since_size_stat: u32 = 0;
-        let mut post_roll = PostRoll::new(clips_cfg.post_roll_secs);
         // M-Alert-Clip: gate every alert-clip hook on the config flag so
         // the hot path stays free when the feature is off (the default).
         let alert_clips_enabled = clips_cfg.alert_clips.enabled;
-        // Guarantee every alert/event has an underlying full-resolution
-        // motion clip even when the motion tracker never declared `Born`
-        // for it (small / distant / brief motion that trips a rule on a
-        // keyframe pass). When enabled, an alert firing on a frame with
-        // no open clip force-opens a native-resolution motion clip and
-        // each alert frame keeps it open through `post_roll_secs`.
-        let record_motion_clip_on_alert = clips_cfg.record_motion_clip_on_alert;
-        // SPEC-089 — the fresh-evidence policy measured beside legacy on the
-        // same frames. It never calls the recorder; `None` in legacy mode.
-        let mut shadow = ShadowRecording::start(
-            stats.recording_activity(),
-            cfg.id,
-            zone_generation,
-            cfg.behavior.recording_policy,
-            tracker.name(),
-            clips_cfg.post_roll_secs,
-            clips_cfg.pre_roll_secs,
-        );
+        // SPEC-089 — every analysis, coalesced for the recording controller,
+        // whichever policy it runs. `None` for a tracker that cannot tell an
+        // observation from a prediction: its tracks count as none.
+        let mut evidence = EvidenceProducer::new(zone_generation, cfg.behavior.recording_policy);
+        let backend = tracker_backend(tracker.name());
+        // Lets a stop end a frame whose detect never answers (SPEC-089 R-4).
+        let mut frame_stop = stop.clone();
 
         info!(camera_id = cfg.id, "pipeline running");
 
@@ -751,84 +754,13 @@ async fn run_camera(
                     return ControlFlow::Continue(());
                 }
 
-                // M2.1: enforce MAX_CLIP_DURATION_MS. If the currently
-                // open clip has been writing for >= 5 min, close it now
-                // so a fresh one opens below if motion or post-roll is
-                // still active. Done BEFORE motion/event
-                // handling so any alerts/motion on this frame attach
-                // to the new clip rather than the about-to-be-closed
-                // one.
-                if let (Some(handle), Some(opened_at)) = (current_clip, clip_opened_at) {
-                    let age_ms =
-                        frame.captured_mono.saturating_duration_since(opened_at).as_millis() as i64;
-                    let duration_exceeded = age_ms >= MAX_CLIP_DURATION_MS;
-
-                    // Byte-cap guard. Sampled every SIZE_STAT_INTERVAL_FRAMES
-                    // to keep the per-frame fast path syscall-free. Rotates
-                    // on the same close+reopen path as the duration cap so a
-                    // corrupt byte-exploding stream can't produce a single
-                    // multi-GiB clip that wedges the cold replicator.
-                    let mut size_exceeded = false;
-                    if max_clip_bytes > 0 {
-                        frames_since_size_stat += 1;
-                        if frames_since_size_stat >= SIZE_STAT_INTERVAL_FRAMES {
-                            frames_since_size_stat = 0;
-                            if let Some(size_bytes) = recorder.inflight_size_bytes(handle).await {
-                                if size_bytes >= max_clip_bytes {
-                                    size_exceeded = true;
-                                    warn!(
-                                        camera_id = cfg.id,
-                                        clip_id = handle.clip_id,
-                                        size_bytes,
-                                        max_bytes = max_clip_bytes,
-                                        "rotating clip: max size reached \
-                                         (likely corrupt byte-exploding stream)"
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    let epoch_changed = recorder.ended_on_epoch_change(handle);
-                    if epoch_changed {
-                        info!(
-                            camera_id = cfg.id,
-                            clip_id = handle.clip_id,
-                            "rotating clip: stream epoch changed"
-                        );
-                    }
-
-                    if duration_exceeded || size_exceeded || epoch_changed {
-                        if duration_exceeded {
-                            debug!(
-                                camera_id = cfg.id,
-                                clip_id = handle.clip_id,
-                                age_ms,
-                                max_ms = MAX_CLIP_DURATION_MS,
-                                "rotating clip: max duration reached"
-                            );
-                        }
-                        if let Err(e) = recorder
-                            .close(
-                                handle,
-                                ClipFinal {
-                                    ended_at: frame.captured_at,
-                                },
-                            )
-                            .await
-                        {
-                            warn!(
-                                camera_id = cfg.id,
-                                "recorder.close (rotation) failed: {e}"
-                            );
-                        }
-                        current_clip = None;
-                        clip_opened_at = None;
-                        frames_since_size_stat = 0;
-                        // Rotation changes files, not the motion/post-roll lifetime.
-                        pending_open = true;
-                    }
-                }
+                // SPEC-089 — the frame's file deadlines (M2.1 duration and
+                // byte cap, stream epoch) run first on its clock, in the
+                // recording controller, so alerts and motion on this frame
+                // attach to the clip that follows a rotation. Between frames
+                // the controller keeps them on its own clock.
+                let arrived = evidence.arrived(frame.captured_mono, frame.captured_at);
+                record(&recording, cfg.id, RecordingCommand::Evidence(arrived)).await;
 
                 // M_PERF_CROWD Phase E1 — decide BEFORE running the
                 // detector whether this frame is one that the skip policy
@@ -856,25 +788,25 @@ async fn run_camera(
                     Vec::new()
                 } else {
                     let span = info_span!("frame.infer", model = %active_detector.name());
-                    match active_detector
-                        .detect(&frame, &prompts)
-                        .instrument(span)
-                        .await
-                    {
+                    let detected = tokio::select! {
+                        biased;
+                        d = active_detector.detect(&frame, &prompts).instrument(span) => d,
+                        // A hung detector cannot hold a stop: recording is the
+                        // controller's, and it finalizes on the stop below.
+                        () = stop_requested(&mut frame_stop) => return ControlFlow::Break(()),
+                    };
+                    match detected {
                         Ok(d) => d,
                         Err(e) => {
                             error!(camera_id = cfg.id, "detect failed: {e}");
-                            if let Some(shadow) = shadow.as_mut() {
-                                let writes = shadow.frame(
-                                    frame.captured_mono,
-                                    frame.captured_at,
-                                    AnalysisOutcome::Failed,
-                                    EvidenceCounts::default(),
-                                    false,
-                                    current_clip.map(|h| h.clip_id),
-                                );
-                                persist_shadow(&store, shadow, writes).await;
-                            }
+                            let failed = evidence.analysed(
+                                frame.captured_mono,
+                                frame.captured_at,
+                                AnalysisOutcome::Failed,
+                                EvidenceCounts::default(),
+                                None,
+                            );
+                            record(&recording, cfg.id, RecordingCommand::Evidence(failed)).await;
                             return ControlFlow::Continue(());
                         }
                     }
@@ -1087,26 +1019,17 @@ async fn run_camera(
                                 supervisor_downscaled = want_supervisor_downscale;
                                 current_supervisor_w = target_w;
                                 current_supervisor_h = target_h;
-                                if let Some(handle) = current_clip.take() {
-                                    if let Err(e) = recorder
-                                        .close(
-                                            handle,
-                                            ClipFinal {
-                                                ended_at: frame.captured_at,
-                                            },
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            camera_id = cfg.id,
-                                            "recorder.close (RGB tap resize) failed: {e}"
-                                        );
-                                    }
-                                    clip_opened_at = None;
-                                    // Resizing rotates the file, preserving motion and post-roll.
-                                    pending_open = true;
-                                    frames_since_size_stat = 0;
-                                }
+                                let resized = EpochChange {
+                                    captured_at: frame.captured_at,
+                                    frame_width: target_w,
+                                    frame_height: target_h,
+                                };
+                                record(
+                                    &recording,
+                                    cfg.id,
+                                    RecordingCommand::StreamEpochChanged(resized),
+                                )
+                                .await;
                                 rebuild_source = true;
                                 return ControlFlow::Break(());
                             }
@@ -1416,97 +1339,48 @@ async fn run_camera(
                 }
 
                 // Motion lifecycle. The emitter is pure — it just tells
-                // us what changed. We turn its decisions into open/close
-                // recorder calls + motion_events rows here.
+                // us what changed. The recording controller turns its
+                // decisions into open/close recorder calls and
+                // motion_events rows (SPEC-089).
                 //
                 // The synchronous emitter.tick() runs inside the span
                 // via in_scope(); we don't hold an EnteredSpan guard
-                // across recorder/store awaits because EnteredSpan is
-                // !Send and would break tokio::spawn.
+                // across awaits because EnteredSpan is !Send and would
+                // break tokio::spawn.
                 let decisions = info_span!("frame.motion").in_scope(|| {
                     emitter.tick(cfg.id, dynamic_tracked, frame.captured_at, frame.captured_mono)
                 });
-                let alert_kept_alive = record_motion_clip_on_alert && !events_to_link.is_empty();
-                let has_live_motion = emitter.live_track_count(cfg.id) > 0 || alert_kept_alive;
-                let action = post_roll.tick(frame.captured_mono, has_live_motion);
-                if matches!(action, PostRollAction::CloseNow) {
-                    pending_open = false;
-                    open_retry_at = None;
-                    open_retry_delay = Duration::from_millis(500);
-                    open_panic_refused = false;
-                    open_error_logged = false;
-                }
-                // Recorder continuity cannot depend on whether Updated rows are due.
-                let should_open = current_clip.is_none()
-                    && (!open_panic_refused || !recorder.is_panic())
-                    && (open_panic_refused
-                        || open_retry_at.is_none_or(|retry_at| frame.captured_mono >= retry_at))
-                    && (pending_open
-                        || alert_kept_alive
-                        || decisions.iter().any(|d| matches!(d.kind, MotionKind::Born)));
-                if should_open {
-                    if open_panic_refused {
-                        // Panic recovery resumes immediately with a fresh I/O retry budget.
-                        open_panic_refused = false;
-                        open_retry_delay = Duration::from_millis(500);
-                    }
-                    match recorder
-                        .open(OpenClip {
-                            camera_id: cfg.id,
-                            started_at: frame.captured_at,
-                            frame_width: current_supervisor_w,
-                            frame_height: current_supervisor_h,
-                        })
-                        .await
-                    {
-                        Ok(handle) => {
-                            current_clip = Some(handle);
-                            clip_opened_at = Some(frame.captured_mono);
-                            pending_open = false;
-                            open_retry_at = None;
-                            open_retry_delay = Duration::from_millis(500);
-                            open_error_logged = false;
-                        }
-                        Err(RecorderError::Refused) => {
-                            // Let the first refusal report health, then wait for disk recovery.
-                            open_panic_refused = recorder.is_panic();
-                            if open_retry_at.is_none() {
-                                debug!(
-                                    camera_id = cfg.id,
-                                    "recorder refused open; dropping motion frame"
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            if !open_error_logged {
-                                warn!(camera_id = cfg.id, "recorder.open failed: {e}");
-                                open_error_logged = true;
-                            }
-                        }
-                    }
-                    if current_clip.is_none() {
-                        pending_open = true;
-                        // Non-panic failures back off; refusals do not suppress the first error warning.
-                        open_retry_at = Some(frame.captured_mono + open_retry_delay);
-                        open_retry_delay = open_retry_delay.saturating_mul(2).min(Duration::from_secs(30));
-                    }
-                }
-                for d in &decisions {
-                    let Some(handle) = current_clip else {
-                        // Open was refused earlier in this frame and
-                        // we have no clip to stamp. Skip silently —
-                        // pending demand retries after backoff while post-roll is active.
-                        continue;
-                    };
-                    if let Err(e) = insert_motion_decision(&store, handle, d).await {
-                        warn!(camera_id = cfg.id, "insert_motion_event failed: {e}");
-                    }
-                }
+                let counts = backend.map_or_else(EvidenceCounts::default, |backend| {
+                    evidence_counts(
+                        backend,
+                        dynamic_tracks(&tracked_arc, static_filter.is_some()),
+                        tracked_arc.len(),
+                        excluded,
+                    )
+                });
+                let outcome = if skip_detector {
+                    AnalysisOutcome::Skipped
+                } else {
+                    AnalysisOutcome::Success
+                };
+                let motion = Motion {
+                    live: emitter.live_track_count(cfg.id) > 0,
+                    born: decisions.iter().any(|d| matches!(d.kind, MotionKind::Born)),
+                    alerts: events_to_link.len(),
+                    decisions,
+                };
+                let analysed = evidence.analysed(
+                    frame.captured_mono,
+                    frame.captured_at,
+                    outcome,
+                    counts,
+                    Some(motion),
+                );
+                record(&recording, cfg.id, RecordingCommand::Evidence(analysed)).await;
 
-                // Stamp events.clip_id for any alerts that fired this
-                // frame, now that the motion lifecycle has had a chance
-                // to open a clip. When `record_motion_clip_on_alert` is
-                // set, the lifecycle above also opens a
+                // Link this frame's alerts to the clip the controller has open
+                // now that it has decided on the frame. With
+                // `record_motion_clip_on_alert` set, legacy opens a
                 // native-resolution motion clip on alerts so every event has
                 // surrounding full-res video — matching the motion clip
                 // (native resolution, pre-roll, post-roll), NOT the
@@ -1515,72 +1389,26 @@ async fn run_camera(
                 // (clip_id NULL) and the timeline UI shows "no surrounding
                 // video".
                 if !events_to_link.is_empty() {
-                    if let Some(handle) = current_clip {
-                        for event_id in &events_to_link {
-                            if let Err(e) = store.link_event_to_clip(event_id, handle.clip_id).await {
-                                warn!(
-                                    event = %event_id,
-                                    clip_id = handle.clip_id,
-                                    "link_event_to_clip failed: {e}"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Close the clip when the post-roll grace window
-                // elapses without motion returning. Pre-B3 this fired
-                // immediately on `live_track_count == 0`; B3 wraps that
-                // condition in a deferred-close timer so two short
-                // motion bursts inside `clips_cfg.post_roll_secs`
-                // produce a single clip rather than two adjacent
-                // micro-clips. Pre-roll is intentionally a separate PR.
-                //
-                // An alert firing this frame counts as activity for the
-                // deferred close (same as live motion) so an
-                // alert-triggered clip — which may have opened with no
-                // live tracker track at all — stays open and captures the
-                // full post-roll window instead of closing on the very
-                // next frame.
-                if matches!(action, PostRollAction::CloseNow) {
-                    if let Some(handle) = current_clip.take() {
-                        if let Err(e) = recorder
-                            .close(
-                                handle,
-                                ClipFinal {
-                                    ended_at: frame.captured_at,
-                                },
-                            )
-                            .await
-                        {
-                            warn!(camera_id = cfg.id, "recorder.close failed: {e}");
-                        }
-                        clip_opened_at = None;
-                    }
-                }
-
-                // SPEC-089 — after legacy decided this frame, so the shadow
-                // trace compares against the clip legacy actually holds.
-                if let Some(shadow) = shadow.as_mut() {
-                    let counts = shadow.counts(
-                        dynamic_tracks(&tracked_arc, static_filter.is_some()),
-                        tracked_arc.len(),
-                        excluded,
-                    );
-                    let outcome = if skip_detector {
-                        AnalysisOutcome::Skipped
-                    } else {
-                        AnalysisOutcome::Success
+                    let alert = Alert {
+                        event_ids: events_to_link,
+                        captured_mono: frame.captured_mono,
+                        captured_at: frame.captured_at,
                     };
-                    let writes = shadow.frame(
-                        frame.captured_mono,
-                        frame.captured_at,
-                        outcome,
-                        counts,
-                        alert_kept_alive,
-                        current_clip.map(|h| h.clip_id),
-                    );
-                    persist_shadow(&store, shadow, writes).await;
+                    let ids = alert.event_ids.clone();
+                    match record(&recording, cfg.id, RecordingCommand::Alert(alert)).await {
+                        Some(receipt) if receipt.clip.is_none() => debug!(
+                            camera_id = cfg.id,
+                            events = ?ids,
+                            error = ?receipt.error,
+                            "alert events not linked: no motion clip is open"
+                        ),
+                        Some(_) => {}
+                        None => warn!(
+                            camera_id = cfg.id,
+                            events = ?ids,
+                            "alert events may not be linked to a motion clip"
+                        ),
+                    }
                 }
 
                 // SPEC-088 — this frame went through the zone filters and
@@ -1641,27 +1469,9 @@ async fn run_camera(
             }
         }
 
-        // Pipeline ended — close any clip still open so its row
-        // doesn't sit forever with NULL ended_at.
-        post_roll.reset();
-        if let Some(handle) = current_clip.take() {
-            let now = chrono::Utc::now();
-            if let Err(e) = recorder.close(handle, ClipFinal { ended_at: now }).await {
-                warn!(
-                    camera_id = cfg.id,
-                    "final recorder.close on shutdown failed: {e}"
-                );
-            }
-            clip_opened_at = None;
-        }
-        // Suppress dead_assignment / unused_assignments warnings —
-        // `clip_opened_at` is reset for invariant clarity even on the
-        // shutdown path.
-        let _ = clip_opened_at;
-        if let Some(shadow) = shadow.as_mut() {
-            let writes = shadow.finish();
-            persist_shadow(&store, shadow, writes).await;
-        }
+        // Pipeline ended — the controller closes any clip still open so its
+        // row doesn't sit forever with NULL ended_at, and answers once it has.
+        record(&recording, cfg.id, RecordingCommand::Stop).await;
         emitter.forget_camera(cfg.id);
 
         let _ = bus
@@ -1742,63 +1552,6 @@ fn build_source(
             },
         }),
     }
-}
-
-/// SPEC-089 — persist what a shadow frame finished. A summary the store
-/// refuses is reported on the camera's diagnostics, not retried: the trace
-/// says it has a gap.
-// shortcut: awaited on the analysis loop like motion rows (at most a minute row and a clip row per change), move off-loop if store latency ever shows in frame timing.
-async fn persist_shadow(store: &Store, shadow: &ShadowRecording, writes: ShadowWrites) {
-    if let Some(minute) = writes.minute {
-        if let Err(e) = store.insert_recording_activity_minute(&minute).await {
-            shadow.collector_failed(format!("minute summary not saved: {e}"));
-        }
-    }
-    if let Some(episode) = writes.episode {
-        if let Err(e) = store.insert_recording_activity_episode(&episode).await {
-            shadow.collector_failed(format!("episode summary not saved: {e}"));
-        }
-    }
-}
-
-/// Translate one [`MotionDecision`] into a `motion_events` row write.
-/// Lifted out of the loop body so the `match` on `kind` and the
-/// attribute-serialization stay readable.
-async fn insert_motion_decision(
-    store: &Arc<Store>,
-    handle: ClipHandle,
-    d: &MotionDecision,
-) -> Result<(), nexus_store::StoreError> {
-    let kind = match d.kind {
-        MotionKind::Born => MotionEventKind::Born,
-        MotionKind::Updated => MotionEventKind::Updated,
-        MotionKind::Died => MotionEventKind::Died,
-    };
-    // Fast-path the common empty-attributes case (avoids cloning the
-    // map + allocating a serde_json::Value::Object wrapper for every
-    // motion event in a busy scene).
-    #[expect(
-        clippy::expect_used,
-        reason = "serializing a string-keyed JSON map cannot fail"
-    )]
-    let attrs_json = if d.attributes.is_empty() {
-        "{}".to_string()
-    } else {
-        serde_json::to_string(&d.attributes)
-            .expect("string-keyed JSON attributes are infallible to serialize")
-    };
-    let new = NewMotionEvent {
-        camera_id: d.camera_id,
-        clip_id: handle.clip_id,
-        track_id: d.track_id,
-        kind,
-        captured_at: d.captured_at,
-        bbox: d.bbox,
-        label: d.label.clone(),
-        confidence: d.confidence,
-        attributes_json: attrs_json,
-    };
-    store.insert_motion_event(&new).await.map(|_id| ())
 }
 
 #[cfg(test)]

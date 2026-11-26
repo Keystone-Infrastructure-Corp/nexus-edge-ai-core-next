@@ -39,6 +39,9 @@ pub enum RecordingReason {
     PostRoll,
     Quiet,
     DegradedCoverage,
+    /// Activity has ended but the writer holds a new clip until it has the
+    /// recorder's minimum media duration. Set by the controller, never by the policy.
+    MinimumDuration,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -180,6 +183,22 @@ impl RecordingActivityPolicy {
             open: reason != RecordingReason::Quiet,
             reason,
         }
+    }
+
+    /// The first instant after `now_ms` at which [`Self::tick`] can answer
+    /// differently with no new evidence: activity running out or analysis
+    /// going stale. `None` while degraded, which only evidence ends.
+    pub fn next_change_ms(&self, now_ms: u64) -> Option<u64> {
+        if self.degraded {
+            return None;
+        }
+        let quiet = self.last_activity_ms.map(|a| a + self.post_roll_ms.max(1));
+        let stale = self.last_success_ms.map(|s| s + self.stale_after_ms + 1);
+        [quiet, stale]
+            .into_iter()
+            .flatten()
+            .filter(|&t| t > now_ms)
+            .min()
     }
 
     fn activity(&mut self, at: u64) {
