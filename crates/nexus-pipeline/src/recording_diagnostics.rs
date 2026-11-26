@@ -714,6 +714,14 @@ impl ShadowRecording {
         Some(origin + std::time::Duration::from_millis(at))
     }
 
+    /// When the minute being counted ends, so its row is written on time
+    /// even when nothing else happens.
+    pub fn next_minute(&self) -> Option<Instant> {
+        let origin = self.shared.lock().origin?;
+        let (index, _) = self.minute?;
+        Some(origin + std::time::Duration::from_millis((index + 1) * MINUTE_MS))
+    }
+
     /// Trace the state once the writer acted on the latest answer:
     /// `writer_clip` is the open clip, `held` that it is open only for the
     /// minimum duration. Returns the summaries this finished.

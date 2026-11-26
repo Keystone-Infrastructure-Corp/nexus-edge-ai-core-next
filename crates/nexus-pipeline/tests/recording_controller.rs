@@ -702,7 +702,7 @@ mod controller {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use nexus_pipeline::recording_activity::AnalysisOutcome;
+    use nexus_pipeline::recording_activity::{AnalysisOutcome, RecordingReason};
     use nexus_pipeline::recording_controller::{
         self as rc, Alert, ControllerConfig, ControllerGuard, EpochChange, EvidenceProducer,
         Motion, RecordingCommand, RecordingControl, RecordingError, RecordingReceipt,
@@ -828,6 +828,13 @@ mod controller {
             frame_height: H,
             observed_enabled: false,
         }
+    }
+
+    fn shadow(stale_after_ms: u64) -> ControllerConfig {
+        config(Some(RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: stale_after_ms,
+        }))
     }
 
     fn observed(post_roll_secs: u32) -> ControllerConfig {
@@ -1054,6 +1061,49 @@ mod controller {
                 .expect("the controller ends after its stop");
             receipt
         }
+    }
+
+    /// The shadow policy's reason, whether it would record, and whether its
+    /// trace has a gap.
+    fn proposed(c: &Cam) -> Option<(Option<RecordingReason>, bool, bool)> {
+        c.runtime().map(|r| {
+            let d = r.diagnostics;
+            (d.reason, d.shadow_open, d.trace_incomplete)
+        })
+    }
+
+    /// R-4/R-6: shadow proposes what observed would do, on its own clock. A
+    /// first analysis that never returns is degraded coverage from the frame
+    /// that arrived; a healthy, quiet camera whose detector then hangs is
+    /// proposed degraded once analysis goes stale. Legacy writes nothing and
+    /// the trace has no gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shadow_proposes_degraded_coverage_when_analysis_hangs() {
+        let mut c = cam(shadow(1_000), 0, false, false).await;
+        let (mono, wall) = c.clock(0);
+        let arrived = c.producer.arrived(mono, wall);
+        c.send(RecordingCommand::Evidence(arrived), LONG)
+            .await
+            .unwrap();
+        assert_eq!(
+            proposed(&c),
+            Some((Some(RecordingReason::DegradedCoverage), true, false)),
+            "the first analysis is still pending"
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while proposed(&c) != Some((Some(RecordingReason::Quiet), false, false)) {
+            assert!(Instant::now() < deadline, "{:#?}", c.runtime());
+            c.now(AnalysisOutcome::Success, 0).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        // The detector hangs: no evidence at all from here.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            proposed(&c),
+            Some((Some(RecordingReason::DegradedCoverage), true, false)),
+            "stale analysis is proposed as degraded coverage"
+        );
+        assert!(c.rec.calls().is_empty(), "legacy recorded nothing");
     }
 
     /// A slow open is waited for, never raced: the frames behind it time

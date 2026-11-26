@@ -561,10 +561,16 @@ impl Controller {
         if let Some(t) = self.file_deadline() {
             waits.push(until(t));
         }
+        // The policy's own deadlines and minute buckets, in shadow as in observed.
+        if let Some(shadow) = &self.shadow {
+            waits.extend(
+                [shadow.next_change(now), shadow.next_minute()]
+                    .into_iter()
+                    .flatten()
+                    .map(until),
+            );
+        }
         if self.observed {
-            if let Some(t) = self.shadow.as_ref().and_then(|s| s.next_change(now)) {
-                waits.push(until(t));
-            }
             if let Some(hold) = self.hold {
                 waits.push(until(hold.recheck));
             }
@@ -619,16 +625,14 @@ impl Controller {
             if close_now {
                 self.close(wall, "post-roll").await;
             }
+        } else if rotated && self.may_open(now) {
+            // Rotation changes files, not the motion lifetime: the next one opens now.
+            self.open(now, wall).await;
+        }
+        if !self.observed {
             if let Some(shadow) = self.shadow.as_mut() {
                 shadow.tick(now);
             }
-        } else if rotated {
-            // Rotation changes files, not the motion lifetime: the next one opens now.
-            if self.may_open(now) {
-                self.open(now, wall).await;
-            }
-        } else {
-            return;
         }
         self.trace(now, wall).await;
     }
@@ -645,27 +649,37 @@ impl Controller {
             }
         }
         self.last_sequence = self.last_sequence.max(e.sequence);
-        if self.last_frame.is_none_or(|f| f.mono != e.captured_mono) {
-            self.last_frame = Some(FrameClock {
+        // The capture clock never runs back: a frame that waited longer for
+        // the analysis loop was captured before the time it already shows.
+        let (mono, wall) = self.now();
+        let arrived = tokio::time::Instant::now();
+        self.last_frame = Some(match self.last_frame {
+            Some(_) if mono >= e.captured_mono => FrameClock {
+                mono,
+                wall,
+                arrived,
+            },
+            _ => FrameClock {
                 mono: e.captured_mono,
                 wall: e.captured_at,
-                arrived: tokio::time::Instant::now(),
-            });
-        }
+                arrived,
+            },
+        });
+        let (now, wall) = self.now();
         self.stall_check = None;
-        if e.analysis.is_none() {
-            self.rotate_if_due(e.captured_mono, e.captured_at, false)
-                .await;
-            return None;
-        }
 
         let mut error = None;
         let mut close_now = false;
-        if let (Some(motion), false) = (&e.motion, self.observed) {
+        if e.analysis.is_none() {
+            // The frame arrived: its file deadlines first, as legacy's loop did.
+            self.rotate_if_due(e.captured_mono, e.captured_at, false)
+                .await;
+        } else if let (Some(motion), false) = (&e.motion, self.observed) {
             (close_now, error) = self.legacy(e.captured_mono, e.captured_at, motion).await;
         }
         let alerts = e.motion.as_ref().map_or(0, |m| m.alerts);
-        if let (Some(shadow), Some(_)) = (self.shadow.as_mut(), e.analysis) {
+        // Arrival alone starts the policy: degraded coverage counts from healthy ingest.
+        if let Some(shadow) = self.shadow.as_mut() {
             let alert = !self.observed && self.cfg.record_motion_clip_on_alert && alerts > 0;
             let intent = shadow.evidence(e.origin, e.captured_mono, e.analysis, &e.summary, alert);
             if self.observed {
@@ -683,7 +697,7 @@ impl Controller {
                 self.close(e.captured_at, "post-roll").await;
             }
         }
-        self.trace(e.captured_mono, e.captured_at).await;
+        self.trace(now, wall).await;
         error
     }
 
