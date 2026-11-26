@@ -2,9 +2,10 @@
 //! analysis evidence and explicit alerts, never from tracker memory.
 //!
 //! Pure: no I/O, no async, no clock. Every time is elapsed monotonic
-//! milliseconds from the caller (capture stamps for evidence, the
-//! controller's clock for [`RecordingActivityPolicy::tick`]); nothing here
-//! reads wall or UTC time. SPEC-089 Task 2 runs it in shadow beside legacy
+//! milliseconds from the caller: capture stamps for evidence, which also
+//! close activity on the analysis frontier, and the consumer's clock for
+//! freshness alone ([`RecordingActivityPolicy::tick`]); nothing here reads
+//! wall or UTC time. SPEC-089 Task 2 runs it in shadow beside legacy
 //! recording ([`crate::recording_diagnostics`]); nothing here writes footage.
 
 use nexus_config::TrackerBackendKind;
@@ -67,7 +68,15 @@ pub fn is_observed(backend: TrackerBackendKind, object: &TrackedObject) -> bool 
 
 /// Per-camera recording decision. Starts in degraded coverage (open) until
 /// analysis proves healthy; then open from qualifying evidence or an alert
-/// until `last activity + post_roll` (end exclusive).
+/// until `last activity + post_roll` (end exclusive) on the analysis
+/// frontier: the capture time of the newest successful pass applied.
+///
+/// The frontier is the policy's clock. A window closes only once a frame
+/// captured at or after its end has been analysed, so footage always runs
+/// through that capture-time deadline, however late analysis is used. An
+/// analysis stall therefore holds an open window open until analysis is
+/// stale on the consumer's clock, and then degraded coverage records: a
+/// stall never cuts real activity short. That is intended.
 pub struct RecordingActivityPolicy {
     post_roll_ms: u64,
     stale_after_ms: u64,
@@ -171,11 +180,6 @@ impl RecordingActivityPolicy {
         }
     }
 
-    /// Capture time of the latest activity: qualifying evidence, an alert or a recovery.
-    pub fn last_activity_ms(&self) -> Option<u64> {
-        self.last_activity_ms
-    }
-
     /// Explicit alert recording: activity independent of the detector's evidence.
     pub fn alert(&mut self, captured_ms: u64) {
         self.activity(captured_ms);
@@ -193,19 +197,18 @@ impl RecordingActivityPolicy {
         }
     }
 
+    /// The intent now: freshness is judged at `now_ms`, the consumer's
+    /// clock; activity and post-roll only on the analysis frontier.
     pub fn tick(&mut self, now_ms: u64) -> RecordingIntent {
         self.expire(now_ms);
+        // Unreachable while healthy: recovery takes successes.
+        let frontier = self.last_success_ms.unwrap_or(0);
         let reason = match self.last_activity_ms {
             _ if self.degraded => RecordingReason::DegradedCoverage,
-            // The activity instant itself is open even with zero post-roll.
-            Some(a) if now_ms <= a || now_ms - a < self.post_roll_ms => {
-                // Activity while the newest analysed frame carried it.
-                if self.last_success_ms.is_none_or(|s| a >= s) {
-                    RecordingReason::Activity
-                } else {
-                    RecordingReason::PostRoll
-                }
-            }
+            // The newest analysed frame carried it: open even with zero
+            // post-roll, until a newer pass shows nothing.
+            Some(a) if frontier <= a => RecordingReason::Activity,
+            Some(a) if frontier < a.saturating_add(self.post_roll_ms) => RecordingReason::PostRoll,
             _ => RecordingReason::Quiet,
         };
         RecordingIntent {
@@ -215,19 +218,16 @@ impl RecordingActivityPolicy {
     }
 
     /// The first instant after `now_ms` at which [`Self::tick`] can answer
-    /// differently with no new evidence: activity running out or analysis
-    /// going stale. `None` while degraded, which only evidence ends.
+    /// differently with no new evidence: analysis going stale. Activity
+    /// ends only with evidence, so it has no timer. `None` while degraded,
+    /// which only evidence ends.
     pub fn next_change_ms(&self, now_ms: u64) -> Option<u64> {
         if self.degraded {
             return None;
         }
-        let quiet = self.last_activity_ms.map(|a| a + self.post_roll_ms.max(1));
-        let stale = self.last_success_ms.map(|s| s + self.stale_after_ms + 1);
-        [quiet, stale]
-            .into_iter()
-            .flatten()
+        self.last_success_ms
+            .map(|s| s + self.stale_after_ms + 1)
             .filter(|&t| t > now_ms)
-            .min()
     }
 
     fn activity(&mut self, at: u64) {

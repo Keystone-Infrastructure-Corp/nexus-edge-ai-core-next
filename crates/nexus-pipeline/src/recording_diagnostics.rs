@@ -35,6 +35,9 @@ const MINUTE_MS: u64 = 60_000;
 /// One change of the legacy recorder's state or of the shadow intent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Transition {
+    /// The policy clock: an evidence-driven change at its frame's capture,
+    /// a change the stale deadline drove at the controller's now; never
+    /// before the previous transition.
     pub at_ms: u64,
     /// The wall clock read with `at_ms`: a later wall-clock correction moves neither.
     pub wall_at: DateTime<Utc>,
@@ -760,9 +763,9 @@ impl ShadowRecording {
 
     /// Apply a producer's coalesced `summary`, reduced on a clock that
     /// starts at `origin`, as of the frame captured at `captured_mono` and
-    /// used at `now`: evidence keeps its capture times, the intent and
-    /// freshness are judged now. `analysis` is that frame's own pass,
-    /// counted by [`Self::record`].
+    /// used at `now`: activity runs on the analysis frontier the summary
+    /// carries, freshness is judged now. `analysis` is that frame's own
+    /// pass, counted by [`Self::record`].
     pub fn evidence(
         &mut self,
         origin: Instant,
@@ -778,18 +781,11 @@ impl ShadowRecording {
         let policy = self.policy.get_or_insert_with(|| {
             RecordingActivityPolicy::new(self.post_roll_ms, self.stale_after_ms, at)
         });
-        let seen = policy.last_activity_ms();
         if alert {
             policy.alert(at);
         }
         policy.apply_summary(summary, now_ms);
-        // A window that ran out before its evidence was used stays shut.
-        // Activity new here still opens its own instant, as zero post-roll
-        // does: late analysis delays recording, it never drops a sighting.
-        let intent = match (policy.tick(now_ms), policy.last_activity_ms()) {
-            (intent, Some(a)) if !intent.open && Some(a) > seen => policy.tick(a),
-            (intent, _) => intent,
-        };
+        let intent = policy.tick(now_ms);
         self.intent = Some(intent);
         if let Some((outcome, counts)) = analysis {
             self.pass = Some((outcome, counts, *summary));
@@ -833,13 +829,18 @@ impl ShadowRecording {
         Some(origin + std::time::Duration::from_millis((index + 1) * MINUTE_MS))
     }
 
-    /// Trace the state once the writer acted on the latest answer:
-    /// `writer_clip` is the open clip, `held` that it is open only for the
-    /// minimum duration. Returns the summaries this finished.
+    /// Trace the state once the writer acted on the latest answer, as of
+    /// `captured_mono` read with the wall clock `captured_at`: an
+    /// evidence-driven state at its frame's capture, one the policy's
+    /// deadline drove at the caller's now. A time before the latest traced
+    /// one is held there, its wall clock run on with it: evidence used late
+    /// never runs the trace back. `writer_clip` is the open clip, `held`
+    /// that it is open only for the minimum duration. Returns the summaries
+    /// this finished.
     pub fn record(
         &mut self,
         captured_mono: Instant,
-        captured_at: DateTime<Utc>,
+        mut captured_at: DateTime<Utc>,
         writer_clip: Option<ClipId>,
         held: bool,
     ) -> ShadowWrites {
@@ -854,7 +855,11 @@ impl ShadowRecording {
         };
         let mut shared = self.shared.lock();
         let origin = *shared.origin.get_or_insert(captured_mono);
-        let at = millis(captured_mono, origin);
+        let mut at = millis(captured_mono, origin);
+        if let Some((last, ..)) = self.last.filter(|&(last, ..)| last > at) {
+            captured_at += chrono::Duration::milliseconds((last - at) as i64);
+            at = last;
+        }
         let index = at / MINUTE_MS;
         match self.minute {
             // Forward only: a minute index is written once.
@@ -1406,24 +1411,77 @@ mod tests {
         assert_eq!(used(31_000, 46_000), DegradedCoverage);
     }
 
-    /// Codex review 4: the intent is decided when evidence is used, on the
-    /// evidence's capture times. With 1 s of post-roll, activity at 10 s
-    /// closes at 11 s; an empty frame captured at 10.5 s and used at 12 s
-    /// cannot reopen it. A late qualifying frame is new evidence when used:
-    /// it opens its own instant only, as zero post-roll does, and the next
-    /// use without new activity closes it. Shadow's accounting counts no
-    /// reopened window.
-    #[test]
-    fn late_evidence_is_decided_when_used_on_its_capture_times() {
-        fn used(
-            s: &mut ShadowRecording,
-            summary: &mut EvidenceSummary,
-            t0: Instant,
-            w0: DateTime<Utc>,
-            (captured, now, observed): (u64, u64, u32),
-        ) -> (RecordingReason, bool) {
-            let sequence = summary.through_sequence + 1;
-            summary.reduce(
+    /// What the recording controller does with a shadow policy, replayed:
+    /// it wakes at each deadline the policy names before evidence is used,
+    /// traced then, and traces evidence at its frame's capture.
+    struct Replay {
+        registry: RecordingActivityRegistry,
+        s: ShadowRecording,
+        summary: EvidenceSummary,
+        t0: Instant,
+        w0: DateTime<Utc>,
+        /// The controller's clock.
+        now: u64,
+    }
+
+    impl Replay {
+        fn start(post_roll_secs: u32, pre_roll_secs: u32) -> Self {
+            let registry = RecordingActivityRegistry::default();
+            let policy = RecordingPolicyConfig {
+                mode: RecordingPolicyMode::Shadow,
+                analysis_stale_after_ms: 10_000,
+            };
+            let s = ShadowRecording::start(
+                &registry,
+                3,
+                9,
+                Some(policy),
+                "rev-9",
+                "iou-naive",
+                post_roll_secs,
+                pre_roll_secs,
+            )
+            .unwrap();
+            Self {
+                registry,
+                s,
+                summary: EvidenceSummary::new(9, 10_000),
+                t0: Instant::now(),
+                w0: Utc::now(),
+                now: 0,
+            }
+        }
+
+        fn at(&self, ms: u64) -> Instant {
+            self.t0 + std::time::Duration::from_millis(ms)
+        }
+
+        fn wall(&self, ms: u64) -> DateTime<Utc> {
+            self.w0 + chrono::Duration::milliseconds(ms as i64)
+        }
+
+        /// Run the controller's clock to `until`, waking at each policy
+        /// deadline before it.
+        fn wait(&mut self, until: u64) {
+            while let Some(t) = self
+                .s
+                .next_change(self.at(self.now))
+                .filter(|&t| t < self.at(until))
+            {
+                let ms = millis(t, self.t0);
+                self.s.tick(t);
+                self.s.record(t, self.wall(ms), None, false);
+                self.now = ms;
+            }
+            self.now = until;
+        }
+
+        /// Use the analysis of the frame captured at `captured`, with
+        /// `observed` qualifying objects, at `now`.
+        fn used(&mut self, captured: u64, now: u64, observed: u32) -> RecordingReason {
+            self.wait(now);
+            let sequence = self.summary.through_sequence + 1;
+            self.summary.reduce(
                 9,
                 sequence,
                 Observation {
@@ -1434,75 +1492,156 @@ mod tests {
                     outcome: AnalysisOutcome::Success,
                 },
             );
+            let summary = self.summary;
             let counts = EvidenceCounts {
                 observed,
                 ..EvidenceCounts::default()
             };
-            let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
-            let intent = s.evidence(
-                t0,
-                at(captured),
-                at(now),
+            let intent = self.s.evidence(
+                self.t0,
+                self.at(captured),
+                self.at(now),
                 Some((AnalysisOutcome::Success, counts)),
-                summary,
+                &summary,
                 false,
             );
-            s.record(
-                at(now),
-                w0 + chrono::Duration::milliseconds(now as i64),
-                None,
-                false,
-            );
-            (intent.reason, intent.open)
+            self.s
+                .record(self.at(captured), self.wall(captured), None, false);
+            intent.reason
         }
-        let registry = RecordingActivityRegistry::default();
-        let policy = RecordingPolicyConfig {
-            mode: RecordingPolicyMode::Shadow,
-            analysis_stale_after_ms: 10_000,
-        };
-        let mut s =
-            ShadowRecording::start(&registry, 3, 9, Some(policy), "rev-9", "iou-naive", 1, 0)
-                .unwrap();
-        let (t0, w0) = (Instant::now(), Utc::now());
-        let mut summary = EvidenceSummary::new(9, 10_000);
-        // Healthy from 2 s (the recovery gate), quiet from 3 s.
-        for ms in (0..=9_000).step_by(1_000) {
-            used(&mut s, &mut summary, t0, w0, (ms, ms, 0));
-        }
-        let mut use_at = |evidence| used(&mut s, &mut summary, t0, w0, evidence);
-        assert_eq!(use_at((10_000, 10_000, 1)), (Activity, true));
-        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
-        let closed = s.tick(at(11_000)).unwrap();
-        s.record(at(11_000), w0, None, false);
-        assert_eq!((closed.reason, closed.open), (Quiet, false));
 
-        let mut use_at = |evidence| used(&mut s, &mut summary, t0, w0, evidence);
+        /// Healthy from the recovery gate at 2 s, each pass used as captured.
+        fn healthy(&mut self) {
+            for ms in (0..=9_000).step_by(1_000) {
+                self.used(ms, ms, 0);
+            }
+        }
+
+        /// The retained transitions from `from_ms`: when, shadow open, why.
+        fn trace(&self, from_ms: u64) -> Vec<(u64, bool, RecordingReason)> {
+            let trace = self
+                .registry
+                .trace(3, self.at(self.now), self.wall(self.now))
+                .unwrap();
+            assert!(!trace.trace_incomplete, "{trace:#?}");
+            trace
+                .transitions
+                .iter()
+                .filter(|t| t.at_ms >= from_ms)
+                .map(|t| (t.at_ms, t.shadow_open, t.reason))
+                .collect()
+        }
+
+        fn snapshot(&self) -> DiagnosticsSnapshot {
+            self.registry
+                .snapshot(3, self.at(self.now))
+                .unwrap()
+                .diagnostics
+                .unwrap()
+        }
+    }
+
+    /// Codex review 5, P1 1: qualifying frames captured every 1.5 s, each
+    /// used 1.5 s later, under 2 s of post-roll and 5 s of pre-roll. The
+    /// window is judged on the analysis frontier, so the lag closes nothing
+    /// between uses: one window, closed by the first pass captured at or
+    /// after the last qualifying capture + 2 s.
+    #[test]
+    fn steady_analysis_lag_keeps_one_window_open() {
+        let mut r = Replay::start(2, 5);
+        r.healthy();
+        for captured in [10_000, 11_500, 13_000, 14_500] {
+            assert_eq!(
+                r.used(captured, captured + 1_500, 1),
+                Activity,
+                "{captured}"
+            );
+        }
+        assert_eq!(r.used(16_000, 17_500, 0), PostRoll, "before 14.5 s + 2 s");
+        assert_eq!(r.used(17_500, 19_000, 0), Quiet);
         assert_eq!(
-            use_at((10_500, 12_000, 0)),
-            (Quiet, false),
-            "a late empty frame reopens no expired window"
+            r.trace(10_000),
+            [
+                (10_000, true, Activity),
+                (16_000, true, PostRoll),
+                (17_500, false, Quiet)
+            ]
         );
         assert_eq!(
-            use_at((11_500, 13_000, 1)),
-            (Activity, true),
-            "a late qualifying frame opens its own instant"
+            r.snapshot().shadow_recorded_ms,
+            (4_000 + 5_000) + (7_500 + 5_000),
+            "[0, 4 s) startup and recovery, [10, 17.5 s), each with 5 s of pre-roll"
         );
+    }
+
+    /// Codex review 5, P1 2: a qualifying frame captured at 10 s is used at
+    /// 12 s under 1 s of post-roll. Its window ends on capture time: the
+    /// first pass captured at or after 11 s closes it, however late it is
+    /// used, and the accounting is exactly [10, 11 s). An empty frame
+    /// captured before that close but used after it, or an older summary
+    /// read again, reopens nothing (Codex review 4).
+    #[test]
+    fn a_late_qualifying_frame_closes_once_the_frontier_reaches_its_end() {
+        let mut r = Replay::start(1, 0);
+        r.healthy();
+        assert_eq!(r.used(10_000, 12_000, 1), Activity);
         assert_eq!(
-            use_at((12_000, 13_100, 0)),
-            (Quiet, false),
-            "its post-roll had already run out"
+            r.used(10_500, 12_200, 0),
+            PostRoll,
+            "the frontier is short of 11 s"
         );
-        let snapshot = registry
-            .snapshot(3, at(14_000))
-            .unwrap()
-            .diagnostics
-            .unwrap();
+        let older = r.summary;
+        assert_eq!(r.used(11_000, 12_400, 0), Quiet);
         assert_eq!(
-            snapshot.shadow_recorded_ms,
-            3_000 + 1_000 + 100,
-            "[0, 3 s) degraded then recovered, [10, 11 s) and [13, 13.1 s)"
+            r.used(10_700, 13_000, 0),
+            Quiet,
+            "captured before the close"
         );
-        assert_eq!(snapshot.elapsed.legacy_closed.post_roll, 0);
+        let at = |ms| r.t0 + std::time::Duration::from_millis(ms);
+        let reread =
+            r.s.evidence(r.t0, at(10_500), at(13_200), None, &older, false);
+        assert_eq!(reread.reason, Quiet, "an older summary");
+        assert_eq!(
+            r.trace(10_000),
+            [
+                (10_000, true, Activity),
+                (10_500, true, PostRoll),
+                (11_000, false, Quiet)
+            ]
+        );
+        let s = r.snapshot();
+        assert_eq!(
+            s.shadow_recorded_ms,
+            3_000 + 1_000,
+            "[0, 3 s) and [10, 11 s)"
+        );
+        assert_eq!(s.elapsed.legacy_closed.post_roll, 500);
+    }
+
+    /// Codex review 5, P1 2: with no pass after a late qualifying frame the
+    /// window stays open, as on any analysis stall, until analysis is stale
+    /// on the consumer's clock; then degraded coverage records. A stall
+    /// never cuts activity short.
+    #[test]
+    fn a_late_qualifying_frame_with_no_later_pass_degrades_when_stale() {
+        let mut r = Replay::start(1, 0);
+        r.healthy();
+        assert_eq!(r.used(10_000, 12_000, 1), Activity);
+        r.wait(25_000);
+        assert_eq!(
+            r.trace(10_000),
+            [(10_000, true, Activity), (20_001, true, DegradedCoverage)]
+        );
+        let s = r.snapshot();
+        assert_eq!(
+            (
+                s.elapsed.legacy_closed.activity,
+                s.elapsed.legacy_closed.post_roll
+            ),
+            (1_000 + 10_001, 0),
+            "[2, 3 s) recovery, then [10, 20.001 s)"
+        );
+        assert_eq!(s.shadow_recorded_ms, 3_000 + 15_000, "open through 25 s");
     }
 
     #[test]

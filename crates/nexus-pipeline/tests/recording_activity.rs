@@ -88,12 +88,27 @@ fn state(p: &mut RecordingActivityPolicy, now: u64) -> (bool, RecordingReason) {
     (i.open, i.reason)
 }
 
+/// Empty passes every 500 ms from `from`, each judged as it is analysed:
+/// the capture of the first that closes the window, every earlier one
+/// holding it in post-roll.
+fn closing_pass(p: &mut RecordingActivityPolicy, from: u64) -> u64 {
+    for t in (from..).step_by(500) {
+        p.observe(success(t, 0));
+        match state(p, t) {
+            OPEN_POST_ROLL => {}
+            CLOSED => return t,
+            other => panic!("{other:?} at {t}"),
+        }
+    }
+    unreachable!("the window never closed")
+}
+
 /// SPEC-089 Task 3: the controller sleeps until the policy's answer can
-/// change on its own: the post-roll end or the stale deadline, never while
-/// degraded (only evidence ends that). Each instant is the first the answer
-/// differs.
+/// change on its own: only the stale deadline, never while degraded (only
+/// evidence ends that). Activity runs on the analysis frontier, so it ends
+/// only with a newer pass: no timer, however long the consumer waits.
 #[test]
-fn the_next_change_is_the_post_roll_end_or_the_stale_deadline() {
+fn the_next_change_is_only_the_stale_deadline() {
     let mut p = RecordingActivityPolicy::new(POST_ROLL, STALE, 0);
     assert_eq!(
         p.next_change_ms(0),
@@ -104,15 +119,13 @@ fn the_next_change_is_the_post_roll_end_or_the_stale_deadline() {
     // The last success was at 30 s: stale after 40 s.
     assert_eq!(p2.next_change_ms(30_000), Some(40_001));
     p2.observe(success(31_000, 1));
+    assert_eq!(p2.next_change_ms(31_000), Some(41_001), "no activity timer");
     assert_eq!(
-        p2.next_change_ms(31_000),
-        Some(41_000),
-        "post-roll end first"
+        state(&mut p2, 41_000),
+        OPEN_ACTIVITY,
+        "no newer pass: the newest analysed frame still carries it"
     );
-    assert_eq!(state(&mut p2, 40_999), OPEN_ACTIVITY);
-    assert_eq!(state(&mut p2, 41_000), CLOSED);
-    assert_eq!(p2.next_change_ms(41_000), Some(41_001), "then staleness");
-    assert_eq!(state(&mut p2, 41_001), OPEN_DEGRADED);
+    assert_eq!(state(&mut p2, 41_001), OPEN_DEGRADED, "then staleness");
     p.observe(success(0, 0));
     assert_eq!(p.next_change_ms(0), None);
 }
@@ -130,9 +143,7 @@ fn stationary_observed_person_keeps_renewing() {
         p.observe(success(t, 1));
         assert_eq!(state(&mut p, t), OPEN_ACTIVITY, "at {t}");
     }
-    quiet(&mut p, 632_000, 650_000);
-    assert_eq!(state(&mut p, 631_000 + POST_ROLL - 1), OPEN_POST_ROLL);
-    assert_eq!(state(&mut p, 631_000 + POST_ROLL), CLOSED);
+    assert_eq!(closing_pass(&mut p, 631_500), 631_000 + POST_ROLL);
 }
 
 #[test]
@@ -140,9 +151,7 @@ fn explicit_alert_opens_and_holds_post_roll() {
     let mut p = healthy_quiet_at_30s();
     p.alert(30_500);
     assert_eq!(state(&mut p, 30_500), OPEN_ACTIVITY);
-    quiet(&mut p, 31_000, 45_000);
-    assert_eq!(state(&mut p, 30_500 + POST_ROLL - 1), OPEN_POST_ROLL);
-    assert_eq!(state(&mut p, 30_500 + POST_ROLL), CLOSED);
+    assert_eq!(closing_pass(&mut p, 31_000), 30_500 + POST_ROLL);
 }
 
 #[test]
@@ -231,9 +240,8 @@ fn recovery_grants_exactly_one_post_roll_window() {
         p.observe(success(t, 0));
     }
     assert_eq!(state(&mut p, 33_000), OPEN_ACTIVITY);
-    quiet(&mut p, 34_000, 80_000);
-    assert_eq!(state(&mut p, 33_000 + POST_ROLL - 1), OPEN_POST_ROLL);
-    assert_eq!(state(&mut p, 33_000 + POST_ROLL), CLOSED);
+    assert_eq!(closing_pass(&mut p, 33_500), 33_000 + POST_ROLL);
+    quiet(&mut p, 44_000, 80_000);
     assert_eq!(state(&mut p, 80_000), CLOSED, "no second window");
 }
 
@@ -281,9 +289,8 @@ fn reordered_capture_times_never_move_the_activity_clock_backwards() {
         received_ms: 40_500,
         ..success(35_000, 1)
     });
-    quiet(&mut p, 41_000, 60_000);
-    assert_eq!(state(&mut p, 40_000 + POST_ROLL - 1), OPEN_POST_ROLL);
-    assert_eq!(state(&mut p, 40_000 + POST_ROLL), CLOSED);
+    assert_eq!(closing_pass(&mut p, 40_500), 40_000 + POST_ROLL);
+    quiet(&mut p, 50_500, 60_000);
 
     // Late successes older than the degradation do not count toward recovery.
     p.observe(obs(60_500, 0, 0, AnalysisOutcome::Failed));
@@ -296,6 +303,8 @@ fn reordered_capture_times_never_move_the_activity_clock_backwards() {
     assert_eq!(state(&mut p, 63_000), OPEN_DEGRADED);
 }
 
+/// The activity instant is the analysis frontier: open while the newest
+/// analysed frame is the one that carried it, closed by the next pass.
 #[test]
 fn zero_post_roll_opens_only_at_the_activity_instant() {
     let mut p = RecordingActivityPolicy::new(0, STALE, 0);
@@ -303,10 +312,13 @@ fn zero_post_roll_opens_only_at_the_activity_instant() {
     assert_eq!(state(&mut p, 30_000), CLOSED);
     p.observe(success(31_000, 1));
     assert_eq!(state(&mut p, 31_000), OPEN_ACTIVITY);
-    assert_eq!(state(&mut p, 31_001), CLOSED);
+    assert_eq!(state(&mut p, 31_001), OPEN_ACTIVITY, "no newer pass yet");
+    p.observe(success(31_500, 0));
+    assert_eq!(state(&mut p, 31_500), CLOSED);
     p.alert(32_000);
     assert_eq!(state(&mut p, 32_000), OPEN_ACTIVITY);
-    assert_eq!(state(&mut p, 32_001), CLOSED);
+    p.observe(success(32_500, 0));
+    assert_eq!(state(&mut p, 32_500), CLOSED);
 }
 
 #[test]
@@ -331,9 +343,7 @@ fn elapsed_clock_jumps_fail_safe() {
         captured_ms: t + 1_000_000,
         ..success(t, 1)
     });
-    quiet(&mut p, later + 21_000, later + 40_000);
-    assert_eq!(state(&mut p, t + POST_ROLL - 1), OPEN_POST_ROLL);
-    assert_eq!(state(&mut p, t + POST_ROLL), CLOSED);
+    assert_eq!(closing_pass(&mut p, t + 500), t + POST_ROLL);
 
     // Clocks near the end of u64 do not overflow.
     let mut p = RecordingActivityPolicy::new(POST_ROLL, STALE, u64::MAX - 10_000);
@@ -453,10 +463,13 @@ fn a_stalled_consumer_recovers_exactly_once_from_coalesced_successes() {
     for t in (6_000..=20_000).step_by(2_000) {
         p.apply_summary(producer.push(success(t, 0)), t);
         p.apply_summary(&read, t);
+        let once = if t < 4_000 + POST_ROLL {
+            OPEN_POST_ROLL
+        } else {
+            CLOSED
+        };
+        assert_eq!(state(&mut p, t), once, "post-roll runs out once, at {t}");
     }
-    assert_eq!(state(&mut p, 4_000 + POST_ROLL - 1), OPEN_POST_ROLL);
-    assert_eq!(state(&mut p, 4_000 + POST_ROLL), CLOSED);
-    assert_eq!(state(&mut p, 20_000), CLOSED, "post-roll expired once");
 }
 
 #[test]
@@ -488,9 +501,13 @@ fn a_failure_and_its_recovery_survive_missed_publications() {
     assert_eq!(state(&mut p, 33_000), OPEN_ACTIVITY);
     for t in (34_000..=50_000).step_by(1_000) {
         p.apply_summary(producer.push(success(t, 0)), t);
+        let window = if t < 33_000 + POST_ROLL {
+            OPEN_POST_ROLL
+        } else {
+            CLOSED
+        };
+        assert_eq!(state(&mut p, t), window, "at {t}");
     }
-    assert_eq!(state(&mut p, 33_000 + POST_ROLL - 1), OPEN_POST_ROLL);
-    assert_eq!(state(&mut p, 33_000 + POST_ROLL), CLOSED);
 }
 
 #[test]

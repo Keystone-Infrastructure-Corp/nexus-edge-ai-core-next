@@ -746,7 +746,8 @@ impl Controller {
                 self.close(e.captured_at, "post-roll").await;
             }
         }
-        self.trace(now, wall).await;
+        // On the policy clock: what evidence changed, it changed at its frame's capture.
+        self.trace(e.captured_mono, e.captured_at).await;
         error
     }
 

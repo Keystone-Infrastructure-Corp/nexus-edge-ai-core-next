@@ -1617,7 +1617,9 @@ mod controller {
         let runtime = c.runtime().expect("observed reports its runtime");
         assert_eq!(runtime.mode, RecordingPolicyMode::Observed);
         c.healthy().await;
-        let calls = c.until(3, "closed 1 ").await;
+        // The recovery window ends on the analysis frontier: keep analysing.
+        c.analysing_until(3, "closed 1 ").await;
+        let calls = c.rec.calls();
         assert_eq!(calls.len(), 4, "{calls:#?}");
         // The same person, re-associated: an update, never a birth.
         let receipt = c.now(AnalysisOutcome::Success, 1).await;
@@ -1631,7 +1633,7 @@ mod controller {
     async fn observed_opens_at_once_on_an_explicit_failure() {
         let mut c = cam(observed(1), 0, false, false).await;
         c.healthy().await;
-        c.until(3, "closed 1 ").await;
+        c.analysing_until(3, "closed 1 ").await;
         let receipt = c.now(AnalysisOutcome::Failed, 0).await;
         assert_eq!(receipt.clip.map(|h| h.clip_id), Some(2));
         let runtime = c.runtime().unwrap();
@@ -1707,38 +1709,54 @@ mod controller {
         assert!(c.rec.calls().iter().any(|call| call == "closed 2 media=5"));
     }
 
-    /// Codex review 4: observed decides when it uses evidence. Activity at T
-    /// closes its clip once its 1 s post-roll runs out. The next frame,
-    /// captured at T + 0.5 s, is analysed for 1.5 s: seeing no one it
-    /// reopens nothing. Seeing someone it is new evidence, which opens a new
-    /// file at once (its pre-roll reaching back past the capture) for that
-    /// instant only, so the next analysis without new activity closes it.
+    /// Observed with `post_roll_secs`, `preroll_ms` of retained media and a
+    /// 10 s stale deadline, healthy and past the startup's clip.
+    async fn observed_and_quiet(post_roll_secs: u32, preroll_ms: u64) -> Cam {
+        let mut cfg = observed(post_roll_secs);
+        cfg.policy = Some(RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Observed,
+            analysis_stale_after_ms: 10_000,
+        });
+        let mut c = cam(cfg, preroll_ms, false, false).await;
+        c.healthy().await;
+        c.analysing_until(5, "closed 1 ").await;
+        c
+    }
+
+    /// Sleep until `ms` on the test's capture clock.
+    async fn sleep_until(c: &Cam, ms: u64) {
+        tokio::time::sleep(Duration::from_millis(ms.saturating_sub(c.elapsed_ms()))).await;
+    }
+
+    fn clip_id(receipt: &RecordingReceipt) -> Option<i64> {
+        receipt.clip.map(|h| h.clip_id)
+    }
+
+    /// Codex reviews 4 and 5: observed judges a window on the analysis
+    /// frontier. Activity at T keeps its clip until a pass captured at or
+    /// after T + 1 s is used. The next frame, captured at T + 0.5 s, is
+    /// analysed 1.5 s late: empty, the clip stays open (on capture time its
+    /// window had not ended); with someone, the window runs from T + 0.5 s.
+    /// Either way one clip, closed by the first pass captured past its end,
+    /// and a frame captured before that close but used after it reopens
+    /// nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn late_analysis_reopens_no_expired_window() {
+    async fn late_analysis_holds_one_clip_to_its_capture_deadline() {
         for late_observed in [0, 1] {
-            let mut cfg = observed(1);
-            cfg.policy = Some(RecordingPolicyConfig {
-                mode: RecordingPolicyMode::Observed,
-                analysis_stale_after_ms: 10_000,
-            });
-            let mut c = cam(cfg, 5_000, false, false).await;
-            c.healthy().await;
-            c.until(3, "closed 1 ").await;
+            let mut c = observed_and_quiet(1, 5_000).await;
             let t = c.elapsed_ms();
             let active = c
                 .frame_within(t, AnalysisOutcome::Success, 1, quiet(), LONG)
                 .await
                 .unwrap();
-            assert_eq!(active.clip.map(|h| h.clip_id), Some(2));
-            let until = |c: &Cam, ms: u64| Duration::from_millis(ms.saturating_sub(c.elapsed_ms()));
-            tokio::time::sleep(until(&c, t + 500)).await;
+            assert_eq!(clip_id(&active), Some(2));
+            sleep_until(&c, t + 500).await;
             let (mono, wall) = c.clock(t + 500);
             let arrived = c.producer.arrived(mono, wall);
             c.send(RecordingCommand::Evidence(arrived), LONG)
                 .await
                 .unwrap();
-            c.until(2, "closed 2 ").await;
-            tokio::time::sleep(until(&c, t + 2_000)).await;
+            sleep_until(&c, t + 2_000).await;
             let counts = EvidenceCounts {
                 observed: late_observed,
                 ..EvidenceCounts::default()
@@ -1750,24 +1768,89 @@ mod controller {
                 .send(RecordingCommand::Evidence(late), LONG)
                 .await
                 .unwrap();
-            if late_observed == 0 {
-                tokio::time::sleep(SHORT).await;
-                assert!(receipt.clip.is_none(), "{:#?}", c.rec.calls());
+            assert_eq!(clip_id(&receipt), Some(2), "{:#?}", c.rec.calls());
+            let closed = c.now(AnalysisOutcome::Success, 0).await;
+            assert!(closed.clip.is_none(), "{:#?}", c.rec.calls());
+            let (mono, wall) = c.clock(t + 1_200);
+            let earlier = c.producer.analysed(
+                mono,
+                wall,
+                AnalysisOutcome::Success,
+                EvidenceCounts::default(),
+                Some(quiet()),
+            );
+            let receipt = c
+                .send(RecordingCommand::Evidence(earlier), LONG)
+                .await
+                .unwrap();
+            assert!(receipt.clip.is_none(), "{:#?}", c.rec.calls());
+            let calls = c.rec.calls();
+            assert_eq!(
+                calls.iter().filter(|c| c.starts_with("opened ")).count(),
+                2,
+                "{calls:#?}"
+            );
+            assert!(calls.last().unwrap().starts_with("closed 2 "), "{calls:#?}");
+        }
+    }
+
+    /// Codex review 5, P1 1: qualifying frames captured every 1.5 s, each
+    /// analysed 1.5 s later as the next frame arrives, under 2 s of
+    /// post-roll and 5 s of pre-roll. The lag never closes the window: one
+    /// clip, open on every analysis, closed once a pass captured 2 s after
+    /// the last person is used.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn steady_analysis_lag_records_one_clip() {
+        let mut c = observed_and_quiet(2, 5_000).await;
+        let start = c.elapsed_ms() + 100;
+        let mut pending: Option<(Instant, DateTime<Utc>, u32)> = None;
+        // Frames 0..3 see someone; 3 and 4 do not; 4's analysis closes.
+        for k in 0..6u64 {
+            let ms = start + 1_500 * k;
+            sleep_until(&c, ms).await;
+            if let Some((mono, wall, observed)) = pending.take() {
+                let counts = EvidenceCounts {
+                    observed,
+                    ..EvidenceCounts::default()
+                };
+                let analysed = c.producer.analysed(
+                    mono,
+                    wall,
+                    AnalysisOutcome::Success,
+                    counts,
+                    Some(quiet()),
+                );
+                let receipt = c
+                    .send(RecordingCommand::Evidence(analysed), LONG)
+                    .await
+                    .unwrap();
+                let open = (k < 5).then_some(2);
                 assert_eq!(
-                    c.rec
-                        .calls()
-                        .last()
-                        .map(|call| call.starts_with("closed 2 ")),
-                    Some(true),
-                    "no reopen: {:#?}",
+                    clip_id(&receipt),
+                    open,
+                    "frame {}: {:#?}",
+                    k - 1,
                     c.rec.calls()
                 );
-            } else {
-                assert_eq!(receipt.clip.map(|h| h.clip_id), Some(3));
-                let next = c.now(AnalysisOutcome::Success, 0).await;
-                assert!(next.clip.is_none(), "{:#?}", c.rec.calls());
             }
+            let (mono, wall) = c.clock(ms);
+            let arrived = c.producer.arrived(mono, wall);
+            c.send(RecordingCommand::Evidence(arrived), LONG)
+                .await
+                .unwrap();
+            pending = Some((mono, wall, u32::from(k < 3)));
         }
+        let calls = c.rec.calls();
+        let after = calls
+            .iter()
+            .position(|c| c.starts_with("closed 1 "))
+            .unwrap();
+        assert_eq!(
+            calls[after + 1..calls.len() - 1],
+            ["opening", "opened 2 512x288", "closing 2"],
+            "{calls:#?}"
+        );
+        assert!(calls.last().unwrap().starts_with("closed 2 "), "{calls:#?}");
     }
 
     /// A source lost before the minimum is reached ends the hold: the clip
