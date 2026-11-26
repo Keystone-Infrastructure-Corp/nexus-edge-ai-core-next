@@ -331,6 +331,13 @@ pub struct CameraBehavior {
     /// legacy and is never serialized, so an old core sees no new key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recording_policy: Option<RecordingPolicyConfig>,
+    /// SPEC-089 — opaque token of the saved `recording_policy`, owned by the
+    /// engine: the store assigns one when it creates a camera or first opens
+    /// one saved without it, and a camera write that changes the policy
+    /// assigns a new one. A write's own value is never kept. Empty, and never
+    /// serialized, only before the store has assigned it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub recording_policy_revision: String,
 }
 
 /// M_TILE_REINFER (G1) — wire-shape tile grid preset.
@@ -372,6 +379,17 @@ pub struct RecordingPolicyConfig {
         deserialize_with = "bounded_analysis_stale_after_ms"
     )]
     pub analysis_stale_after_ms: u64,
+}
+
+impl RecordingPolicyConfig {
+    /// What a camera runs for `policy`: absent is legacy with the defaults, so
+    /// writes compare policies through this.
+    pub fn or_legacy(policy: Option<Self>) -> Self {
+        policy.unwrap_or(Self {
+            mode: RecordingPolicyMode::Legacy,
+            analysis_stale_after_ms: default_analysis_stale_after_ms(),
+        })
+    }
 }
 
 fn default_analysis_stale_after_ms() -> u64 {
@@ -579,6 +597,38 @@ mod tests {
             toml_camera.behavior.recording_policy.map(|p| p.mode),
             Some(RecordingPolicyMode::Shadow)
         );
+    }
+
+    /// SPEC-089 — `recording_policy_revision` is a flattened top-level key a
+    /// camera without one never serializes, and a policy compares through
+    /// `or_legacy`, so absent and an explicit default legacy are one policy.
+    #[test]
+    fn the_recording_policy_revision_is_an_optional_top_level_key() {
+        let old = r#"{"id":7,"name":"Lot","url":"rtsp://10.0.0.5/stream","enabled":true,"max_fps":0,"prompts":[],"visual_prompts":[],"model_override":null,"parking_lot_mode":true,"zones":[]}"#;
+        let mut camera: CameraConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(camera.behavior.recording_policy_revision, "");
+        assert_eq!(serde_json::to_string(&camera).unwrap(), old);
+
+        camera.behavior.recording_policy_revision = "0a1b2c".into();
+        let json = serde_json::to_value(&camera).unwrap();
+        assert_eq!(json["recording_policy_revision"], "0a1b2c");
+        let back: CameraConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(back.behavior.recording_policy_revision, "0a1b2c");
+
+        let policy = |mode, analysis_stale_after_ms| RecordingPolicyConfig {
+            mode,
+            analysis_stale_after_ms,
+        };
+        let legacy = policy(RecordingPolicyMode::Legacy, 10_000);
+        assert_eq!(RecordingPolicyConfig::or_legacy(None), legacy);
+        assert_eq!(RecordingPolicyConfig::or_legacy(Some(legacy)), legacy);
+        for other in [
+            policy(RecordingPolicyMode::Legacy, 5_000),
+            policy(RecordingPolicyMode::Shadow, 10_000),
+            policy(RecordingPolicyMode::Observed, 10_000),
+        ] {
+            assert_ne!(RecordingPolicyConfig::or_legacy(Some(other)), legacy);
+        }
     }
 
     /// Every outside camera write (config load, the admin API's PUT and POST)

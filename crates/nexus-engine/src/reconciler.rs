@@ -287,6 +287,8 @@ fn changed_behavior_field(started: &CameraBehavior, want: &CameraBehavior) -> Op
         detector_downscale_to_height: _,
         // SPEC-089: a mode change must not restart (gap) the camera; the recording controller applies it live.
         recording_policy: _,
+        // SPEC-089: names the saved policy; applied live with it.
+        recording_policy_revision: _,
     } = want;
 
     if *parking_lot_mode != started.parking_lot_mode {
@@ -4285,6 +4287,9 @@ mod tests {
                     mode: nexus_config::RecordingPolicyMode::Shadow,
                     analysis_stale_after_ms: 10_000,
                 })
+            }),
+            ("recording_policy_revision", |b| {
+                b.recording_policy_revision = "rev-2".into()
             }),
         ];
 
