@@ -6997,6 +6997,90 @@ mod epoch_tests {
         );
     }
 
+    /// SPEC-088 review 10: a clip that recorded nothing is discarded, its
+    /// alerts detached rather than deleted with it. When the store rejects
+    /// that discard the clip is retained at its discard step, and the retry
+    /// that completes it still keeps the alert and its undelivered outbox
+    /// row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retried_discard_keeps_the_clips_alerts() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, path, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        let alert = nexus_types::AlertEvent {
+            event_id: uuid::Uuid::now_v7(),
+            camera_id: 1,
+            rule_id: "r1".into(),
+            track_id: Some(7),
+            label: "person".into(),
+            severity: nexus_types::Severity::High,
+            bbox: None,
+            frame_id: 1,
+            captured_at: Utc::now(),
+            trace_id: "trace".into(),
+            artifacts: nexus_types::Artifacts::default(),
+            context: serde_json::Map::new(),
+            frame_w: 0,
+            frame_h: 0,
+        };
+        let event_id = alert.event_id.to_string();
+        store
+            .record_event_and_enqueue(&alert, &["webhook:slack"])
+            .await
+            .unwrap();
+        store
+            .link_event_to_clip(&event_id, clip.clip_id)
+            .await
+            .unwrap();
+        // The clip recorded nothing, so its close discards it.
+        fs::remove_file(&path).await.unwrap();
+        fail_clip_writes(&store).await;
+
+        let failed = rec.drain_camera(1).await;
+        let retained_step = rec
+            .unfinalized
+            .lock()
+            .get(&clip.clip_id)
+            .map(|u| matches!(u.step, FinalStep::Discard));
+        let linked_meanwhile = store.get_event_clip_id(&event_id).await.unwrap();
+        restore_clip_writes(&store).await;
+        let drained = rec.drain_camera(1).await;
+
+        assert!(failed.is_err(), "precondition: the discard failed");
+        assert_eq!(
+            retained_step,
+            Some(true),
+            "the failed discard was not retained at its discard step"
+        );
+        assert_eq!(
+            linked_meanwhile,
+            Some(clip.clip_id),
+            "the failed discard detached the alert from a clip it kept"
+        );
+        assert!(drained.is_ok(), "the retried discard: {drained:?}");
+        assert!(
+            store.get_clip(clip.clip_id).await.unwrap().is_none(),
+            "the retry did not discard the clip's row"
+        );
+        assert!(
+            store.get_event(&event_id).await.unwrap().is_some(),
+            "the alert went with its discarded clip"
+        );
+        assert_eq!(store.get_event_clip_id(&event_id).await.unwrap(), None);
+        assert_eq!(
+            store.outbox_for_event(&event_id).await.unwrap().len(),
+            1,
+            "the alert's undelivered outbox row went with its discarded clip"
+        );
+    }
+
     /// SPEC-088 Z-4 in `main`'s order: every supervisor is aborted, none is
     /// joined, then the recorder shuts down. One was closing (stalled on its
     /// pump), one held a clip, and one still mid-poll starts an open after
