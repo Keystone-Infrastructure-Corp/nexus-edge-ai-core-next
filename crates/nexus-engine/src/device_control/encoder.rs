@@ -743,6 +743,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn write_check_rejects_quality_and_profile_outside_the_options() {
+        use crate::discovery::onvif_encoder::FloatRange;
+        let opts = VideoEncoderOptions {
+            quality_range: Some(FloatRange { min: 1.0, max: 6.0 }),
+            profiles_supported: vec!["Main".into(), "High".into()],
+            ..sub_options()
+        };
+        let current = VideoEncoderConfig {
+            profile: Some("Baseline".into()),
+            ..sub_config()
+        };
+        let with = |quality, profile: &str| VideoEncoderConfig {
+            quality,
+            profile: Some(profile.into()),
+            ..current.clone()
+        };
+        for bad in [with(Some(7.0), "Baseline"), with(Some(9.0), "Extended")] {
+            assert!(check_write(&bad, &current, &opts).is_err(), "{bad:?}");
+        }
+        // In range, or unchanged although the camera's own value is outside.
+        assert_eq!(
+            check_write(&with(Some(3.0), "High"), &current, &opts),
+            Ok(())
+        );
+        assert_eq!(
+            check_write(&with(Some(9.0), "Baseline"), &current, &opts),
+            Ok(())
+        );
+    }
+
     /// An H264 and a JPEG configuration, as a mixed-codec camera lists them.
     const MIXED_CONFIGS: &str = concat!(
         r#"<trt:Configurations token="VE_sub"><tt:Name>sub</tt:Name><tt:Encoding>H264</tt:Encoding>"#,
