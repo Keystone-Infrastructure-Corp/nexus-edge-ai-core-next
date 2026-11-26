@@ -439,13 +439,6 @@ async fn calls_until(rig: &Rig, secs: u64, cond: impl Fn(&[String]) -> bool) -> 
     }
 }
 
-fn legacy_stale_after(ms: u64) -> Option<RecordingPolicyConfig> {
-    Some(RecordingPolicyConfig {
-        mode: RecordingPolicyMode::Legacy,
-        analysis_stale_after_ms: ms,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Detector hang: the file deadline and stop do not wait for inference.
 // ---------------------------------------------------------------------------
@@ -465,7 +458,6 @@ async fn a_hung_detector_cannot_stop_rotation_or_stop() {
     ]);
     // The clip opens at 0; frames 1-3 land 4:58.5 to 4:59.5 into it, the gate's 500 ms apart.
     setup.at_ms = vec![0, 298_500, 299_000, 299_500];
-    setup.policy = legacy_stale_after(200);
     let mut rig = rig(setup).await;
     for i in 0..4 {
         rig.feed(i).await;
@@ -494,6 +486,48 @@ async fn a_hung_detector_cannot_stop_rotation_or_stop() {
         "the stop finalized the open clip: {calls:#?}"
     );
     assert!(calls.last().unwrap().starts_with("close 2 "), "{calls:#?}");
+}
+
+/// R-4/R-6: the five-minute file deadline is the recorder's own. Inference
+/// hangs 299 s into a clip: the clip rotates at five minutes, at the same
+/// instant in legacy and in shadow, however long the shadow policy waits
+/// before calling analysis stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hang_late_in_a_clip_rotates_at_the_file_deadline_in_legacy_and_shadow() {
+    let shadow = Some(RecordingPolicyConfig {
+        mode: RecordingPolicyMode::Shadow,
+        analysis_stale_after_ms: 60_000,
+    });
+    for policy in [None, shadow] {
+        let mut setup = Setup::new(vec![
+            Step::See(1, 0),
+            Step::See(1, 0),
+            Step::See(1, 0),
+            Step::Hang,
+        ]);
+        setup.at_ms = vec![0, 298_000, 298_500, 299_000];
+        setup.policy = policy;
+        let mut rig = rig(setup).await;
+        for i in 0..4 {
+            rig.feed(i).await;
+        }
+        let calls = writes(&calls_until(&rig, 5, |c| opens(c) >= 2).await);
+        assert_eq!(
+            (opens(&calls), closes(&calls)),
+            (2, 1),
+            "{policy:?}: no rotation while inference hung: {calls:#?}"
+        );
+        // Five minutes after the open at 22:13:20, and the next file at once.
+        assert!(
+            calls[1].starts_with("close 1 at 2023-11-14 22:18:20"),
+            "{policy:?}: {calls:#?}"
+        );
+        assert!(
+            calls[2].starts_with("open 2023-11-14 22:18:20"),
+            "{policy:?}: {calls:#?}"
+        );
+        rig.stop().await;
+    }
 }
 
 /// The opens and closes, without the size checks between them.
@@ -1151,10 +1185,11 @@ mod controller {
     }
 
     /// A storage panic refuses the open on the receipt; once it clears the
-    /// controller opens on its own clock, with no frame to prompt it.
+    /// controller opens on its own clock, with no frame to prompt it, after
+    /// legacy's ten-second stall.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_storage_panic_refuses_then_recovers_without_a_frame() {
-        let mut c = cam(config(super::legacy_stale_after(100)), 0, false, false).await;
+        let mut c = cam(config(None), 0, false, false).await;
         c.rec.set_panic(true);
         let refused = c.frame(0, live(true)).await;
         assert_eq!(
@@ -1168,7 +1203,7 @@ mod controller {
             "no retry while panicked"
         );
         c.rec.set_panic(false);
-        let calls = c.until(3, "opened 1 512x288").await;
+        let calls = c.until(13, "opened 1 512x288").await;
         assert_eq!(calls, ["opening", "refused", "opening", "opened 1 512x288"]);
     }
 

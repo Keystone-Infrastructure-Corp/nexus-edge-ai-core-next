@@ -63,12 +63,17 @@ const RECORDER_SLOW: Duration = COMMAND_TIMEOUT;
 /// (`max_cold_upload_bytes = max_clip_bytes * 2`) absorbs the overshoot.
 const SIZE_STAT_INTERVAL_FRAMES: u32 = 60;
 
-/// How often the controller acts on its own clock once no frame has been
-/// analysed for the stale deadline.
+/// How often the controller acts on its own clock once no frame has
+/// arrived for [`RECORDER_STALL`].
 const STALL_TICK: Duration = Duration::from_secs(1);
 
 /// The stale deadline when no policy names one (legacy).
 const DEFAULT_STALE_AFTER_MS: u64 = 10_000;
+
+/// How long without a frame before the writer acts on its own clock:
+/// legacy's stale deadline whichever policy runs, so no policy parameter
+/// moves file safety or legacy's decisions (R-6).
+const RECORDER_STALL: Duration = Duration::from_millis(DEFAULT_STALE_AFTER_MS);
 
 /// First open retry delay; doubles per failure up to [`OPEN_RETRY_MAX`].
 const OPEN_RETRY_FIRST: Duration = Duration::from_millis(500);
@@ -337,7 +342,6 @@ pub fn spawn(
         generation: cfg.generation,
     };
     let mut controller = Controller {
-        stale_after: stale_after(cfg.policy),
         post_roll: PostRoll::new(cfg.post_roll_secs),
         frame_dims: (cfg.frame_width, cfg.frame_height),
         cfg,
@@ -406,7 +410,6 @@ struct Controller {
     stats: Arc<FrameStatsRegistry>,
     alive: watch::Receiver<()>,
     cancelled: bool,
-    stale_after: Duration,
     /// The fresh-evidence policy and its diagnostics; `None` in legacy.
     shadow: Option<ShadowRecording>,
     /// The policy writes; legacy only traces.
@@ -543,17 +546,20 @@ impl Controller {
         let (now, _) = self.now();
         let until = |t: Instant| t.saturating_duration_since(now);
         let mut waits = Vec::new();
-        if self.clip.is_some()
-            || self.pending_open
-            || self.deferred_close.is_some()
-            || self.observed
-        {
+        if self.writing() {
             let stall = self
                 .stall_check
-                .or_else(|| self.last_frame.map(|f| f.arrived + self.stale_after));
+                .or_else(|| self.last_frame.map(|f| f.arrived + RECORDER_STALL));
             waits.push(stall.map_or(Duration::ZERO, |t| {
                 t.saturating_duration_since(tokio::time::Instant::now())
             }));
+        }
+        if self.deferred_close.is_some() {
+            // Its frame's alerts link to the clip before anything else closes it.
+            return waits.into_iter().min();
+        }
+        if let Some(t) = self.file_deadline() {
+            waits.push(until(t));
         }
         if self.observed {
             if let Some(t) = self.shadow.as_ref().and_then(|s| s.next_change(now)) {
@@ -574,17 +580,32 @@ impl Controller {
         waits.into_iter().min()
     }
 
+    /// Whether the writer has a timer of its own: a clip open, opening or
+    /// closing, or observed's policy deciding.
+    fn writing(&self) -> bool {
+        self.clip.is_some() || self.pending_open || self.deferred_close.is_some() || self.observed
+    }
+
+    /// M2.1: when the open clip reaches the five-minute cap, on the capture clock.
+    fn file_deadline(&self) -> Option<Instant> {
+        self.clip
+            .and(self.clip_opened_at)
+            .map(|at| at + Duration::from_millis(MAX_CLIP_DURATION_MS as u64))
+    }
+
     /// Act on the controller's own clock: no frame needed.
     async fn wake(&mut self) {
         let (now, wall) = self.now();
-        self.flush_deferred_close().await;
-        let stalled = self
-            .last_frame
-            .is_none_or(|f| f.arrived.elapsed() >= self.stale_after);
+        let stalled = self.writing()
+            && self
+                .last_frame
+                .is_none_or(|f| f.arrived.elapsed() >= RECORDER_STALL);
         if stalled {
+            self.flush_deferred_close().await;
             self.stall_check = Some(tokio::time::Instant::now() + STALL_TICK);
-            self.rotate_if_due(now, wall, true).await;
         }
+        let due = stalled || self.file_deadline().is_some_and(|t| now >= t);
+        let rotated = due && self.rotate_if_due(now, wall, stalled).await;
         if self.observed {
             let intent = self.intent_now(now);
             self.drive(intent, now, wall).await;
@@ -600,6 +621,11 @@ impl Controller {
             }
             if let Some(shadow) = self.shadow.as_mut() {
                 shadow.tick(now);
+            }
+        } else if rotated {
+            // Rotation changes files, not the motion lifetime: the next one opens now.
+            if self.may_open(now) {
+                self.open(now, wall).await;
             }
         } else {
             return;
@@ -828,7 +854,6 @@ impl Controller {
         let was_observed = self.observed;
         self.cfg.policy = policy;
         self.cfg.policy_revision = revision;
-        self.stale_after = stale_after(policy);
         if let Some(mut old) = self.shadow.take() {
             let writes = old.finish();
             persist(&self.store, &old, writes).await;
@@ -893,9 +918,10 @@ impl Controller {
     /// M2.1: rotate on the five-minute duration cap, the byte cap and a
     /// stream epoch change. `stalled` checks the size now rather than every
     /// [`SIZE_STAT_INTERVAL_FRAMES`] frames, as no frames arrive to count.
-    async fn rotate_if_due(&mut self, now: Instant, wall: DateTime<Utc>, stalled: bool) {
+    /// Returns whether it rotated.
+    async fn rotate_if_due(&mut self, now: Instant, wall: DateTime<Utc>, stalled: bool) -> bool {
         let (Some(handle), Some(opened_at)) = (self.clip, self.clip_opened_at) else {
-            return;
+            return false;
         };
         let age_ms = now.saturating_duration_since(opened_at).as_millis() as i64;
         let duration_exceeded = age_ms >= MAX_CLIP_DURATION_MS;
@@ -944,7 +970,9 @@ impl Controller {
             self.frames_since_size_stat = 0;
             // Rotation changes files, not the motion/post-roll lifetime.
             self.pending_open = true;
+            return true;
         }
+        false
     }
 
     async fn open(&mut self, now: Instant, wall: DateTime<Utc>) -> Option<RecordingError> {
