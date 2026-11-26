@@ -704,11 +704,20 @@ impl StaticObjectFilter {
                     let center = b.center();
                     let inside = in_parking(center);
                     let label = o.label.to_lowercase();
-                    t.owner &= t.last.is_some_and(|(p, ms)| {
-                        at_ms > ms
-                            && (at_ms - ms) as f64 <= max_gap_ms
-                            && (reset_px <= 0.0 || distance(p, center) <= reset_px)
-                    });
+                    // A jump past the ID-reuse step is another object under
+                    // this id: it inherits no dwell, even one within the
+                    // motion bounds of a large box, and no parked episode.
+                    if reset_px > 0.0 && t.last.is_some_and(|(p, _)| distance(p, center) > reset_px)
+                    {
+                        t.window.miss();
+                        t.owner = false;
+                        if t.parked_at.take().is_some() {
+                            t.alert_epoch += 1;
+                        }
+                    }
+                    t.owner &= t
+                        .last
+                        .is_some_and(|(_, ms)| at_ms > ms && (at_ms - ms) as f64 <= max_gap_ms);
                     t.last = Some((center, at_ms));
                     still =
                         t.window
@@ -2381,6 +2390,59 @@ mod tests {
             assert_eq!(epoch_of(&last[0]), 1, "{name}");
             v2_step(&mut f, 17_000, HD, vec![vehicle(1, 600.0, 500.0)]);
             assert!(f.anchors().is_empty(), "{name}: expired on its TTL");
+        }
+    }
+
+    /// A parked track whose id jumps past the ID-reuse step yet within both
+    /// motion bounds (a 1000 px diagonal, 2 s later) is another object: it
+    /// is visible in a new alert episode until its own fresh dwell, also
+    /// when it lands inside the anchor radius the parked car matched.
+    #[test]
+    fn v2_a_jump_past_the_id_reuse_step_starts_a_fresh_dwell() {
+        // An 800x600 box: a 1000 px diagonal.
+        let big = |x: f32| {
+            let mut o = vehicle(1, x, 500.0);
+            let b = BBox {
+                x1: x - 400.0,
+                y1: 200.0,
+                x2: x + 400.0,
+                y2: 800.0,
+            };
+            (o.bbox, o.detection_bbox) = (b, Some(b));
+            o
+        };
+        // (name, seeded anchor, parked x, x after the jump, anchors after)
+        let cases = [
+            (
+                "75 px from its own anchor",
+                None,
+                400.0,
+                475.0,
+                vec![(400.0, 500.0), (475.0, 500.0)],
+            ),
+            (
+                "61 px, within the anchor it matched",
+                Some(anchor_at(400.0, 500.0)),
+                430.0,
+                369.0,
+                vec![(400.0, 500.0)],
+            ),
+        ];
+        for (name, seeded, from, to, anchors) in cases {
+            let mut f = v2_filter();
+            f.anchors.extend(seeded);
+            let mut out = Vec::new();
+            for ms in capture_ms(1.45, 0, 6_900) {
+                out = v2_step(&mut f, ms, HD, vec![big(from)]);
+            }
+            assert!(is_object_static(&out[0]), "{name}: parked");
+            assert_eq!(epoch_of(&out[0]), 0, "{name}");
+            for ms in capture_ms(1.45, 8_900, 16_000) {
+                let out = v2_step(&mut f, ms, HD, vec![big(to)]);
+                assert_eq!(is_object_static(&out[0]), ms >= 13_900, "{name}: {ms} ms");
+                assert_eq!(epoch_of(&out[0]), 1, "{name}: {ms} ms");
+            }
+            assert_eq!(anchor_centers(&f), anchors, "{name}");
         }
     }
 

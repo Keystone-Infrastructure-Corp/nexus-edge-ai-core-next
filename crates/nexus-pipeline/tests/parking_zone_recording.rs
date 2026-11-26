@@ -75,13 +75,14 @@ fn stalls() -> Vec<ZoneConfig> {
     vec![parking("stalls", 0.0, 0.5)]
 }
 
-/// A car the detector reports, at a normalized center. `id` is the track id
-/// the scripted tracker reports it under; an unseen car is a coasting track
-/// there, and absent for the real tracker.
+/// A car the detector reports, at a normalized center and box size. `id` is
+/// the track id the scripted tracker reports it under; an unseen car is a
+/// coasting track there, and absent for the real tracker.
 #[derive(Clone, Copy)]
 struct Car {
     x: f32,
     y: f32,
+    size: (f32, f32),
     id: u64,
     seen: bool,
 }
@@ -90,6 +91,7 @@ fn car(x: f32, y: f32) -> Car {
     Car {
         x,
         y,
+        size: (CAR_W, CAR_H),
         id: 0,
         seen: true,
     }
@@ -175,6 +177,7 @@ struct Recorder {
     stub: StubClipRecorder,
     source: Mutex<Option<Box<dyn FrameSource + Send>>>,
     opened: Mutex<Vec<DateTime<Utc>>>,
+    closed: Mutex<Vec<DateTime<Utc>>>,
 }
 
 #[async_trait]
@@ -185,6 +188,7 @@ impl ClipRecorder for Recorder {
     }
 
     async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError> {
+        self.closed.lock().push(args.ended_at);
         self.stub.close(handle, args).await
     }
 
@@ -225,7 +229,7 @@ impl Detector for Cars {
             .into_iter()
             .filter(|c| c.seen || self.all)
             .map(|c| {
-                let (cx, cy, bw, bh) = (c.x * w, c.y * h, CAR_W * w, CAR_H * h);
+                let (cx, cy, bw, bh) = (c.x * w, c.y * h, c.size.0 * w, c.size.1 * h);
                 let mut d = Detection {
                     label: "vehicle.car".into(),
                     confidence: 0.9,
@@ -300,6 +304,9 @@ struct Outcome {
     metadata: Vec<FrameMetadata>,
     alerts: Vec<AlertEvent>,
     opened: Vec<DateTime<Utc>>,
+    /// Each clip's capture ms when opened and when closed; `None`: still
+    /// open when the camera stopped.
+    clips: Vec<(u64, Option<u64>)>,
     motion: Vec<MotionEventRow>,
     /// Centers of the anchors on disk once the camera stopped.
     anchors: Vec<(f32, f32)>,
@@ -336,6 +343,18 @@ impl Outcome {
             .collect()
     }
 
+    /// Capture ms of the motion rows of `kind`, in order.
+    fn motion_at(&self, kind: MotionEventKind) -> Vec<u64> {
+        let mut at: Vec<u64> = self
+            .motion
+            .iter()
+            .filter(|r| r.kind == kind)
+            .map(|r| offset_ms(r.captured_at))
+            .collect();
+        at.sort_unstable();
+        at
+    }
+
     fn died_before(&self, ms: u64) -> usize {
         let until = wall0() + chrono::Duration::milliseconds(ms as i64);
         self.motion
@@ -343,6 +362,11 @@ impl Outcome {
             .filter(|r| r.kind == MotionEventKind::Died && r.captured_at < until)
             .count()
     }
+}
+
+/// Capture ms of a wall stamp.
+fn offset_ms(at: DateTime<Utc>) -> u64 {
+    (at - wall0()).num_milliseconds() as u64
 }
 
 /// An anchor center from the registry, to the hundredth of a pixel.
@@ -407,6 +431,7 @@ async fn run(s: Scenario, dir: &Path) -> Outcome {
     let mut shots = s.shots;
     let mut last = shots.last().cloned().expect("a shot");
     last.ms += 500;
+    let stopped_ms = last.ms;
     shots.push(last);
     let frames: Vec<Frame> = shots
         .iter()
@@ -428,6 +453,7 @@ async fn run(s: Scenario, dir: &Path) -> Outcome {
         stub: StubClipRecorder::new(store.clone(), dir.join("clips")),
         source: Mutex::new(Some(Box::new(Scripted { frames, go: go_rx }))),
         opened: Mutex::new(Vec::new()),
+        closed: Mutex::new(Vec::new()),
     });
     let tracker_cfg = TrackerConfig::default();
     let tracker: Arc<dyn Tracker> = if s.scripted_ids {
@@ -510,10 +536,23 @@ async fn run(s: Scenario, dir: &Path) -> Outcome {
         })
         .unwrap_or_default();
     let opened = recorder.opened.lock().clone();
+    let closed = recorder.closed.lock().clone();
+    assert_eq!(opened.len(), closed.len(), "every clip closed by the stop");
+    // The stop closes an open clip on the wall clock, after every shot.
+    let clips = opened
+        .iter()
+        .zip(&closed)
+        .map(|(&o, &c)| {
+            let c = (c <= wall0() + chrono::Duration::milliseconds(stopped_ms as i64))
+                .then(|| offset_ms(c));
+            (offset_ms(o), c)
+        })
+        .collect();
     Outcome {
         metadata: tracked,
         alerts: fired,
         opened,
+        clips,
         motion,
         anchors,
     }
@@ -743,6 +782,47 @@ async fn a_reused_track_id_inherits_no_parked_verdict_or_anchor() {
         o.anchors,
         vec![(128.0, 144.0)],
         "left to expire, not erased"
+    );
+}
+
+/// A tracker that hands a large parked car's id to another car standing 64
+/// px away, after a 2 s stall in the stream: inside both motion bounds of
+/// the box's 729 px diagonal, but past the 60 px ID-reuse step. The arrival
+/// inherits no dwell: it is alerted and recorded until its own dwell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reused_id_within_the_motion_bounds_is_alerted_and_recorded_until_its_own_dwell() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let mut times = every(690, 0, 16_000);
+    let jump = times.len();
+    times.extend(every(690, 17_870, 25_000));
+    let x = |k: usize| if k < jump { 0.25 } else { 0.3125 };
+    // A 512x518 px box on a 1024x576 frame.
+    let mut shots = shots(&times, |k, _| {
+        vec![Car {
+            id: 7,
+            size: (0.5, 0.9),
+            ..car(x(k), 0.5)
+        }]
+    });
+    for shot in &mut shots {
+        shot.size = (1024, 576);
+    }
+    let mut s = Scenario::v2(shots);
+    s.scripted_ids = true;
+    let o = run(s, dir.path()).await;
+    for (k, &ms) in times.iter().enumerate() {
+        let want = (5_000..16_000).contains(&ms) || ms >= times[jump] + 5_000;
+        assert_eq!(o.static_at(k, x(k), 0.5), want, "{ms} ms");
+    }
+    assert_eq!(o.fired("any_vehicle"), vec![0, jump]);
+    // Post-roll ends the parked car's clip; the arrival opens its own.
+    assert_eq!(o.clips, vec![(0, Some(15_870)), (17_870, None)]);
+    assert_eq!(o.motion_at(MotionEventKind::Born), vec![0, 17_870]);
+    assert_eq!(o.motion_at(MotionEventKind::Died), vec![5_520, 23_390]);
+    assert_eq!(
+        o.anchors,
+        vec![(256.0, 288.0), (320.0, 288.0)],
+        "the parked car's anchor is left to expire"
     );
 }
 
