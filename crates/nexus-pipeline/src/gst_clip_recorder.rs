@@ -139,6 +139,10 @@ const EOS_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// another owned task is still running.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 
+/// How long `shutdown` gives its last attempt at the clips it could not
+/// finalize, inside the engine's 15 s recorder shutdown budget.
+const SHUTDOWN_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Failed attempts at finalizing a clip, its close included, for which
 /// [`ClipRecorder::drain_camera`] keeps its camera stopping (SPEC-088).
 const FINALIZE_DRAINS: u32 = 3;
@@ -958,7 +962,8 @@ impl Writers {
     /// Retry `handle`'s failed row step, backing off, until it is finalized:
     /// a camera that keeps recording, or that its drains released, may never
     /// be drained again. Shutdown waits for an attempt under way, not for
-    /// the schedule, which makes none once shutdown began (SPEC-088).
+    /// the schedule, which makes none once shutdown began: shutdown makes
+    /// the last one itself (SPEC-088).
     fn spawn_finalize_schedule(&self, handle: ClipHandle, step: FinalStep) {
         let store = self.store.clone();
         let unfinalized = self.unfinalized.clone();
@@ -1726,7 +1731,7 @@ impl ClipRecorder for GstClipRecorder {
             // And after it: a close registered since may have taken the
             // last clip out of `open` and still own its writer.
             if handles.is_empty() && idle && self.in_flight.is_closed() {
-                return;
+                break;
             }
             if !handles.is_empty() {
                 info!(
@@ -1739,6 +1744,30 @@ impl ClipRecorder for GstClipRecorder {
                 self.spawn_drain_close(handle);
             }
             let _ = tokio::time::timeout(SHUTDOWN_POLL, self.in_flight.closed()).await;
+        }
+        // A retained clip's own retries end with shutdown, and no boot step
+        // closes its row, which then never replicates: try every retained
+        // step once more, bounded, before the process goes (SPEC-088).
+        let retained: Vec<(ClipId, CameraId, FinalStep)> = self
+            .unfinalized
+            .lock()
+            .iter()
+            .map(|(&clip_id, u)| (clip_id, u.camera_id, u.step.clone()))
+            .collect();
+        let last_attempts = retained.iter().map(|(clip_id, camera_id, step)| {
+            retry_finalize(&self.store, &self.unfinalized, *clip_id, *camera_id, step)
+        });
+        let ended = tokio::time::timeout(
+            SHUTDOWN_FINALIZE_TIMEOUT,
+            futures::future::join_all(last_attempts),
+        )
+        .await;
+        if ended.is_err() {
+            warn!(
+                count = retained.len(),
+                "gst recorder: shutdown's last attempt at clips not finalized timed out; their \
+                 rows stay unclosed"
+            );
         }
     }
 
@@ -6987,7 +7016,8 @@ mod epoch_tests {
     }
 
     /// SPEC-088 review 10: shutdown does not wait out a retry schedule, and
-    /// the schedule makes no attempt after it.
+    /// the schedule makes no attempt after it; shutdown makes one last
+    /// attempt itself, which fails on the store still rejecting writes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_ends_a_released_clips_retry_schedule() {
         assert!(
@@ -7012,8 +7042,8 @@ mod epoch_tests {
         );
         assert_eq!(
             attempts(&rec, clip),
-            Some(3),
-            "the schedule retried after shutdown"
+            Some(4),
+            "shutdown made no last attempt, or the schedule retried after it"
         );
     }
 
@@ -7074,15 +7104,118 @@ mod epoch_tests {
             "shutdown returned while a scheduled attempt was under way"
         );
         assert!(shut, "shutdown did not return once the attempt ended");
+        // The blocked attempt ran to its end, then shutdown's last one.
         assert_eq!(
             attempted,
-            Some(4),
-            "the blocked attempt did not run to its end"
+            Some(5),
+            "the blocked attempt did not run to its end before shutdown's last one"
         );
         assert_eq!(
             attempts(&rec, clip),
-            Some(4),
+            Some(5),
             "the schedule retried after shutdown"
+        );
+    }
+
+    /// PR #405 review: a clip whose close failed at its row step retries 5 s
+    /// on, and a restart before then (an OTA) must not lose it: no boot step
+    /// closes the row, and an unclosed row never replicates. Shutdown makes a
+    /// last attempt at every retained step, so both rows close, the damaged
+    /// clip's quarantined with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_finalizes_retained_clips_before_their_retry_is_due() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (plain, _, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        // Two SPS in one file: the layout the damaged-clip fixture records.
+        let mut mixed = encode(15, "main", 60, Duration::ZERO);
+        mixed.extend(encode(20, "main", 60, Duration::from_secs(4)));
+        let (damaged, _, _) =
+            register_samples(&rec, &store, &clips_dir, 2, started_at, None, &mixed).await;
+        fail_clip_writes(&store).await;
+        let ended_at = started_at + chrono::Duration::seconds(8);
+        let failed = [
+            rec.close(plain, ClipFinal { ended_at }).await.is_err(),
+            rec.close(damaged, ClipFinal { ended_at }).await.is_err(),
+        ];
+        restore_clip_writes(&store).await;
+
+        let shut = tokio::time::timeout(Duration::from_secs(4), rec.shutdown())
+            .await
+            .is_ok();
+        let row = store.get_clip(damaged.clip_id).await.unwrap().unwrap();
+        let pending = store.clips_pending_cold_upload(10, None).await.unwrap();
+
+        assert_eq!(failed, [true, true], "precondition: both closes failed");
+        assert!(shut, "shutdown did not return within its budget");
+        assert!(
+            finalized_playable(&store, &clips_dir, plain.clip_id).await,
+            "shutdown returned with a retained clip's row unclosed"
+        );
+        assert!(
+            row.ended_at.is_some() && row.sha256.is_some(),
+            "shutdown returned with a retained damaged clip's row unclosed"
+        );
+        assert!(
+            row.cold_quarantined,
+            "the last attempt dropped the quarantine"
+        );
+        assert!(
+            pending.iter().all(|c| c.id != damaged.clip_id),
+            "damaged footage is upload-eligible"
+        );
+        assert!(
+            rec.unfinalized.lock().is_empty(),
+            "a clip is still retained"
+        );
+    }
+
+    /// PR #405 review: shutdown's last attempt is bounded. On a store with no
+    /// free connection, whose acquire waits 30 s, shutdown still returns well
+    /// inside the engine's 15 s budget, the clip still retained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdowns_last_attempt_at_a_retained_clip_is_bounded() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        fail_clip_writes(&store).await;
+        let ended_at = started_at + chrono::Duration::seconds(8);
+        let closed = rec.close(clip, ClipFinal { ended_at }).await;
+        let mut held = Vec::new();
+        for _ in 0..store.pool().options().get_max_connections() {
+            held.push(store.pool().acquire().await.unwrap());
+        }
+
+        let began = tokio::time::Instant::now();
+        let shut = tokio::time::timeout(Duration::from_secs(15), rec.shutdown())
+            .await
+            .is_ok();
+        let took = began.elapsed();
+        drop(held);
+
+        assert!(closed.is_err(), "precondition: the close failed");
+        assert!(
+            shut && took < Duration::from_secs(10),
+            "shutdown waited {took:?} on its last attempt"
+        );
+        assert_eq!(
+            attempts(&rec, clip),
+            Some(1),
+            "the clip is no longer retained"
         );
     }
 
