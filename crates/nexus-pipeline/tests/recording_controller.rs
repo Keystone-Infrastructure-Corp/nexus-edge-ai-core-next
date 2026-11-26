@@ -1583,6 +1583,83 @@ mod controller {
         }
     }
 
+    /// Codex review 7: evidence that degrades on success is counted too.
+    /// Healthy through 59 s under a 1 s stale deadline; a slow legacy open
+    /// keeps the controller busy past the deadline (60.001 s), so the first
+    /// wake after it, the minute cut, traces degraded coverage at 61 s. A
+    /// success captured at 60.5 s, used at 62 s, starts a new run: analysis
+    /// was not sustained from 60 s, so the state it shows at its capture is
+    /// degraded, though held at 61 s where nothing changes. That is a
+    /// reported gap, counted once, as is a failure there. With the stale
+    /// wake on time, the same frames leave no gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broken_run_held_behind_a_late_stale_wake_is_a_reported_gap() {
+        use RecordingReason::DegradedCoverage;
+        for (late, outcome) in [
+            (true, AnalysisOutcome::Success),
+            (true, AnalysisOutcome::Failed),
+            (false, AnalysisOutcome::Success),
+        ] {
+            let mut c = cam(shadow(1_000), 0, late, false).await;
+            for ms in (0..=58_000).step_by(1_000) {
+                c.frame(ms, quiet()).await;
+            }
+            // The controller's clock runs on from 59 s in real time.
+            let t59 = Instant::now();
+            let born = c
+                .frame_within(59_000, AnalysisOutcome::Success, 0, live(true), SHORT)
+                .await;
+            assert_eq!(born.is_err(), late, "only the gated open is slow");
+            tokio::time::sleep_until((t59 + Duration::from_millis(1_200)).into()).await;
+            c.rec.opens.add_permits(FREE);
+            let deadline = Instant::now() + LONG;
+            let stale = loop {
+                let at = trace(&c)
+                    .transitions
+                    .iter()
+                    .find(|t| t.at_ms > 59_000 && t.reason == DegradedCoverage)
+                    .map(|t| t.at_ms);
+                if let Some(at) = at {
+                    break at;
+                }
+                assert!(Instant::now() < deadline, "never stale: {:#?}", trace(&c));
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            let wake = if late { 61_000..61_500 } else { 60_001..60_500 };
+            assert!(wake.contains(&stale), "{late}: {:#?}", trace(&c));
+            let (mono, wall) = c.clock(60_500);
+            let arrived = c.producer.arrived(mono, wall);
+            c.send(RecordingCommand::Evidence(arrived), LONG)
+                .await
+                .unwrap();
+            tokio::time::sleep_until((t59 + Duration::from_millis(3_000)).into()).await;
+            let analysed = c.producer.analysed(
+                mono,
+                wall,
+                outcome,
+                EvidenceCounts::default(),
+                Some(live(false)),
+            );
+            c.send(RecordingCommand::Evidence(analysed), LONG)
+                .await
+                .unwrap();
+            let trace = trace(&c);
+            let window: Vec<_> = trace
+                .transitions
+                .iter()
+                .filter(|t| t.at_ms > 59_000)
+                .map(|t| (t.at_ms, t.reason))
+                .collect();
+            assert_eq!(window, [(stale, DegradedCoverage)], "{trace:#?}");
+            assert_eq!(trace.trace_incomplete, late, "{outcome:?}: {trace:#?}");
+            assert_eq!(
+                trace.clock_steps_back,
+                u64::from(late),
+                "{outcome:?}: {trace:#?}"
+            );
+        }
+    }
+
     /// Observed: an alert drive is the writer's own decision, traced at
     /// the controller's now (700 ms after its frame, which took that long
     /// to analyse). The next frame, captured at 200 ms and used after the

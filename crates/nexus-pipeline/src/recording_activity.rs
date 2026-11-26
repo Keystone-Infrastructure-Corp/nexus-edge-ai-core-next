@@ -45,6 +45,18 @@ pub enum RecordingReason {
     MinimumDuration,
 }
 
+/// Why the current degraded coverage began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DegradedCause {
+    /// No analysis has proved healthy yet.
+    FirstAnalysis,
+    Failure,
+    /// A success run began after the last success seen: a stale gap no tick saw.
+    BrokenRun,
+    /// The newest success went stale on the consumer's clock.
+    Stale,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RecordingIntent {
     pub open: bool,
@@ -84,6 +96,7 @@ pub struct RecordingActivityPolicy {
     last_activity_ms: Option<u64>,
     degraded: bool,
     degraded_since_ms: u64,
+    degraded_cause: DegradedCause,
     recovery_passes: u32,
     recovery_started_ms: Option<u64>,
     /// Generation and through-sequence of the last [`EvidenceSummary`] applied.
@@ -99,6 +112,7 @@ impl RecordingActivityPolicy {
             last_activity_ms: None,
             degraded: true,
             degraded_since_ms: started_ms,
+            degraded_cause: DegradedCause::FirstAnalysis,
             recovery_passes: 0,
             recovery_started_ms: None,
             applied: None,
@@ -126,7 +140,7 @@ impl RecordingActivityPolicy {
             .last_failure
             .filter(|&(_, sequence)| sequence > applied_through)
         {
-            self.degrade(at);
+            self.degrade(at, DegradedCause::Failure);
         }
         // A run reduced under another stale deadline (a live change the
         // producer had not yet applied) proves nothing under this one.
@@ -137,7 +151,10 @@ impl RecordingActivityPolicy {
         // since: by a failure, or by a stale gap no tick saw.
         if let (Some(run), Some(seen)) = (run, self.last_success_ms) {
             if run.first_ms > seen {
-                self.degrade(seen.saturating_add(self.stale_after_ms));
+                self.degrade(
+                    seen.saturating_add(self.stale_after_ms),
+                    DegradedCause::BrokenRun,
+                );
             }
         }
         self.last_success_ms = self.last_success_ms.max(summary.last_success_ms);
@@ -156,7 +173,7 @@ impl RecordingActivityPolicy {
         let at = observation.captured_ms.min(observation.received_ms);
         match observation.outcome {
             AnalysisOutcome::Skipped => {}
-            AnalysisOutcome::Failed => self.degrade(at),
+            AnalysisOutcome::Failed => self.degrade(at, DegradedCause::Failure),
             AnalysisOutcome::Success => {
                 if observation.qualifying_observed > 0 {
                     self.activity(at);
@@ -170,7 +187,7 @@ impl RecordingActivityPolicy {
                     .last_success_ms
                     .filter(|&s| at - s > self.stale_after_ms)
                 {
-                    self.degrade(s + self.stale_after_ms);
+                    self.degrade(s + self.stale_after_ms, DegradedCause::BrokenRun);
                 }
                 if self.degraded {
                     self.count_recovery(at);
@@ -197,7 +214,7 @@ impl RecordingActivityPolicy {
             .last_success_ms
             .is_none_or(|s| now_ms.saturating_sub(s) > self.stale_after_ms);
         if !self.degraded && stale {
-            self.degrade(now_ms);
+            self.degrade(now_ms, DegradedCause::Stale);
         }
     }
 
@@ -234,14 +251,22 @@ impl RecordingActivityPolicy {
             .filter(|&t| t > now_ms)
     }
 
+    /// When and why the current degraded coverage began; `None` while healthy.
+    pub fn degraded_since(&self) -> Option<(u64, DegradedCause)> {
+        self.degraded
+            .then_some((self.degraded_since_ms, self.degraded_cause))
+    }
+
     fn activity(&mut self, at: u64) {
         self.last_activity_ms = self.last_activity_ms.max(Some(at));
     }
 
-    fn degrade(&mut self, at: u64) {
-        if !self.degraded {
+    fn degrade(&mut self, at: u64, cause: DegradedCause) {
+        // Evidence used late can show a degradation began before it was judged.
+        if !self.degraded || at < self.degraded_since_ms {
             self.degraded = true;
             self.degraded_since_ms = at;
+            self.degraded_cause = cause;
         }
         self.recovery_passes = 0;
         self.recovery_started_ms = None;

@@ -21,8 +21,8 @@ use serde::Serialize;
 use tracing::warn;
 
 use crate::recording_activity::{
-    is_observed, AnalysisOutcome, EvidenceSummary, Observation, RecordingActivityPolicy,
-    RecordingIntent, RecordingReason,
+    is_observed, AnalysisOutcome, DegradedCause, EvidenceSummary, Observation,
+    RecordingActivityPolicy, RecordingIntent, RecordingReason,
 };
 
 /// Transition summaries kept per camera. Dropping an older one marks the
@@ -954,9 +954,17 @@ impl ShadowRecording {
             let changed = d.transitions > transitions;
             if at > captured {
                 // Held. Only the newest evidence's state is its own (older evidence moves no frontier back);
-                // degraded coverage is judged when used unless this pass failed; a hold is the writer's own.
+                // degraded coverage is judged when used unless this pass failed or evidence, not the
+                // consumer's clock, shows it began by this capture (a broken success run); a hold is the writer's own.
+                let evidenced = self
+                    .policy
+                    .as_ref()
+                    .and_then(RecordingActivityPolicy::degraded_since)
+                    .is_some_and(|(since, cause)| {
+                        cause != DegradedCause::Stale && since <= captured
+                    });
                 let driven = matches!(reason, Activity | PostRoll | Quiet)
-                    || (failed && reason == DegradedCoverage);
+                    || ((failed || evidenced) && reason == DegradedCoverage);
                 let policy = |r| if r == MinimumDuration { Quiet } else { r };
                 let earlier = driven
                     && self.used_ms == Some(captured)

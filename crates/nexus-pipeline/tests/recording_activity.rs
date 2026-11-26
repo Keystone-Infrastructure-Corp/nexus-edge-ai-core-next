@@ -553,6 +553,33 @@ fn a_gap_seen_while_healthy_degrades_until_the_gate() {
     assert_eq!(state(&mut p, 47_000), OPEN_ACTIVITY);
 }
 
+/// Codex review 7: a stale wake that ran late (61 s) is not when the
+/// degradation began. A success at 60.5 s that starts a new run shows that
+/// analysis stopped being sustained at 60 s; that evidence moves the start.
+#[test]
+fn evidence_moves_a_late_judged_degradation_to_its_start() {
+    use nexus_pipeline::recording_activity::DegradedCause;
+    let mut p = RecordingActivityPolicy::new(POST_ROLL, STALE, 0);
+    assert_eq!(p.degraded_since(), Some((0, DegradedCause::FirstAnalysis)));
+    let mut producer = Producer::new();
+    for t in (0..=50_000).step_by(1_000) {
+        p.apply_summary(producer.push(success(t, 0)), t);
+    }
+    assert_eq!(p.degraded_since(), None);
+    p.tick(61_000);
+    assert_eq!(p.degraded_since(), Some((61_000, DegradedCause::Stale)));
+    p.apply_summary(producer.push(success(60_500, 0)), 62_000);
+    p.tick(62_000);
+    let broken = Some((50_000 + STALE, DegradedCause::BrokenRun));
+    assert_eq!(p.degraded_since(), broken);
+    // A failure inside the degradation moves nothing.
+    p.apply_summary(
+        producer.push(obs(61_500, 0, 0, AnalysisOutcome::Failed)),
+        62_000,
+    );
+    assert_eq!(p.degraded_since(), broken);
+}
+
 #[test]
 fn a_recovered_run_read_after_it_went_stale_does_not_recover() {
     let mut producer = Producer::new();
