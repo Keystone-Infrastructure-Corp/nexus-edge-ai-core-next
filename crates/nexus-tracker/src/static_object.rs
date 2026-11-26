@@ -711,10 +711,14 @@ impl StaticObjectFilter {
                 owner: false,
             });
             // Missing from the last frame: nothing observed it there, and a
-            // tracker may have given its id to another object.
+            // tracker may have given its id to another object, which
+            // inherits no parked episode; its anchor is left to expire.
             if t.seen_seq + 1 != v2.seq {
                 t.window.miss();
                 t.owner = false;
+                if t.parked_at.take().is_some() {
+                    t.alert_epoch += 1;
+                }
             }
             t.seen_seq = v2.seq;
             let mut still = false;
@@ -2585,6 +2589,22 @@ mod tests {
             v2_step(&mut lone, ms, HD, vec![coasting(vehicle(1, 400.0, 500.0))]);
         }
         assert!(lone.anchors().is_empty());
+    }
+
+    /// A parked id missing from a frame and back at its spot may be another
+    /// car: it is visible in a new alert episode until its own fresh dwell,
+    /// which matches the same anchor.
+    #[test]
+    fn v2_a_parked_id_missing_from_a_frame_returns_in_a_new_episode() {
+        let mut f = v2_filter();
+        park_all(&mut f, &[(1, 400.0, 500.0)]);
+        v2_step(&mut f, 7_600, HD, vec![]);
+        for ms in capture_ms(1.45, 8_300, 16_000) {
+            let out = v2_step(&mut f, ms, HD, vec![vehicle(1, 400.0, 500.0)]);
+            assert_eq!(is_object_static(&out[0]), ms >= 13_300, "{ms} ms");
+            assert_eq!(epoch_of(&out[0]), 1, "{ms} ms");
+        }
+        assert_eq!(anchor_centers(&f), vec![(400.0, 500.0)]);
     }
 
     fn anchor_at(x: f32, y: f32) -> StaticAnchor {

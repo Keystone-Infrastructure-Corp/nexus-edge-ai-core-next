@@ -30,7 +30,7 @@ use nexus_pipeline::{
 };
 use nexus_rules::RuleEvaluator;
 use nexus_store::{MotionEventKind, MotionEventRow, Store};
-use nexus_tracker::{build_tracker, is_object_static, Tracker};
+use nexus_tracker::{build_tracker, is_object_static, Tracker, ALERT_EPOCH_ATTRIBUTE_KEY};
 use nexus_types::{
     AlertEvent, BBox, CameraId, Detection, Frame, FrameMetadata, PixelFormat, TrackedObject,
 };
@@ -792,6 +792,61 @@ async fn a_reused_track_id_inherits_no_parked_verdict_or_anchor() {
     }
     assert_eq!(o.fired("any_vehicle"), vec![0, gone + 1]);
     // The reused id is born again and keeps the clip open past the parked
+    // car's post-roll (15 870 ms).
+    assert_eq!(o.clips, vec![(0, None)]);
+    assert_eq!(o.motion_at(MotionEventKind::Born), vec![0, times[gone + 1]]);
+    assert_eq!(o.motion_at(MotionEventKind::Died), vec![5_520]);
+    assert_eq!(
+        o.anchors,
+        vec![(128.0, 144.0)],
+        "left to expire, not erased"
+    );
+}
+
+/// A tracker that drops a parked car's id for a frame and reports it again
+/// 20 px away, inside the anchor radius and the ID-reuse step: whatever it
+/// now is, it inherits no parked episode. It is alerted and recorded in a
+/// new episode, visible until its own dwell, and driving off a stall it
+/// never dwelled at is no departure: no second alert, and the anchor is
+/// left to expire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_id_dropped_and_back_inside_the_anchor_radius_starts_a_new_episode() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let times = every(690, 0, 25_000);
+    let gone = first_at(&times, 10_000);
+    let leaving = first_at(&times, 13_000);
+    let x = |k: usize| 0.25 + (20.0 + 15.0 * k.saturating_sub(leaving) as f32) / SIZE.0 as f32;
+    let mut s = Scenario::v2(shots(&times, |k, _| {
+        let id = 7;
+        match k.cmp(&gone) {
+            std::cmp::Ordering::Less => vec![Car { id, ..in_stall() }],
+            std::cmp::Ordering::Equal => vec![],
+            std::cmp::Ordering::Greater => vec![Car {
+                id,
+                ..car(x(k), 0.5)
+            }],
+        }
+    }));
+    s.scripted_ids = true;
+    let o = run(s, dir.path()).await;
+    for (k, &ms) in times.iter().enumerate() {
+        if k < gone {
+            assert_eq!(o.static_at(k, 0.25, 0.5), ms >= 5_000, "{ms} ms");
+        } else if k > gone {
+            assert!(!o.static_at(k, x(k), 0.5), "hidden at {ms} ms");
+        }
+    }
+    assert_eq!(o.fired("any_vehicle"), vec![0, gone + 1]);
+    let epoch = |k: usize, x: f32| {
+        o.object_at(k, x, 0.5).expect("object in view").attributes[ALERT_EPOCH_ATTRIBUTE_KEY]
+            .clone()
+    };
+    assert_ne!(
+        epoch(gone + 1, x(gone + 1)),
+        epoch(gone - 1, 0.25),
+        "a new episode"
+    );
+    // Born again on its return, it keeps the clip open past the parked
     // car's post-roll (15 870 ms).
     assert_eq!(o.clips, vec![(0, None)]);
     assert_eq!(o.motion_at(MotionEventKind::Born), vec![0, times[gone + 1]]);
