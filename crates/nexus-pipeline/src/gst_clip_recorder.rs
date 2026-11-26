@@ -143,6 +143,11 @@ const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 /// [`ClipRecorder::drain_camera`] keeps its camera stopping (SPEC-088).
 const FINALIZE_DRAINS: u32 = 3;
 
+/// A clip whose close could not finalize it retries on its own after this
+/// delay, doubled after each failed attempt up to [`FINALIZE_RETRY_MAX`].
+const FINALIZE_RETRY_MIN: Duration = Duration::from_secs(5);
+const FINALIZE_RETRY_MAX: Duration = Duration::from_secs(300);
+
 /// Recording-health reason of a clip whose close did not finish.
 const UNFINALIZED: &str = "recording could not be finalized";
 
@@ -354,6 +359,7 @@ struct Unfinalized {
     step: FinalStep,
     /// Failed attempts, the close's included.
     attempts: u32,
+    /// A drain's retry is running.
     retrying: bool,
     error: String,
 }
@@ -765,6 +771,8 @@ struct Writers {
     open: Arc<Mutex<HashMap<ClipId, OpenState>>>,
     epoch_ended: Arc<PlRwLock<HashMap<ClipId, Arc<AtomicBool>>>>,
     unfinalized: Arc<PlMutex<HashMap<ClipId, Unfinalized>>>,
+    in_flight: watch::Sender<()>,
+    shutting_down: Arc<PlMutex<bool>>,
 }
 
 impl GstClipRecorder {
@@ -776,58 +784,23 @@ impl GstClipRecorder {
             open: self.open.clone(),
             epoch_ended: self.epoch_ended.clone(),
             unfinalized: self.unfinalized.clone(),
+            in_flight: self.in_flight.clone(),
+            shutting_down: self.shutting_down.clone(),
         }
     }
 
-    /// Retry `clip_id`'s failed row step. A `held` retry is the camera's
-    /// work, which its drain waits for; shutdown waits for every retry.
-    fn spawn_finalize_retry(
-        &self,
-        clip_id: ClipId,
-        camera_id: CameraId,
-        step: FinalStep,
-        held: bool,
-    ) {
+    /// Retry `clip_id`'s failed row step once, as the camera's work, which
+    /// its drain waits for.
+    fn spawn_finalize_retry(&self, clip_id: ClipId, camera_id: CameraId, step: FinalStep) {
         let store = self.store.clone();
         let unfinalized = self.unfinalized.clone();
-        let retry = async move {
-            let retried = match &step {
-                FinalStep::Close(close) => store.close_clip(clip_id, close).await,
-                FinalStep::Discard => store.discard_clip_metadata(clip_id).await,
-            };
-            let mut unfinalized = unfinalized.lock();
-            match retried {
-                Ok(()) => {
-                    unfinalized.remove(&clip_id);
-                    info!(
-                        clip_id,
-                        camera_id, "gst recorder: finalized a clip on retry"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        clip_id,
-                        camera_id,
-                        error = %e,
-                        "gst recorder: clip finalization retry failed"
-                    );
-                    if let Some(u) = unfinalized.get_mut(&clip_id) {
-                        u.attempts += 1;
-                        u.retrying = false;
-                        u.error = e.to_string();
-                    }
+        self.spawn_owned(camera_id, async move {
+            if !retry_finalize(&store, &unfinalized, clip_id, camera_id, &step).await {
+                if let Some(u) = unfinalized.lock().get_mut(&clip_id) {
+                    u.retrying = false;
                 }
             }
-        };
-        if held {
-            self.spawn_owned(camera_id, retry);
-        } else {
-            let in_flight = self.in_flight.subscribe();
-            tokio::spawn(async move {
-                let _in_flight = in_flight;
-                retry.await
-            });
-        }
+        });
     }
 
     /// Finalize `handle` in an owned task for a drain ([`ClipRecorder::shutdown`],
@@ -883,8 +856,51 @@ impl GstClipRecorder {
     }
 }
 
+/// One attempt at `clip_id`'s failed row step; `true` once it is finalized.
+async fn retry_finalize(
+    store: &Store,
+    unfinalized: &PlMutex<HashMap<ClipId, Unfinalized>>,
+    clip_id: ClipId,
+    camera_id: CameraId,
+    step: &FinalStep,
+) -> bool {
+    // Another retry finalized it already.
+    if !unfinalized.lock().contains_key(&clip_id) {
+        return true;
+    }
+    let retried = match step {
+        FinalStep::Close(close) => store.close_clip(clip_id, close).await,
+        FinalStep::Discard => store.discard_clip_metadata(clip_id).await,
+    };
+    let mut unfinalized = unfinalized.lock();
+    match retried {
+        Ok(()) => {
+            unfinalized.remove(&clip_id);
+            info!(
+                clip_id,
+                camera_id, "gst recorder: finalized a clip on retry"
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                clip_id,
+                camera_id,
+                error = %e,
+                "gst recorder: clip finalization retry failed"
+            );
+            if let Some(u) = unfinalized.get_mut(&clip_id) {
+                u.attempts += 1;
+                u.error = e.to_string();
+            }
+            false
+        }
+    }
+}
+
 impl Writers {
-    /// Keep `step`'s failure for the camera's later drains.
+    /// Keep `step`'s failure for the camera's later drains, and retry it on
+    /// its own until it is finalized.
     fn unfinalized(
         &self,
         handle: ClipHandle,
@@ -895,13 +911,42 @@ impl Writers {
             handle.clip_id,
             Unfinalized {
                 camera_id: handle.camera_id,
-                step,
+                step: step.clone(),
                 attempts: 1,
                 retrying: false,
                 error: e.to_string(),
             },
         );
+        self.spawn_finalize_schedule(handle, step);
         e.into()
+    }
+
+    /// Retry `handle`'s failed row step, backing off, until it is finalized:
+    /// a camera that keeps recording, or that its drains released, may never
+    /// be drained again. Shutdown waits for an attempt under way, not for
+    /// the schedule, which makes none once shutdown began (SPEC-088).
+    fn spawn_finalize_schedule(&self, handle: ClipHandle, step: FinalStep) {
+        let store = self.store.clone();
+        let unfinalized = self.unfinalized.clone();
+        let in_flight = self.in_flight.clone();
+        let shutting_down = self.shutting_down.clone();
+        tokio::spawn(async move {
+            let mut delay = FINALIZE_RETRY_MIN;
+            loop {
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(FINALIZE_RETRY_MAX);
+                let _attempt = in_flight.subscribe();
+                // As an open does: either shutdown's idle check sees this
+                // attempt, or this sees shutdown begun.
+                if *shutting_down.lock() {
+                    return;
+                }
+                let (clip_id, camera_id) = (handle.clip_id, handle.camera_id);
+                if retry_finalize(&store, &unfinalized, clip_id, camera_id, &step).await {
+                    return;
+                }
+            }
+        });
     }
 
     async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError> {
@@ -1677,15 +1722,15 @@ impl ClipRecorder for GstClipRecorder {
         // A clip a close could not finalize, whoever awaited it, is retried
         // at its failed row step. After `FINALIZE_DRAINS` failed attempts it
         // no longer holds the camera stopping, so recording resumes, but it
-        // stays in recording health until a retry completes it (SPEC-088).
+        // retries on its own and stays in recording health until a retry
+        // completes it (SPEC-088).
         let mut released = HashSet::new();
         let mut retries = Vec::new();
         for (&clip_id, u) in self.unfinalized.lock().iter_mut() {
             if u.camera_id != camera_id {
                 continue;
             }
-            let held = u.attempts < FINALIZE_DRAINS;
-            if !held {
+            if u.attempts >= FINALIZE_DRAINS {
                 released.insert(clip_id);
                 error!(
                     clip_id,
@@ -1695,13 +1740,12 @@ impl ClipRecorder for GstClipRecorder {
                     "gst recorder: clip still not finalized; no longer holding its camera \
                      stopping, retrying in the background and reporting it in recording health"
                 );
-            }
-            if !std::mem::replace(&mut u.retrying, true) {
-                retries.push((clip_id, u.step.clone(), held));
+            } else if !std::mem::replace(&mut u.retrying, true) {
+                retries.push((clip_id, u.step.clone()));
             }
         }
-        for (clip_id, step, held) in retries {
-            self.spawn_finalize_retry(clip_id, camera_id, step, held);
+        for (clip_id, step) in retries {
+            self.spawn_finalize_retry(clip_id, camera_id, step);
         }
         // `shutdown`'s loop for one camera: an open still in flight registers
         // its clip (or finalizes it itself) later, and a close in flight may
@@ -6640,6 +6684,207 @@ mod epoch_tests {
 
         assert!(timed_out, "precondition: the first drain timed out");
         assert!(next.is_err(), "the failed close was lost: {next:?}");
+    }
+
+    /// Make every update or delete of a clip row fail at once, as a store
+    /// that rejects writes does, until [`restore_clip_writes`]. This crate
+    /// has no `sqlx`: a custom BEGIN statement runs the DDL in its own
+    /// transaction.
+    async fn fail_clip_writes(store: &Store) {
+        for op in ["UPDATE", "DELETE"] {
+            let ddl = format!(
+                "BEGIN; CREATE TRIGGER fail_clip_{op} BEFORE {op} ON motion_clips \
+                 BEGIN SELECT RAISE(ABORT, 'storage unavailable'); END;"
+            );
+            store
+                .pool()
+                .begin_with(ddl)
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn restore_clip_writes(store: &Store) {
+        for op in ["UPDATE", "DELETE"] {
+            let ddl = format!("BEGIN; DROP TRIGGER fail_clip_{op};");
+            store
+                .pool()
+                .begin_with(ddl)
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Poll `done` for at most `limit`; whether it held.
+    async fn wait_for(limit: Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while !done() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
+    /// Register a clip of camera 1, make its row writes fail and drain the
+    /// camera until the fourth drain releases it, as the reconciler's passes
+    /// do, then tear the camera down as the reconciler does before starting
+    /// its replacement. No drain of the camera comes after.
+    async fn release_an_unfinalized_clip(
+        rec: &GstClipRecorder,
+        store: &Store,
+        clips_dir: &Path,
+    ) -> ClipHandle {
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, _) = register_clip(rec, store, clips_dir, 1, started_at, None).await;
+        fail_clip_writes(store).await;
+        let mut drained = Vec::new();
+        for _ in 0..4 {
+            drained.push(rec.drain_camera(1).await.is_ok());
+        }
+        rec.remove_camera_ingester(1);
+        assert_eq!(
+            drained,
+            [false, false, false, true],
+            "precondition: the fourth drain released the camera"
+        );
+        clip
+    }
+
+    fn attempts(rec: &GstClipRecorder, clip: ClipHandle) -> Option<u32> {
+        rec.unfinalized
+            .lock()
+            .get(&clip.clip_id)
+            .map(|u| u.attempts)
+    }
+
+    /// SPEC-088 review 10: once its camera is released no drain retries a
+    /// clip, so it retries on its own, 5 s after its close failed and then
+    /// backing off. The first of those fails too; once the store recovers,
+    /// the next one, not at once and not never, stamps the row with no drain
+    /// called, and recording health, which reported the clip until then,
+    /// clears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_released_clip_finalizes_on_its_own_once_the_store_recovers() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let clip = release_an_unfinalized_clip(&rec, &store, &clips_dir).await;
+
+        let retried_on_its_own =
+            wait_for(Duration::from_secs(10), || attempts(&rec, clip) == Some(4)).await;
+        let failed = tokio::time::Instant::now();
+        let reported = rec.recording_degradations();
+        restore_clip_writes(&store).await;
+        let settled = wait_for(Duration::from_secs(20), || attempts(&rec, clip).is_none()).await;
+        let waited = failed.elapsed();
+
+        assert!(
+            retried_on_its_own,
+            "precondition: the released clip's own retry failed"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|d| d.camera_id == 1 && d.reason == UNFINALIZED),
+            "the unfinalized clip vanished from recording health: {reported:?}"
+        );
+        assert!(
+            settled,
+            "no retry finalized the clip once the store recovered"
+        );
+        assert!(
+            waited >= Duration::from_secs(4),
+            "the schedule retried without backing off: {waited:?}"
+        );
+        assert!(
+            finalized_playable(&store, &clips_dir, clip.clip_id).await,
+            "the retry did not stamp the row with the close's final file"
+        );
+        assert!(
+            rec.recording_degradations().is_empty(),
+            "a recovered clip is still reported: {:?}",
+            rec.recording_degradations()
+        );
+    }
+
+    /// SPEC-088 review 10: a close the supervisor runs while its camera keeps
+    /// recording (a rotation) is never followed by a drain; its failure
+    /// retries on its own once the store recovers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_close_of_a_recording_camera_retries_on_its_own() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        fail_clip_writes(&store).await;
+
+        let closed = rec
+            .close(
+                clip,
+                ClipFinal {
+                    ended_at: Utc::now(),
+                },
+            )
+            .await;
+        restore_clip_writes(&store).await;
+        let settled = wait_for(Duration::from_secs(10), || attempts(&rec, clip).is_none()).await;
+
+        assert!(closed.is_err(), "precondition: the close failed");
+        assert!(settled, "no retry finalized the clip");
+        assert!(
+            finalized_playable(&store, &clips_dir, clip.clip_id).await,
+            "the retry did not stamp the row with the close's final file"
+        );
+    }
+
+    /// SPEC-088 review 10: shutdown does not wait out a retry schedule, and
+    /// the schedule makes no attempt after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_ends_a_released_clips_retry_schedule() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let clip = release_an_unfinalized_clip(&rec, &store, &clips_dir).await;
+
+        let shut = tokio::time::timeout(Duration::from_secs(1), rec.shutdown())
+            .await
+            .is_ok();
+        // Past the schedule's first delay.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        assert!(
+            shut,
+            "shutdown waited for a retry schedule between attempts"
+        );
+        assert_eq!(
+            attempts(&rec, clip),
+            Some(3),
+            "the schedule retried after shutdown"
+        );
     }
 
     /// SPEC-088 Z-4 in `main`'s order: every supervisor is aborted, none is

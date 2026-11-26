@@ -343,7 +343,8 @@ pub trait ClipRecorder: Send + Sync {
     /// that already took one), and return when all of it is done; `Err`
     /// while a clip of the camera could not be finalized, by this drain or
     /// by any earlier close, until a retry completes it or it has failed
-    /// three times (it stays in [`Self::recording_degradations`]). The
+    /// three times (it then retries on its own and stays in
+    /// [`Self::recording_degradations`] until it is finalized). The
     /// engine calls it once a camera's supervisor has ended and starts no
     /// replacement, nor removes
     /// the camera's ingester, until it returns `Ok`: an aborted supervisor
