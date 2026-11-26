@@ -8780,8 +8780,39 @@ mod tests {
                 };
                 reads.push(row.get("recording_activity").cloned());
             }
-            assert_eq!(reads[0], reads[1], "the batch and the single read disagree");
-            reads.pop().unwrap()
+            let batch = reads.pop().unwrap();
+            let mut single = reads.pop().unwrap();
+            // Each read ages the same frame from its own `now`, so the later
+            // batch read's times may only have grown, and by a moment.
+            let mut timed: Vec<String> = [
+                "last_success_age_ms",
+                "last_qualifying_age_ms",
+                "last_failure_age_ms",
+                "legacy_recorded_ms",
+                "shadow_recorded_ms",
+            ]
+            .map(|key| format!("/{key}"))
+            .into();
+            for side in ["legacy_open", "legacy_closed"] {
+                for reason in ["activity", "post_roll", "degraded_coverage", "quiet"] {
+                    timed.push(format!("/elapsed/{side}/{reason}"));
+                }
+            }
+            if let (Some(s), Some(b)) = (single.as_mut(), batch.as_ref()) {
+                for path in &timed {
+                    let x = s.pointer(path).and_then(serde_json::Value::as_u64);
+                    let y = b.pointer(path).and_then(serde_json::Value::as_u64);
+                    if let (Some(x), Some(y)) = (x, y) {
+                        assert!(
+                            (x..=x + 1_000).contains(&y),
+                            "{path}: batch read {y} ms is not a moment after single read {x} ms"
+                        );
+                        *s.pointer_mut(path).unwrap() = y.into();
+                    }
+                }
+            }
+            assert_eq!(single, batch, "the batch and the single read disagree");
+            batch
         }
 
         let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
