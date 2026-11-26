@@ -25,13 +25,16 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Instant;
 
-use nexus_config::StaticObjectConfig;
+use nexus_config::{ParkingPolicyV2, StaticObjectConfig, ZoneConfig, ZoneKind};
 use nexus_types::{CameraId, Frame, TrackId, TrackedObject};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
+use crate::annotator::point_in_normalized_polygon;
+use crate::parking_stillness::{InvalidStillnessParam, StillnessParams, StillnessWindow};
 use crate::rate::InferenceRate;
 
 /// Attribute key stamped on a `TrackedObject` by [`StaticObjectFilter::classify`]
@@ -149,6 +152,33 @@ pub struct StaticObjectFilter {
     extra_anchor_classes: Vec<String>,
     /// Measured inference rate; converts `dwell_secs` to frames.
     rate: InferenceRate,
+    /// SPEC-077 `parking_policy_v2`; `None` is the legacy per-frame filter.
+    parking_v2: Option<ParkingV2>,
+}
+
+/// SPEC-077 v2 state: only an observed dwell, timed on capture stamps,
+/// inside a parking zone suppresses a track.
+struct ParkingV2 {
+    params: StillnessParams,
+    /// Normalized polygons of the camera's parking zones.
+    zones: Vec<Vec<(f32, f32)>>,
+    /// Capture milliseconds count from the first classified frame.
+    origin: Option<Instant>,
+    /// Analysis-frame size; a change resets every candidate.
+    geometry: Option<(u32, u32)>,
+    /// Classified frames so far.
+    seq: u64,
+    tracks: HashMap<TrackId, V2Track>,
+}
+
+struct V2Track {
+    window: StillnessWindow,
+    alert_epoch: u64,
+    /// The `seq` of the last frame that carried this track.
+    seen_seq: u64,
+    /// Where the track's current parked episode began: the center at its
+    /// first qualified dwell.
+    parked_at: Option<(f32, f32)>,
 }
 
 impl StaticObjectFilter {
@@ -186,7 +216,37 @@ impl StaticObjectFilter {
                 .map(|s| s.to_lowercase())
                 .collect(),
             rate: InferenceRate::default(),
+            parking_v2: None,
         }
+    }
+
+    /// SPEC-077: replace the legacy per-frame FSM with `parking_policy_v2`.
+    /// A track is static only while its own observed dwell inside one of
+    /// `zones`' parking polygons qualifies; the other zone kinds are ignored.
+    pub fn with_parking_policy(
+        mut self,
+        policy: &ParkingPolicyV2,
+        zones: &[ZoneConfig],
+    ) -> Result<Self, InvalidStillnessParam> {
+        let params = StillnessParams::new(
+            policy.dwell_secs,
+            policy.max_speed_box_diagonals_per_sec,
+            policy.max_displacement_box_diagonals,
+            policy.max_observation_gap_secs,
+        )?;
+        self.parking_v2 = Some(ParkingV2 {
+            params,
+            zones: zones
+                .iter()
+                .filter(|z| z.kind == ZoneKind::Parking)
+                .map(|z| z.polygon.clone())
+                .collect(),
+            origin: None,
+            geometry: None,
+            seq: 0,
+            tracks: HashMap::new(),
+        });
+        Ok(self)
     }
 
     pub fn name(&self) -> &'static str {
@@ -228,6 +288,9 @@ impl StaticObjectFilter {
     pub fn clear(&mut self) {
         self.anchors.clear();
         self.state_by_track.clear();
+        if let Some(v2) = &mut self.parking_v2 {
+            v2.tracks.clear();
+        }
         if let Some(path) = &self.persistence_path {
             match fs::remove_file(path) {
                 Ok(()) => {}
@@ -260,6 +323,11 @@ impl StaticObjectFilter {
         // Wall-clock used to refresh / age anchors. Pulled from the
         // frame so tests and replay scenarios behave deterministically.
         let frame_ms = _frame.captured_at.timestamp_millis();
+        if self.parking_v2.is_some() {
+            self.classify_v2(_frame, objects);
+            self.sweep_anchors(frame_ms);
+            return;
+        }
         self.rate.observe_at(_frame.captured_mono);
 
         // Walk the object list, classifying each. Borrow-checker: pull
@@ -509,17 +577,105 @@ impl StaticObjectFilter {
         if dirty {
             self.save_registry();
         }
+        self.sweep_anchors(frame_ms);
+    }
 
-        // ---- TTL sweep ----
-        // After per-track classification, prune any anchor whose last
-        // matching observation is older than `anchor_ttl_secs`. Anchors
-        // loaded from disk in the legacy (pre-TTL) shape carry
-        // `last_seen_unix_ms = None`; bootstrap those to the current
-        // frame so they get one full TTL window after restart before
-        // becoming eligible for sweeping. Only persists when an actual
-        // removal happens to avoid disk thrash from the per-frame
-        // refresh stamps above.
-        if cfg_persistence && self.cfg.anchor_ttl_secs > 0 {
+    /// SPEC-077 v2 classification. Each track's observed (detector-matched)
+    /// box feeds its [`StillnessWindow`] in analysis-frame pixels, the
+    /// supervisor frame the detector already mapped its boxes back into,
+    /// timed by monotonic capture milliseconds. Coasting frames and
+    /// frames a track is missing from only end its window. Track age,
+    /// update counts and movement EMAs never credit stillness.
+    fn classify_v2(&mut self, frame: &Frame, objects: &mut [TrackedObject]) {
+        let eligible: Vec<bool> = objects
+            .iter()
+            .map(|o| self.is_anchor_eligible(&o.label))
+            .collect();
+        let match_dist = self.cfg.match_distance_pixels.max(1) as f32;
+        let Some(v2) = self.parking_v2.as_mut() else {
+            return;
+        };
+        let origin = *v2.origin.get_or_insert(frame.captured_mono);
+        let at_ms = frame
+            .captured_mono
+            .saturating_duration_since(origin)
+            .as_millis() as u64;
+        let geometry = (frame.width, frame.height);
+        if v2.geometry.replace(geometry).is_some_and(|g| g != geometry) {
+            // Pixels of the old geometry say nothing about the new one.
+            for t in v2.tracks.values_mut() {
+                t.window.miss();
+                if t.parked_at.take().is_some() {
+                    t.alert_epoch += 1;
+                }
+            }
+        }
+        v2.seq += 1;
+        let (fw, fh) = (frame.width.max(1) as f32, frame.height.max(1) as f32);
+        let zones = &v2.zones;
+        let in_parking = |(x, y): (f32, f32)| {
+            zones
+                .iter()
+                .any(|z| point_in_normalized_polygon(x / fw, y / fh, z))
+        };
+        let params = v2.params;
+        for (o, eligible) in objects.iter_mut().zip(eligible) {
+            if !eligible {
+                continue;
+            }
+            let t = v2.tracks.entry(o.track_id).or_insert_with(|| V2Track {
+                window: StillnessWindow::new(params),
+                alert_epoch: 0,
+                seen_seq: 0,
+                parked_at: None,
+            });
+            // Missing from the last frame: nothing observed it there.
+            if t.seen_seq + 1 != v2.seq {
+                t.window.miss();
+            }
+            t.seen_seq = v2.seq;
+            let mut still = false;
+            match o.detection_bbox {
+                Some(b) => {
+                    let center = b.center();
+                    let inside = in_parking(center);
+                    still =
+                        t.window
+                            .observe(at_ms, center, (b.x2 - b.x1).hypot(b.y2 - b.y1), inside);
+                    // Seen away from where it parked: its next episode.
+                    if t.parked_at
+                        .is_some_and(|p| !inside || distance(p, center) > match_dist)
+                    {
+                        t.parked_at = None;
+                        t.alert_epoch += 1;
+                    }
+                    if still {
+                        t.parked_at.get_or_insert(center);
+                    }
+                }
+                None => t.window.miss(),
+            }
+            if still {
+                o.attributes
+                    .insert(STATIC_ATTRIBUTE_KEY.into(), Value::Bool(true));
+            }
+            o.attributes.insert(
+                ALERT_EPOCH_ATTRIBUTE_KEY.into(),
+                Value::Number(t.alert_epoch.into()),
+            );
+        }
+    }
+
+    /// After per-track classification, prune any anchor whose last
+    /// matching observation is older than `anchor_ttl_secs`. Anchors
+    /// loaded from disk in the legacy (pre-TTL) shape carry
+    /// `last_seen_unix_ms = None`; bootstrap those to the current
+    /// frame so they get one full TTL window after restart before
+    /// becoming eligible for sweeping. Only persists when an actual
+    /// removal happens to avoid disk thrash from the per-frame
+    /// refresh stamps above.
+    fn sweep_anchors(&mut self, frame_ms: i64) {
+        if self.cfg.persistence_enabled && self.cfg.anchor_ttl_secs > 0 {
             let ttl_ms = (self.cfg.anchor_ttl_secs as i64).saturating_mul(1_000);
             let mut swept = false;
             self.anchors.retain_mut(|a| {
@@ -673,6 +829,10 @@ impl StaticObjectFilter {
             }
         }
     }
+}
+
+fn distance(a: (f32, f32), b: (f32, f32)) -> f32 {
+    (a.0 - b.0).hypot(a.1 - b.1)
 }
 
 fn is_vehicle_label(label: &str) -> bool {
@@ -1767,5 +1927,175 @@ mod tests {
             Some(690),
             "only the last detected still frame may refresh the anchor"
         );
+    }
+
+    // ---- SPEC-077 parking_policy_v2 ----
+
+    use nexus_config::{ParkingPolicyV2, ZoneConfig, ZoneKind};
+
+    const HD: (u32, u32) = (1920, 1080);
+    const V2_FPS: [f64; 5] = [0.5, 1.45, 2.0, 8.0, 30.0];
+
+    /// The plan's test values, not customer defaults: dwell 5 s, speed
+    /// <= 0.05 diagonals/s, drift <= 0.10 diagonals, gap <= 3 s.
+    fn v2_policy() -> ParkingPolicyV2 {
+        ParkingPolicyV2 {
+            dwell_secs: 5.0,
+            max_speed_box_diagonals_per_sec: 0.05,
+            max_displacement_box_diagonals: 0.10,
+            max_observation_gap_secs: 3.0,
+        }
+    }
+
+    /// Stalls over the left half of the frame; the right half is the lane.
+    fn stalls() -> Vec<ZoneConfig> {
+        vec![ZoneConfig {
+            id: "stalls".into(),
+            name: "Stalls".into(),
+            polygon: vec![(0.0, 0.0), (0.5, 0.0), (0.5, 1.0), (0.0, 1.0)],
+            kind: ZoneKind::Parking,
+            min_bbox_area_px_override: None,
+        }]
+    }
+
+    fn v2_filter() -> StaticObjectFilter {
+        StaticObjectFilter::new(StaticObjectConfig::default(), 1, None)
+            .with_parking_policy(&v2_policy(), &stalls())
+            .expect("valid policy")
+    }
+
+    /// A tracked box the detector did not see this frame.
+    fn coasting(mut o: TrackedObject) -> TrackedObject {
+        o.detection_bbox = None;
+        o
+    }
+
+    /// Classify `objs` on a `size` frame captured at `ms`.
+    fn v2_step(
+        f: &mut StaticObjectFilter,
+        ms: i64,
+        size: (u32, u32),
+        mut objs: Vec<TrackedObject>,
+    ) -> Vec<TrackedObject> {
+        let mut fr = frame(1, 0, ms);
+        (fr.width, fr.height) = size;
+        f.classify(&fr, &mut objs);
+        objs
+    }
+
+    /// Capture ms of `fps` frames from `from_ms` until `to_ms`.
+    fn capture_ms(fps: f64, from_ms: i64, to_ms: i64) -> Vec<i64> {
+        (0..)
+            .map(|k| from_ms + (k as f64 * 1000.0 / fps).round() as i64)
+            .take_while(|&ms| ms <= to_ms)
+            .collect()
+    }
+
+    /// The capture ms of the first frame on which the one object is static.
+    fn first_static(
+        f: &mut StaticObjectFilter,
+        frames: &[i64],
+        at: impl Fn(usize) -> TrackedObject,
+    ) -> Option<i64> {
+        let mut first = None;
+        for (k, &ms) in frames.iter().enumerate() {
+            let out = v2_step(f, ms, HD, vec![at(k)]);
+            if first.is_none() && is_object_static(&out[0]) {
+                first = Some(ms);
+            }
+        }
+        first
+    }
+
+    /// Dwell is observed capture time, not frames: a parked car promotes on
+    /// the first frame at or after 5 s at every analysis rate.
+    #[test]
+    fn v2_promotes_after_observed_capture_seconds_at_any_rate() {
+        for fps in V2_FPS {
+            let frames = capture_ms(fps, 0, 8_000);
+            let want = frames.iter().copied().find(|&ms| ms >= 5_000);
+            let got = first_static(&mut v2_filter(), &frames, |_| vehicle(1, 400.0, 500.0));
+            assert_eq!(got, want, "{fps} fps");
+        }
+    }
+
+    /// SPEC-077: at 1.45 fps a vehicle moving 20 px a frame never promotes.
+    #[test]
+    fn v2_a_vehicle_moving_20_px_a_frame_at_1_45_fps_never_promotes() {
+        let frames = capture_ms(1.45, 0, 30_000);
+        let got = first_static(&mut v2_filter(), &frames, |k| {
+            vehicle(1, 100.0 + 20.0 * k as f32, 500.0)
+        });
+        assert_eq!(got, None);
+    }
+
+    /// A car queueing in the lane, outside every parking zone, stands still
+    /// for far longer than the dwell and is never hidden.
+    #[test]
+    fn v2_a_vehicle_standing_in_the_lane_is_never_hidden() {
+        for fps in V2_FPS {
+            let frames = capture_ms(fps, 0, 30_000);
+            let got = first_static(&mut v2_filter(), &frames, |_| vehicle(1, 1400.0, 500.0));
+            assert_eq!(got, None, "{fps} fps");
+        }
+    }
+
+    /// Coasting frames are not observations: they are never static, and a
+    /// reacquired car must hold still, observed, for a fresh dwell.
+    #[test]
+    fn v2_coasting_frames_credit_no_stillness() {
+        let mut f = v2_filter();
+        let car = || vehicle(1, 400.0, 500.0);
+        for ms in capture_ms(1.45, 0, 6_000) {
+            v2_step(&mut f, ms, HD, vec![car()]);
+        }
+        assert!(is_object_static(
+            &v2_step(&mut f, 6_900, HD, vec![car()])[0]
+        ));
+        for ms in [7_600, 8_300, 9_000] {
+            let out = v2_step(&mut f, ms, HD, vec![coasting(car())]);
+            assert!(!is_object_static(&out[0]), "coasting at {ms} ms");
+        }
+        let back = capture_ms(1.45, 9_700, 20_000);
+        assert_eq!(
+            first_static(&mut f, &back, |_| car()),
+            back.iter().copied().find(|&ms| ms >= 9_700 + 5_000),
+            "a fresh observed dwell from reacquisition"
+        );
+    }
+
+    /// The same pixel center on a new frame geometry is a new candidate.
+    #[test]
+    fn v2_a_frame_geometry_change_starts_a_fresh_candidate() {
+        let mut f = v2_filter();
+        let car = || vehicle(1, 400.0, 500.0);
+        for ms in capture_ms(1.0, 0, 4_000) {
+            assert!(!is_object_static(&v2_step(&mut f, ms, HD, vec![car()])[0]));
+        }
+        let first = capture_ms(1.0, 5_000, 12_000)
+            .into_iter()
+            .find(|&ms| is_object_static(&v2_step(&mut f, ms, (1920, 1200), vec![car()])[0]));
+        assert_eq!(first, Some(10_000), "no elapsed time is inherited");
+    }
+
+    /// Leaving where it parked starts the car's next alert episode.
+    #[test]
+    fn v2_leaving_its_spot_starts_a_new_alert_episode() {
+        let mut f = v2_filter();
+        let epoch = |o: &TrackedObject| o.attributes[ALERT_EPOCH_ATTRIBUTE_KEY].clone();
+        for ms in capture_ms(1.45, 0, 6_000) {
+            v2_step(&mut f, ms, HD, vec![vehicle(1, 400.0, 500.0)]);
+        }
+        let parked = v2_step(&mut f, 6_900, HD, vec![vehicle(1, 400.0, 500.0)]);
+        assert!(is_object_static(&parked[0]));
+        assert_eq!(epoch(&parked[0]), 0);
+        let mut x = 400.0;
+        for ms in capture_ms(1.45, 7_590, 12_000) {
+            x += 15.0;
+            let out = v2_step(&mut f, ms, HD, vec![vehicle(1, x, 500.0)]);
+            assert!(!is_object_static(&out[0]), "moving at {ms} ms");
+            let want = if x - 400.0 > 40.0 { 1 } else { 0 };
+            assert_eq!(epoch(&out[0]), want, "x = {x}");
+        }
     }
 }

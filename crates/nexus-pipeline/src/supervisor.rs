@@ -567,12 +567,25 @@ async fn run_camera(
             let path = state_dir
                 .join("static_objects")
                 .join(format!("cam-{}.json", cfg.id));
-            Some(StaticObjectFilter::with_anchor_classes(
+            let filter = StaticObjectFilter::with_anchor_classes(
                 effective_static_cfg,
                 cfg.id,
                 Some(path),
                 anchor_classes,
-            ))
+            );
+            // SPEC-077: an explicit v2 policy confines suppression to
+            // observed stillness in the parking zones. One the filter
+            // rejects suppresses nothing rather than the whole view.
+            match &cfg.behavior.parking_policy_v2 {
+                None => Some(filter),
+                Some(policy) => match filter.with_parking_policy(policy, &cfg.zones) {
+                    Ok(filter) => Some(filter),
+                    Err(e) => {
+                        error!(camera_id = cfg.id, "parking_policy_v2 not applied, nothing is suppressed: {e}");
+                        None
+                    }
+                },
+            }
         } else {
             None
         };
