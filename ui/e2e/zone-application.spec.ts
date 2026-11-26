@@ -1,10 +1,12 @@
 // SPEC-088 — the camera editor reports whether the running camera uses the
 // zones it shows, and never claims Applied without a fresh, matching receipt.
+// SPEC-077 — where the engine reports parking, the parking settings shown
+// need their own `parking_runtime` receipt too.
 //
 // The engine is real: cameras, saves and the config snapshot (with the
-// revision it computes) are the engine's. Only the stats read's
-// `zones_runtime` is rewritten, so a receipt can say what a running camera
-// would, with the engine's own revisions.
+// revisions it computes) are the engine's. Only the stats read's
+// `zones_runtime` and `parking_runtime` are rewritten, so a receipt can say
+// what a running camera would, with the engine's own revisions.
 
 import { expect, test, type Page, type Request } from "@playwright/test";
 
@@ -14,7 +16,7 @@ type Zone = {
   id: string;
   name: string;
   polygon: Array<[number, number]>;
-  kind: "inclusion" | "exclusion" | "dwell";
+  kind: "inclusion" | "exclusion" | "dwell" | "parking";
 };
 const DOOR: Zone = {
   id: "z-door",
@@ -28,6 +30,22 @@ const DOCK: Zone = {
   polygon: [[0.6, 0.1], [0.9, 0.1], [0.6, 0.4]],
   kind: "inclusion",
 };
+
+const STALLS: Zone = {
+  id: "z-stalls",
+  name: "Stalls",
+  polygon: [[0.1, 0.6], [0.4, 0.6], [0.1, 0.9]],
+  kind: "parking",
+};
+// Candidates from the SPEC-077 plan's calibration grid, never defaults.
+const POLICY_A = {
+  dwell_secs: 10,
+  max_speed_box_diagonals_per_sec: 0.05,
+  max_displacement_box_diagonals: 0.1,
+  max_observation_gap_secs: 3,
+};
+const POLICY_B = { ...POLICY_A, dwell_secs: 20 };
+const PARKED = { parking_lot_mode: true, parking_policy_v2: POLICY_A };
 
 type Receipt = {
   schema_version: number;
@@ -105,8 +123,8 @@ const ONVIF = {
   password: "onvif-secret",
 };
 
-/** A disabled camera, so the engine never tries to stream it. */
-async function createCamera(page: Page, zones: Zone[]): Promise<number> {
+/** A disabled camera, so the engine never tries to stream it; `extra` sets more fields. */
+async function createCamera(page: Page, zones: Zone[], extra: Record<string, unknown> = {}): Promise<number> {
   const cam = await engine<{ id: number }>(page, "POST", "/cameras", {
     id: 0,
     name: "e2e zones",
@@ -115,6 +133,7 @@ async function createCamera(page: Page, zones: Zone[]): Promise<number> {
     enabled: false,
     onvif: ONVIF,
     zones,
+    ...extra,
   });
   return cam.id;
 }
@@ -130,22 +149,30 @@ async function saveElsewhere(page: Page, id: number, change: Record<string, unkn
 /** Another operator's full-config save of the camera with `zones`. */
 const saveZonesElsewhere = (page: Page, id: number, zones: Zone[]) => saveElsewhere(page, id, { zones });
 
+type Snapshot = { zones_revision: string; parking_revision?: string };
+const snapshot = (page: Page, id: number) => engine<Snapshot>(page, "GET", `/admin/cameras/${id}/config-snapshot`);
+
 async function zonesRevision(page: Page, id: number): Promise<string> {
-  return (await engine<{ zones_revision: string }>(page, "GET", `/admin/cameras/${id}/config-snapshot`))
-    .zones_revision;
+  return (await snapshot(page, id)).zones_revision;
 }
 
 /** Camera `id`'s own URL, whatever its query: a save can carry `expected_zones_revision`. */
 const cameraPath = (id: number) => (url: URL) => url.pathname === `/api/v1/cameras/${id}`;
 
 /**
- * Serve this camera's stats from the engine with `zones_runtime` rewritten.
+ * Serve this camera's stats from the engine with `zones_runtime` and
+ * `parking_runtime` rewritten, each from its own real receipt and base
+ * generation: by `set` (both), unless `setParking` gave parking its own.
  * `holdNext` parks the next request before it reaches the engine and
- * answers it with the rewrite given on release.
+ * answers it with the rewrite given on release, for both.
  */
 async function controlReceipt(page: Page, id: number) {
   let rewrite: Rewrite = (r) => r;
-  let base: number | null = null;
+  let parking: Rewrite | null = null;
+  const base: Record<"zones_runtime" | "parking_runtime", number | null> = {
+    zones_runtime: null,
+    parking_runtime: null,
+  };
   let gate: { seen: () => void; opened: Promise<Rewrite> } | null = null;
   await page.route(`**/api/v1/cameras/${id}/stats`, async (route) => {
     let own: Rewrite | null = null;
@@ -156,21 +183,27 @@ async function controlReceipt(page: Page, id: number) {
       own = await g.opened;
     }
     const res = await route.fetch();
-    const body = (await res.json()) as { zones_runtime?: Receipt };
-    if (!body.zones_runtime) throw new Error("the engine reported no zones_runtime");
-    base ??= body.zones_runtime.generation;
-    const out = (own ?? rewrite)(body.zones_runtime, base);
-    if (out === "error") {
-      await route.fulfill({ status: 500, json: { error: "e2e: stats unavailable" } });
-      return;
+    const body = (await res.json()) as Record<string, unknown>;
+    for (const key of ["zones_runtime", "parking_runtime"] as const) {
+      const real = body[key] as Receipt | undefined;
+      if (!real) throw new Error(`the engine reported no ${key}`);
+      const b = (base[key] ??= real.generation);
+      const out = (own ?? (key === "parking_runtime" ? parking : null) ?? rewrite)(real, b);
+      if (out === "error") {
+        await route.fulfill({ status: 500, json: { error: "e2e: stats unavailable" } });
+        return;
+      }
+      if (out === "missing") delete body[key];
+      else body[key] = out;
     }
-    if (out === "missing") delete body.zones_runtime;
-    else body.zones_runtime = out;
     await route.fulfill({ response: res, json: body });
   });
   return {
     set: (r: Rewrite) => {
       rewrite = r;
+    },
+    setParking: (r: Rewrite | null) => {
+      parking = r;
     },
     holdNext: () => {
       let seen = () => {};
@@ -1414,4 +1447,350 @@ test.describe("zone application", () => {
       await expect(page.getByRole("button", { name: /^save$/i })).toBeEnabled();
     });
   }
+
+  test.describe("parking zones (SPEC-077)", () => {
+    const policy = (page: Page) => ({
+      dwell: page.locator("#park-dwell"),
+      speed: page.locator("#park-speed"),
+      drift: page.locator("#park-drift"),
+      gap: page.locator("#park-gap"),
+    });
+    const optIn = (page: Page) => page.getByLabel("Use parking zones (v2)");
+    const save = (page: Page) => page.getByRole("button", { name: /^save$/i }).click();
+
+    async function parkingRevision(page: Page, id: number): Promise<string> {
+      const revision = (await snapshot(page, id)).parking_revision;
+      if (!revision) throw new Error("the engine reported no parking_revision");
+      return revision;
+    }
+
+    /** The camera's PUTs started from now on. */
+    function countPuts(page: Page, id: number) {
+      const seen = { puts: 0 };
+      page.on("request", (r) => {
+        if (isPut(id)(r)) seen.puts += 1;
+      });
+      return seen;
+    }
+
+    /** Open the camera with both receipts applied. */
+    async function openApplied(page: Page, id: number) {
+      const receipt = await controlReceipt(page, id);
+      receipt.set(applied(1));
+      await page.goto(`/cameras/${id}`);
+      const status = page.getByTestId("zone-application");
+      await expect(status).toContainText("Applied to camera");
+      return { receipt, status };
+    }
+
+    test("the first parking zone saves only with parking-lot mode and a complete v2 policy", async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR]);
+      const id = cameraId;
+      const { receipt, status } = await openApplied(page, id);
+      // v2 off and parking-lot mode off: said plainly.
+      await expect(optIn(page)).not.toBeChecked();
+      await expect(page.getByText(/no vehicle is suppressed as parked/)).toBeVisible();
+
+      await page.getByRole("button", { name: "New zone" }).click();
+      await clickCanvas(page, 0.1, 0.6);
+      await clickCanvas(page, 0.4, 0.6);
+      await clickCanvas(page, 0.1, 0.9);
+      await page.getByRole("button", { name: "Finish (3 pt)" }).click();
+      await zoneRow(page, "Zone 2").getByRole("combobox").selectOption("parking");
+      const problem = page.getByTestId("parking-problem");
+      await expect(problem).toContainText("A parking zone needs parking zones (v2)");
+      const sent = countPuts(page, id);
+      await save(page);
+      await expect(page.getByText(/^Not saved: A parking zone needs parking zones \(v2\)/)).toBeVisible();
+
+      // Opted in, nothing is filled for the operator, and v2 needs parking-lot mode.
+      await optIn(page).check();
+      await expect(problem).toContainText("Parking zones (v2) need parking-lot mode");
+      await page.getByLabel("Enable parking-lot mode").check();
+      const f = policy(page);
+      for (const input of Object.values(f)) await expect(input).toHaveValue("");
+      await expect(problem).toContainText("Fill every parking value with a number above 0");
+      await f.dwell.fill("10");
+      await f.speed.fill("0.05");
+      await f.drift.fill("0");
+      await f.gap.fill("3");
+      await save(page);
+      await expect(page.getByText(/^Not saved: Fill every parking value/)).toBeVisible();
+      await page.waitForTimeout(500);
+      expect(sent.puts).toBe(0);
+      await expect(page.getByText("Applied to camera")).toHaveCount(0);
+
+      await f.drift.fill("0.1");
+      await expect(problem).toHaveCount(0);
+      receipt.set(applied(2));
+      const put = page.waitForRequest(isPut(id));
+      await save(page);
+      const body = (await put).postDataJSON() as Record<string, unknown>;
+      const zones = body.zones as Zone[];
+      expect(zones[0]).toEqual(DOOR);
+      expect(zones[1]).toMatchObject({ name: "Zone 2", kind: "parking" });
+      expect(zones[1]!.polygon).toHaveLength(3);
+      expect(body.parking_lot_mode).toBe(true);
+      expect(body.parking_policy_v2).toEqual(POLICY_A);
+      expect(body.url).toBe(URL_WITH_CREDENTIALS);
+      expect(body.onvif).toEqual(ONVIF);
+      await expect(status).toContainText("Applied to camera", POLL);
+      await expect(zoneRow(page, "Zone 2").getByRole("combobox")).toHaveValue("parking");
+    });
+
+    test("a parking zone edits like any zone; removing the last one requires turning v2 off", async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const { receipt, status } = await openApplied(page, id);
+      await expect(optIn(page)).toBeChecked();
+      await expect(policy(page).dwell).toHaveValue("10");
+      await expect(zoneRow(page, "Stalls").getByRole("combobox")).toHaveValue("parking");
+      await expect(polygon(page, STALLS)).toHaveCount(1);
+
+      await zoneRow(page, "Stalls").getByRole("textbox").fill("Stalls north");
+      receipt.set(applied(2));
+      let put = page.waitForRequest(isPut(id));
+      await save(page);
+      let body = (await put).postDataJSON() as Record<string, unknown>;
+      expect(body.zones).toEqual([DOOR, { ...STALLS, name: "Stalls north" }]);
+      expect(body.parking_policy_v2).toEqual(POLICY_A);
+      await expect(status).toContainText("Applied to camera", POLL);
+
+      // Removing the final parking zone warns; v2 must go in the same save.
+      await zoneRow(page, "Stalls north").getByTitle("Delete zone").click();
+      const problem = page.getByTestId("parking-problem");
+      await expect(problem).toContainText("No parking zone remains");
+      const sent = countPuts(page, id);
+      await save(page);
+      await expect(page.getByText(/^Not saved: No parking zone remains/)).toBeVisible();
+      await page.waitForTimeout(500);
+      expect(sent.puts).toBe(0);
+
+      await optIn(page).uncheck();
+      await expect(problem).toHaveCount(0);
+      await expect(page.getByText(/legacy static filter/)).toBeVisible();
+      receipt.set(applied(3));
+      put = page.waitForRequest(isPut(id));
+      await save(page);
+      body = (await put).postDataJSON() as Record<string, unknown>;
+      expect(body.zones).toEqual([DOOR]);
+      expect(body).not.toHaveProperty("parking_policy_v2");
+      expect(body.parking_lot_mode).toBe(true);
+      await expect(status).toContainText("Applied to camera", POLL);
+      const cams = await engine<Array<Record<string, unknown>>>(page, "GET", "/cameras");
+      expect(cams.find((c) => c.id === id)).not.toHaveProperty("parking_policy_v2");
+    });
+
+    test("a policy-only save keeps the zone revision and is Applied only by its parking receipt", async ({
+      page,
+    }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const zonesBefore = await zonesRevision(page, id);
+      const parkingA = await parkingRevision(page, id);
+      const { receipt, status } = await openApplied(page, id);
+
+      await policy(page).dwell.fill("20");
+      await expect(status).toContainText("Unsaved changes");
+      await expect(page.getByText("Applied to camera")).toHaveCount(0);
+
+      // The zone receipt stays applied throughout: it cannot certify the policy.
+      receipt.setParking(applying(2, 1, () => parkingA));
+      const put = page.waitForRequest(isPut(id));
+      await save(page);
+      const body = (await put).postDataJSON() as Record<string, unknown>;
+      expect(body.parking_policy_v2).toEqual(POLICY_B);
+      expect(body.zones).toEqual([DOOR, STALLS]);
+      expect(body.parking_lot_mode).toBe(true);
+      expect(body.url).toBe(URL_WITH_CREDENTIALS);
+      expect(body.onvif).toEqual(ONVIF);
+      await expect(status).toContainText("Saved; applying to camera", POLL);
+      expect(await zonesRevision(page, id)).toBe(zonesBefore);
+      expect(await parkingRevision(page, id)).not.toBe(parkingA);
+      await neverApplied(page, 4_000);
+
+      receipt.setParking(applied(2));
+      await expect(status).toContainText("Applied to camera", POLL);
+      await expect(policy(page).dwell).toHaveValue("20");
+    });
+
+    test("another operator's policy-only save never certifies the stale policy shown", async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const { receipt, status } = await openApplied(page, id);
+      await expect(policy(page).dwell).toHaveValue("10");
+
+      await saveElsewhere(page, id, { parking_policy_v2: POLICY_B });
+      // Hold the editor's reload of the saved settings.
+      let reloads = 0;
+      let release = () => {};
+      const opened = new Promise<void>((resolve) => (release = resolve));
+      await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, async (route) => {
+        reloads += 1;
+        await opened;
+        await route.continue();
+      });
+      // The engine runs B with the zones it always ran: both receipts applied.
+      receipt.set(applied(2));
+      await steadyRead(page);
+      await expect(status).toContainText("Parking settings changed elsewhere", POLL);
+      await expect.poll(() => reloads, POLL).toBe(1);
+      await expect(policy(page).dwell).toHaveValue("10");
+      await neverApplied(page, 4_000);
+
+      release();
+      await expect(policy(page).dwell).toHaveValue("20", POLL);
+      await expect(status).toContainText("Applied to camera", POLL);
+    });
+
+    test("an unsaved policy edit survives another operator's policy save and is never Applied", async ({
+      page,
+    }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const { receipt, status } = await openApplied(page, id);
+
+      await policy(page).dwell.fill("5");
+      await expect(status).toContainText("Unsaved changes");
+      receipt.set(applied(2));
+      await saveElsewhere(page, id, { parking_policy_v2: POLICY_B });
+      await steadyRead(page);
+      await expect(status).toContainText("Unsaved changes; parking settings changed elsewhere", POLL);
+      await expect(policy(page).dwell).toHaveValue("5");
+      await neverApplied(page, 3_000);
+
+      // Saved, the edit is sent as shown.
+      receipt.set(applied(3));
+      const put = page.waitForRequest(isPut(id));
+      await save(page);
+      expect((await put).postDataJSON()).toMatchObject({ parking_policy_v2: { ...POLICY_A, dwell_secs: 5 } });
+      await expect(status).toContainText("Applied to camera", POLL);
+    });
+
+    test("an unrelated edit saved after another operator's policy save keeps their policy", async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const { receipt, status } = await openApplied(page, id);
+
+      await saveElsewhere(page, id, { parking_policy_v2: POLICY_B });
+      await expect(policy(page).dwell).toHaveValue("10");
+      await page.locator("#cam-name").fill("e2e zones renamed");
+      receipt.set(applied(2));
+      const put = page.waitForRequest(isPut(id));
+      await save(page);
+      const body = (await put).postDataJSON() as Record<string, unknown>;
+      expect(body.parking_policy_v2).toEqual(POLICY_B);
+      expect(body.zones).toEqual([DOOR, STALLS]);
+      expect(body.name).toBe("e2e zones renamed");
+      expect(body.onvif).toEqual(ONVIF);
+      await expect(policy(page).dwell).toHaveValue("20");
+      await expect(status).toContainText("Applied to camera", POLL);
+    });
+
+    test("a zone success with a missing, invalid or older parking receipt is never Applied", async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const { receipt, status } = await openApplied(page, cameraId);
+      receipt.set(applied(2));
+      await steadyRead(page);
+      await expect(status).toContainText("Applied to camera", POLL);
+
+      receipt.setParking(() => "missing");
+      await steadyRead(page);
+      await expect(status).toContainText("Cannot confirm: engine did not report parking status", POLL);
+      await expect(page.getByText("Applied to camera")).toHaveCount(0);
+
+      receipt.setParking((r, base) => ({
+        ...(applied(3)(r, base) as Receipt),
+        applied_revision: `sha256:${"0".repeat(64)}`,
+      }));
+      await expect(status).toContainText("Cannot verify: unrecognized parking status from engine", POLL);
+      await expect(page.getByText("Applied to camera")).toHaveCount(0);
+
+      // Older than a parking generation already read.
+      receipt.setParking(applied(1));
+      await expect(status).toContainText("Saved; applying to camera", POLL);
+
+      receipt.setParking(null);
+      await expect(status).toContainText("Applied to camera", POLL);
+    });
+
+    test("a denied policy save keeps the edit unsaved and never Applied", async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const { status } = await openApplied(page, id);
+      await page.route(`**/api/v1/cameras/${id}`, (route) =>
+        route.request().method() === "PUT"
+          ? route.fulfill({ status: 403, json: { error: "e2e: forbidden" } })
+          : route.fallback(),
+      );
+
+      await policy(page).dwell.fill("20");
+      await save(page);
+      await expect(page.getByText("e2e: forbidden")).toBeVisible();
+      await expect(status).toContainText("Unsaved changes", POLL);
+      await expect(policy(page).dwell).toHaveValue("20");
+      await neverApplied(page, 3_000);
+    });
+
+    test("a denied saved-settings read offers no parking editing and no verdict", async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, (route) =>
+        route.fulfill({ status: 403, json: { error: "e2e: forbidden" } }),
+      );
+      await page.goto(`/cameras/${id}`);
+      const status = page.getByTestId("zone-application");
+      await expect(status).toContainText("Cannot verify: no access to the saved zones");
+      // The saved parking zone is shown as one; nothing offers parking editing.
+      await expect(zoneRow(page, "Stalls").getByRole("combobox")).toHaveValue("parking");
+      await expect(optIn(page)).toHaveCount(0);
+      await expect(zoneRow(page, "Door").getByRole("combobox").locator("option")).toHaveText([
+        "inclusion",
+        "exclusion",
+        "dwell",
+      ]);
+    });
+
+    test("an engine without parking keeps today's zone editing: no parking kind, no v2 section", async ({
+      page,
+    }) => {
+      cameraId = await createCamera(page, [DOOR]);
+      const id = cameraId;
+      // An older engine's snapshot: the zones only.
+      await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, async (route) => {
+        const res = await route.fetch();
+        const body = (await res.json()) as { settings: Record<string, unknown>; parking_revision?: string };
+        delete body.settings.parking;
+        delete body.parking_revision;
+        await route.fulfill({ response: res, json: body });
+      });
+      const receipt = await controlReceipt(page, id);
+      receipt.set(applied(1));
+      receipt.setParking(() => "missing");
+      await page.goto(`/cameras/${id}`);
+      const status = page.getByTestId("zone-application");
+      await expect(status).toContainText("Applied to camera");
+      await expect(zoneRow(page, "Door").getByRole("combobox").locator("option")).toHaveText([
+        "inclusion",
+        "exclusion",
+        "dwell",
+      ]);
+      await expect(optIn(page)).toHaveCount(0);
+      await expect(page.getByTestId("parking-problem")).toHaveCount(0);
+
+      // Parking-lot mode stays a plain behaviour field, outside the zone status.
+      await page.getByLabel("Enable parking-lot mode").check();
+      await expect(status).toContainText("Applied to camera");
+      await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
+      await expect(status).toContainText("Unsaved changes");
+      receipt.set(applied(2));
+      const put = page.waitForRequest(isPut(id));
+      await save(page);
+      const body = (await put).postDataJSON() as Record<string, unknown>;
+      expect(body.zones).toEqual([{ ...DOOR, name: "Gate" }]);
+      expect(body).not.toHaveProperty("parking_policy_v2");
+      expect(body.parking_lot_mode).toBe(true);
+      await expect(status).toContainText("Applied to camera", POLL);
+    });
+  });
 });
