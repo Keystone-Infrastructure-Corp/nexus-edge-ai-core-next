@@ -36,6 +36,8 @@ const MINUTE_MS: u64 = 60_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Transition {
     pub at_ms: u64,
+    /// The wall clock read with `at_ms`: a later wall-clock correction moves neither.
+    pub wall_at: DateTime<Utc>,
     pub legacy_open: bool,
     pub shadow_open: bool,
     pub reason: RecordingReason,
@@ -245,11 +247,13 @@ impl RecordingDiagnostics {
         }
     }
 
-    /// The state at `at_ms`. Time since the previous call is credited to
-    /// the previous state; an unchanged state records no transition.
+    /// The state at `at_ms`, read with the wall clock `wall_at`. Time since
+    /// the previous call is credited to the previous state; an unchanged
+    /// state records no transition.
     pub fn transition(
         &mut self,
         at_ms: u64,
+        wall_at: DateTime<Utc>,
         legacy_open: bool,
         shadow_open: bool,
         reason: RecordingReason,
@@ -263,14 +267,18 @@ impl RecordingDiagnostics {
         self.credit(at_ms);
         let next = Transition {
             at_ms,
+            wall_at,
             legacy_open,
             shadow_open,
             reason,
         };
-        if self
-            .state
-            .is_some_and(|s| Transition { at_ms, ..s } == next)
-        {
+        if self.state.is_some_and(|s| {
+            Transition {
+                at_ms,
+                wall_at,
+                ..s
+            } == next
+        }) {
             return;
         }
         self.legacy_files.edge(legacy_open, at_ms, self.pre_roll_ms);
@@ -420,8 +428,8 @@ pub struct TransitionTrace {
     pub collector_error: Option<String>,
 }
 
-/// The policy clock and the wall clock read together: a transition at
-/// `at_ms` was captured at `wall_at - (policy_ms - at_ms)`.
+/// The policy clock and the wall clock read together at export, where the
+/// last state ends. Each transition carries its own capture-time wall clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct TraceClock {
     pub policy_ms: u64,
@@ -872,7 +880,7 @@ impl ShadowRecording {
         if let Some((outcome, counts, summary)) = self.pass.take() {
             d.observe(outcome, counts, &summary);
         }
-        d.transition(at, writer_clip.is_some(), intent.open, reason);
+        d.transition(at, captured_at, writer_clip.is_some(), intent.open, reason);
         self.last = Some((at, captured_at, reason));
 
         if self.episode.as_ref().map(|e| e.clip_id) != writer_clip {
@@ -908,7 +916,7 @@ impl ShadowRecording {
         let mut shared = self.shared.lock();
         shared.active_clip = None;
         let d = &mut shared.diagnostics;
-        d.transition(at, false, reason != RecordingReason::Quiet, reason);
+        d.transition(at, wall, false, reason != RecordingReason::Quiet, reason);
         let elapsed = d.elapsed().legacy_open;
         let minute = d.take_minute(at);
         writes.episode = self.episode.take().map(|e| {
@@ -988,13 +996,22 @@ mod tests {
     use super::*;
     use RecordingReason::{Activity, DegradedCoverage, PostRoll, Quiet};
 
+    /// A wall clock for tests that do not read it.
+    const W: DateTime<Utc> = DateTime::UNIX_EPOCH;
+
     #[test]
     fn more_than_the_ring_keeps_exact_totals_and_reports_the_gap() {
         let mut d = RecordingDiagnostics::new(0);
         // 300 one-second states alternating shadow open and closed, legacy closed.
         for k in 0..300u64 {
             let open = k % 2 == 0;
-            d.transition(k * 1_000, false, open, if open { Activity } else { Quiet });
+            d.transition(
+                k * 1_000,
+                W,
+                false,
+                open,
+                if open { Activity } else { Quiet },
+            );
         }
         assert_eq!(d.transitions().count(), TRANSITION_RING, "bounded");
         assert_eq!(d.transitions().next().map(|t| t.at_ms), Some(44_000));
@@ -1011,7 +1028,7 @@ mod tests {
     fn a_full_ring_alone_is_not_a_gap() {
         let mut d = RecordingDiagnostics::new(0);
         for k in 0..TRANSITION_RING as u64 {
-            d.transition(k, k % 2 == 0, false, Quiet);
+            d.transition(k, W, k % 2 == 0, false, Quiet);
         }
         assert!(!d.snapshot(1_000).trace_incomplete);
     }
@@ -1028,10 +1045,10 @@ mod tests {
 
         // Legacy open [0,10) and shadow open [5,15): either is 15 s.
         let mut d = RecordingDiagnostics::new(0);
-        d.transition(0, true, false, Quiet);
-        d.transition(5_000, true, true, Activity);
-        d.transition(10_000, false, true, PostRoll);
-        d.transition(15_000, false, false, Quiet);
+        d.transition(0, W, true, false, Quiet);
+        d.transition(5_000, W, true, true, Activity);
+        d.transition(10_000, W, false, true, PostRoll);
+        d.transition(15_000, W, false, false, Quiet);
         let e = d.snapshot(20_000).elapsed;
         let either = e.legacy_open.activity
             + e.legacy_open.quiet
@@ -1045,26 +1062,26 @@ mod tests {
     fn pre_roll_windows_that_overlap_are_counted_once() {
         // 5 s pre-roll: shadow files [0,9) and [5,15) from opens at 5 and 10.
         let mut d = RecordingDiagnostics::new(5_000);
-        d.transition(5_000, false, true, Activity);
-        d.transition(9_000, false, false, Quiet);
-        d.transition(10_000, false, true, Activity);
-        d.transition(15_000, false, false, Quiet);
+        d.transition(5_000, W, false, true, Activity);
+        d.transition(9_000, W, false, false, Quiet);
+        d.transition(10_000, W, false, true, Activity);
+        d.transition(15_000, W, false, false, Quiet);
         let s = d.snapshot(30_000);
         assert_eq!(s.shadow_recorded_ms, 15_000);
         assert_eq!(s.elapsed.legacy_closed.activity, 9_000);
         // The open one counts to now, and pre-roll before the first frame counts.
-        d.transition(40_000, true, false, Quiet);
+        d.transition(40_000, W, true, false, Quiet);
         assert_eq!(d.snapshot(42_000).legacy_recorded_ms, 7_000);
         let mut d = RecordingDiagnostics::new(5_000);
-        d.transition(0, true, false, Quiet);
+        d.transition(0, W, true, false, Quiet);
         assert_eq!(d.snapshot(1_000).legacy_recorded_ms, 6_000);
     }
 
     #[test]
     fn a_clock_step_back_is_a_gap_and_never_double_counts() {
         let mut d = RecordingDiagnostics::new(0);
-        d.transition(10_000, true, true, Activity);
-        d.transition(4_000, true, false, Quiet);
+        d.transition(10_000, W, true, true, Activity);
+        d.transition(4_000, W, true, false, Quiet);
         let s = d.snapshot(12_000);
         assert!(s.trace_incomplete);
         assert_eq!(s.elapsed.legacy_open.activity, 0);
@@ -1074,7 +1091,7 @@ mod tests {
     #[test]
     fn a_collector_failure_is_reported() {
         let mut d = RecordingDiagnostics::new(0);
-        d.transition(0, false, true, DegradedCoverage);
+        d.transition(0, W, false, true, DegradedCoverage);
         d.collector_failed("minute summary not saved: disk full".into());
         let s = d.snapshot(1_000);
         assert!(s.trace_incomplete);
@@ -1088,13 +1105,13 @@ mod tests {
     #[test]
     fn minutes_split_the_elapsed_time_exactly() {
         let mut d = RecordingDiagnostics::new(0);
-        d.transition(0, true, true, Activity);
-        d.transition(50_000, true, false, Quiet);
+        d.transition(0, W, true, true, Activity);
+        d.transition(50_000, W, true, false, Quiet);
         let first = d.take_minute(60_000);
         assert_eq!(first.elapsed.legacy_open.activity, 50_000);
         assert_eq!(first.elapsed.legacy_open.quiet, 10_000);
         assert_eq!(first.transitions, 2);
-        d.transition(70_000, false, false, Quiet);
+        d.transition(70_000, W, false, false, Quiet);
         let second = d.take_minute(120_000);
         assert_eq!(second.elapsed.legacy_open.quiet, 10_000);
         assert_eq!(second.elapsed.legacy_closed.quiet, 50_000);
@@ -1133,8 +1150,8 @@ mod tests {
         let intervals = [(1_000, 4_000), (10_000, 12_000), (30_000, 33_000)];
         for (open, close) in intervals {
             let d = &mut shared.lock().diagnostics;
-            d.transition(open, false, true, Activity);
-            d.transition(close, false, false, Quiet);
+            d.transition(open, W, false, true, Activity);
+            d.transition(close, W, false, false, Quiet);
         }
         let trace = registry.trace(3, at(40_000), wall).unwrap();
         assert_eq!(
@@ -1154,12 +1171,14 @@ mod tests {
                 [
                     Transition {
                         at_ms: open,
+                        wall_at: W,
                         legacy_open: false,
                         shadow_open: true,
                         reason: Activity,
                     },
                     Transition {
                         at_ms: close,
+                        wall_at: W,
                         legacy_open: false,
                         shadow_open: false,
                         reason: Quiet,
@@ -1174,10 +1193,10 @@ mod tests {
         {
             let d = &mut shared.lock().diagnostics;
             for k in 0..300u64 {
-                d.transition(40_000 + k, k % 2 == 0, false, Quiet);
+                d.transition(40_000 + k, W, k % 2 == 0, false, Quiet);
             }
             // A changed state whose clock stepped back is held and counted.
-            d.transition(1_000, true, false, Quiet);
+            d.transition(1_000, W, true, false, Quiet);
             d.collector_failed("minute summary not saved".into());
         }
         let trace = registry.trace(3, at(41_000), wall).unwrap();
@@ -1191,6 +1210,59 @@ mod tests {
             trace.collector_error.as_deref(),
             Some("minute summary not saved")
         );
+    }
+
+    /// Codex review 4: each exported transition carries the wall clock read
+    /// with it, so a +60 s wall-clock correction after some of them (here
+    /// from 5 s) moves none: every one still reads its capture time.
+    #[test]
+    fn a_wall_clock_correction_moves_no_exported_transition() {
+        let registry = RecordingActivityRegistry::default();
+        let policy = RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 10_000,
+        };
+        let mut s =
+            ShadowRecording::start(&registry, 3, 9, Some(policy), "rev-9", "iou-naive", 1, 0)
+                .unwrap();
+        let (t0, w0) = (Instant::now(), Utc::now());
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        let wall = |ms: u64| {
+            let corrected = if ms >= 5_000 { 60 } else { 0 };
+            w0 + chrono::Duration::milliseconds(ms as i64) + chrono::Duration::seconds(corrected)
+        };
+        // Recovered at 2 s, quiet at 3 s, someone at 6 s, quiet at 7 s.
+        for ms in (0..=8_000).step_by(1_000) {
+            let counts = EvidenceCounts {
+                observed: u32::from(ms == 6_000),
+                ..EvidenceCounts::default()
+            };
+            s.frame(
+                at(ms),
+                wall(ms),
+                AnalysisOutcome::Success,
+                counts,
+                false,
+                None,
+            );
+        }
+        let trace = registry.trace(3, at(9_000), wall(9_000)).unwrap();
+        let json = serde_json::to_value(&trace).unwrap();
+        let placed: Vec<(u64, DateTime<Utc>)> = json["transitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                let wall_at = serde_json::from_value(t["wall_at"].clone()).unwrap();
+                (t["at_ms"].as_u64().unwrap(), wall_at)
+            })
+            .collect();
+        let captured: Vec<_> = [0, 2_000, 3_000, 6_000, 7_000]
+            .into_iter()
+            .map(|ms| (ms, wall(ms)))
+            .collect();
+        assert_eq!(placed, captured, "{json}");
+        assert!(!trace.trace_incomplete);
     }
 
     #[test]
@@ -1454,7 +1526,7 @@ mod tests {
         d.observe(AnalysisOutcome::Success, counts, &summary);
         summary.reduce(1, 2, seen(2_000, AnalysisOutcome::Failed));
         d.observe(AnalysisOutcome::Failed, EvidenceCounts::default(), &summary);
-        d.transition(2_000, false, true, DegradedCoverage);
+        d.transition(2_000, W, false, true, DegradedCoverage);
         let s = d.snapshot(5_000);
         assert_eq!(s.last_success_age_ms, Some(4_000));
         assert_eq!(s.last_qualifying_age_ms, Some(4_000));

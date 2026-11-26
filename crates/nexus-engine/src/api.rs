@@ -9047,10 +9047,10 @@ mod tests {
     }
 
     /// SPEC-089 — the explicit diagnostics bundle carries a shadow camera's
-    /// retained transitions on the policy clock, with the wall clock read
-    /// beside it, so each shadow interval inside one minute can be placed
-    /// on capture time against labeled events; and it says when the ring
-    /// dropped some.
+    /// retained transitions on the policy clock, each with the wall clock
+    /// read at its capture, so each shadow interval inside one minute can be
+    /// placed on capture time against labeled events; and it says when the
+    /// ring dropped some.
     #[tokio::test]
     async fn diagnostics_bundle_exports_each_shadow_interval_of_the_trace() {
         use nexus_pipeline::recording_activity::AnalysisOutcome;
@@ -9169,9 +9169,11 @@ mod tests {
                 &json!(0)
             )
         );
+        // Each transition carries the wall clock of its frame's capture.
         let t = |at_ms: u64, shadow_open: bool, reason: &str| {
             json!({
                 "at_ms": at_ms,
+                "wall_at": w0 + chrono::Duration::milliseconds(at_ms as i64),
                 "legacy_open": false,
                 "shadow_open": shadow_open,
                 "reason": reason,
@@ -9197,7 +9199,7 @@ mod tests {
             ]),
             "{got}"
         );
-        // The clock pair places each transition on the frame's capture time.
+        // With no wall-clock correction, the export's clock pair agrees.
         let policy_ms = got["clock"]["policy_ms"].as_u64().unwrap();
         let wall_at: chrono::DateTime<chrono::Utc> =
             serde_json::from_value(got["clock"]["wall_at"].clone()).unwrap();
