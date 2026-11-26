@@ -790,7 +790,7 @@ mod controller {
 
     /// Stub-backed clips whose opens and closes each wait for a permit the
     /// test hands out, logging every step. A clip has `preroll_ms` of media
-    /// when it opens and gains media in real time unless the source is lost.
+    /// when it opens and gains media in real time until the source is lost.
     struct Fake {
         stub: StubClipRecorder,
         calls: Mutex<Vec<String>>,
@@ -798,7 +798,8 @@ mod controller {
         closes: Semaphore,
         panic: AtomicBool,
         preroll_ms: u64,
-        source_lost: AtomicBool,
+        /// When the source was lost: media stops growing there.
+        source_lost: Mutex<Option<tokio::time::Instant>>,
         opened: Mutex<HashMap<i64, tokio::time::Instant>>,
         epoch_ended: Mutex<Vec<i64>>,
     }
@@ -847,12 +848,11 @@ mod controller {
 
         fn inflight_media_ms(&self, handle: ClipHandle) -> Option<u64> {
             let opened = *self.opened.lock().get(&handle.clip_id)?;
-            let live = if self.source_lost.load(Ordering::SeqCst) {
-                0
-            } else {
-                opened.elapsed().as_millis() as u64
-            };
-            Some(self.preroll_ms + live)
+            let until = self
+                .source_lost
+                .lock()
+                .unwrap_or_else(tokio::time::Instant::now);
+            Some(self.preroll_ms + until.saturating_duration_since(opened).as_millis() as u64)
         }
 
         fn ended_on_epoch_change(&self, handle: ClipHandle) -> bool {
@@ -947,7 +947,7 @@ mod controller {
             closes: Semaphore::new(if gate_closes { 0 } else { FREE }),
             panic: AtomicBool::new(false),
             preroll_ms,
-            source_lost: AtomicBool::new(false),
+            source_lost: Mutex::new(None),
             opened: Mutex::new(HashMap::new()),
             epoch_ended: Mutex::new(Vec::new()),
         });
@@ -1709,9 +1709,34 @@ mod controller {
         let mut c = cam(observed(0), 1_000, false, false).await;
         c.healthy().await;
         c.until(3, "closed 1 ").await;
-        c.rec.source_lost.store(true, Ordering::SeqCst);
+        *c.rec.source_lost.lock() = Some(tokio::time::Instant::now());
         assert!(c.now(AnalysisOutcome::Success, 1).await.clip.is_some());
         c.analysing_until(5, "closed 2 media=1").await;
+    }
+
+    /// Media that grew during the hold and then stopped is a lost source
+    /// three seconds after it last grew, not at the five-minute rotation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_source_lost_after_media_grew_closes_three_seconds_later() {
+        let mut c = cam(observed(0), 100, false, false).await;
+        c.healthy().await;
+        c.until(3, "closed 1 ").await;
+        assert!(c.now(AnalysisOutcome::Success, 1).await.clip.is_some());
+        // Held for the minimum while its media grows by about two seconds.
+        for _ in 0..9 {
+            c.now(AnalysisOutcome::Success, 0).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let lost = tokio::time::Instant::now();
+        *c.rec.source_lost.lock() = Some(lost);
+        c.analysing_until(6, "closed 2 ").await;
+        let after = lost.elapsed();
+        assert!(
+            (Duration::from_millis(2_900)..Duration::from_millis(4_500)).contains(&after),
+            "closed {after:?} after the media stopped"
+        );
+        let closed = c.rec.calls().pop().unwrap();
+        assert!(*closed < *"closed 2 media=3", "partial media: {closed}");
     }
 
     /// Rollback from observed to legacy goes through the same controller:

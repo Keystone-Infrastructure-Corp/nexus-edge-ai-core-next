@@ -425,8 +425,8 @@ enum Wake {
     Deadline,
 }
 
-/// Holding a short clip for the minimum duration: its media and the time
-/// when the hold began, and when it could next have enough.
+/// Holding a short clip for the minimum duration: its most media and when
+/// that was first seen, and when to look again.
 #[derive(Clone, Copy)]
 struct Hold {
     media_ms: u64,
@@ -816,10 +816,14 @@ impl Controller {
                 since: now,
                 recheck: now,
             });
+            if media_ms > hold.media_ms {
+                hold.media_ms = media_ms;
+                hold.since = now;
+            }
             // Media that stopped growing for a whole minimum duration is a lost source.
-            let lost = media_ms <= hold.media_ms && now >= hold.since + min_clip();
-            if !lost {
-                hold.recheck = now + Duration::from_millis(short_by);
+            let lost_at = hold.since + min_clip();
+            if now < lost_at {
+                hold.recheck = (now + Duration::from_millis(short_by)).min(lost_at);
                 return None;
             }
             warn!(
