@@ -75,6 +75,10 @@ const DEFAULT_STALE_AFTER_MS: u64 = 10_000;
 /// moves file safety or legacy's decisions (R-6).
 const RECORDER_STALL: Duration = Duration::from_millis(DEFAULT_STALE_AFTER_MS);
 
+/// Alert events kept for a clip whose open failed; past this the oldest
+/// are dropped, reported, and stay unlinked.
+const PENDING_LINKS_MAX: usize = 256;
+
 /// First open retry delay; doubles per failure up to [`OPEN_RETRY_MAX`].
 const OPEN_RETRY_FIRST: Duration = Duration::from_millis(500);
 const OPEN_RETRY_MAX: Duration = Duration::from_secs(30);
@@ -355,6 +359,7 @@ pub fn spawn(
         frames_since_size_stat: 0,
         hold: None,
         last_open_error: None,
+        pending_links: Vec::new(),
         pending_open: false,
         open_retry_at: None,
         open_retry_delay: OPEN_RETRY_FIRST,
@@ -420,6 +425,9 @@ struct Controller {
     frame_dims: (u32, u32),
     hold: Option<Hold>,
     last_open_error: Option<RecordingError>,
+    /// Alert events that arrived while a clip failed to open: the open
+    /// that succeeds links them (R-5).
+    pending_links: Vec<String>,
 
     // Legacy's decision state, as the supervisor's loop kept it.
     post_roll: PostRoll,
@@ -734,7 +742,10 @@ impl Controller {
         (close_now, error)
     }
 
+    /// The demand for a clip ended: forget its failed opens and the alert
+    /// events waiting for one.
     fn reset_retry(&mut self) {
+        self.pending_links.clear();
         self.open_retry_at = None;
         self.open_retry_delay = OPEN_RETRY_FIRST;
         self.open_panic_refused = false;
@@ -831,23 +842,24 @@ impl Controller {
         }
         // Linked only to a clip that opened; a refusal is on the receipt.
         match self.clip {
-            Some(handle) => {
-                for event_id in &alert.event_ids {
-                    if let Err(e) = self
-                        .store
-                        .link_event_to_clip(event_id, handle.clip_id)
-                        .await
-                    {
+            Some(handle) => self.link(handle, &alert.event_ids).await,
+            None => {
+                error = error.or_else(|| self.last_open_error.clone());
+                // An open is due again: the clip it opens links these.
+                if self.pending_open {
+                    self.pending_links.extend(alert.event_ids);
+                    let excess = self.pending_links.len().saturating_sub(PENDING_LINKS_MAX);
+                    if excess > 0 {
                         warn!(
                             target: LOG_TARGET,
-                            event = %event_id,
-                            clip_id = handle.clip_id,
-                            "link_event_to_clip failed: {e}"
+                            camera_id = self.cfg.camera_id,
+                            dropped = excess,
+                            "too many alert events wait for a clip to open; the oldest stay unlinked"
                         );
+                        self.pending_links.drain(..excess);
                     }
                 }
             }
-            None => error = error.or_else(|| self.last_open_error.clone()),
         }
         self.flush_deferred_close().await;
         if self.observed {
@@ -883,6 +895,7 @@ impl Controller {
             // Rollback: legacy takes the open clip over, its post-roll from now.
             self.post_roll = PostRoll::new(self.cfg.post_roll_secs);
             self.pending_open = false;
+            self.pending_links.clear();
             self.hold = None;
         }
         if self.observed {
@@ -1013,6 +1026,8 @@ impl Controller {
             .await?;
         let error = match opened {
             Ok(handle) => {
+                let waiting = std::mem::take(&mut self.pending_links);
+                self.link(handle, &waiting).await;
                 self.clip = Some(handle);
                 self.clip_opened_at = Some(now);
                 self.hold = None;
@@ -1127,6 +1142,28 @@ impl Controller {
                     after_secs = RECORDER_SLOW.as_secs(),
                     "recorder {what} has not finished; the recording controller keeps the clip \
                      and starts no other writer until it does"
+                );
+            }
+        }
+    }
+
+    /// Link alert events to `handle`. An event already linked keeps its
+    /// clip: a repeated alert after a rotation must not move it (R-5).
+    async fn link(&self, handle: ClipHandle, event_ids: &[String]) {
+        for event_id in event_ids {
+            if let Ok(Some(_)) = self.store.get_event_clip_id(event_id).await {
+                continue;
+            }
+            if let Err(e) = self
+                .store
+                .link_event_to_clip(event_id, handle.clip_id)
+                .await
+            {
+                warn!(
+                    target: LOG_TARGET,
+                    event = %event_id,
+                    clip_id = handle.clip_id,
+                    "link_event_to_clip failed: {e}"
                 );
             }
         }

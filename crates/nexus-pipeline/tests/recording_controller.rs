@@ -1408,6 +1408,49 @@ mod controller {
         assert_eq!(c.linked(&event).await, Some(1));
     }
 
+    /// R-5: an alert whose clip failed to open keeps its event, and the
+    /// retry that opens the clip links it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_alert_during_a_failed_open_links_on_the_retry() {
+        let mut c = cam(config(None), 0, false, false).await;
+        let event = c.event(0).await;
+        c.rec.set_panic(true);
+        let alerted = Motion {
+            alerts: 1,
+            ..live(true)
+        };
+        assert!(c.frame(0, alerted).await.clip.is_none());
+        let refused = c.alert(0, &event).await;
+        assert!(refused.clip.is_none());
+        assert_eq!(refused.error, Some(RecordingError::Refused));
+        c.rec.set_panic(false);
+        let retried = c.frame(500, live(false)).await;
+        assert_eq!(retried.clip.map(|h| h.clip_id), Some(1));
+        assert_eq!(c.linked(&event).await, Some(1), "linked on the retry");
+    }
+
+    /// R-5: an alert repeated after its clip rotated keeps its first link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_duplicate_alert_after_rotation_keeps_its_first_link() {
+        let mut c = cam(config(None), 0, false, false).await;
+        let event = c.event(0).await;
+        let alerted = Motion {
+            alerts: 1,
+            ..live(true)
+        };
+        assert_eq!(c.frame(0, alerted).await.clip.map(|h| h.clip_id), Some(1));
+        assert_eq!(c.alert(0, &event).await.clip.map(|h| h.clip_id), Some(1));
+        // Rotated with enough media to keep clip 1 (a discarded one unlinks).
+        c.rec.epoch_ended.lock().push(1);
+        assert_eq!(
+            c.frame(4_000, live(false)).await.clip.map(|h| h.clip_id),
+            Some(2),
+            "rotated"
+        );
+        assert_eq!(c.alert(0, &event).await.clip.map(|h| h.clip_id), Some(2));
+        assert_eq!(c.linked(&event).await, Some(1), "the first link stays");
+    }
+
     /// A resize of the analysis frame and a stream epoch change each rotate
     /// the file: the next clip opens at the new size, and the alert linked
     /// to the first clip keeps its link.
