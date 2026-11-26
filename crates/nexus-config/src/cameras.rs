@@ -495,6 +495,8 @@ impl CameraConfig {
     /// SPEC-077: a `parking_policy_v2` needs `parking_lot_mode` and a parking
     /// zone, each of its values must be finite and above zero, and a parking
     /// zone needs the policy, so a save never silently falls back to legacy.
+    /// A parking zone filters nothing, so a minimum-area override on it is
+    /// refused rather than silently ignored.
     pub fn validate_finite(&self) -> Result<(), String> {
         let parking_zone = self.zones.iter().any(|z| z.kind == ZoneKind::Parking);
         match &self.behavior.parking_policy_v2 {
@@ -561,6 +563,13 @@ impl CameraConfig {
                     "zone '{}' needs at least 3 polygon vertices, got {}",
                     zone.id,
                     zone.polygon.len()
+                ));
+            }
+            if zone.kind == ZoneKind::Parking && zone.min_bbox_area_px_override.is_some() {
+                return Err(format!(
+                    "zone '{}' is a parking zone, which filters no detection, so its \
+                     min_bbox_area_px_override would be ignored: remove it",
+                    zone.id
                 ));
             }
         }
@@ -941,5 +950,36 @@ mod tests {
             Ok(()),
             "parking-lot mode with no parking zone and no v2 is the legacy camera"
         );
+    }
+
+    /// SPEC-077 — a parking zone filters no detection, so a per-zone minimum
+    /// area on it would be silently ignored: it is refused instead. Every
+    /// other zone kind keeps its override.
+    #[test]
+    fn a_parking_zone_refuses_a_min_bbox_area_override() {
+        let mut camera = parking_camera(Some(parking_policy()));
+        camera.zones[0].min_bbox_area_px_override = Some(40);
+        let why = camera
+            .validate_finite()
+            .expect_err("a parking zone with a minimum-area override");
+        assert!(
+            why.contains("stalls") && why.contains("min_bbox_area_px_override"),
+            "{why}"
+        );
+
+        for kind in [ZoneKind::Inclusion, ZoneKind::Exclusion, ZoneKind::Dwell] {
+            let mut camera = parking_camera(Some(parking_policy()));
+            camera.zones.push(ZoneConfig {
+                id: "other".into(),
+                kind,
+                min_bbox_area_px_override: Some(40),
+                ..parking_zone()
+            });
+            assert_eq!(
+                camera.validate_finite(),
+                Ok(()),
+                "{kind:?} keeps its override"
+            );
+        }
     }
 }
