@@ -1022,7 +1022,72 @@ test.describe("zone application", () => {
     await expect(zoneRow(page, "Mine")).toBeVisible();
   });
 
-  test("a save whose re-read of the saved zones fails is refused, with nothing sent", async ({ page }) => {
+  const isCameraList = (r: Request) =>
+    r.method() === "GET" && new URL(r.url()).pathname === "/api/v1/cameras";
+
+  test("a role that cannot read the saved-zone snapshot saves another operator's zones from the camera list", async ({
+    page,
+  }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, (route) =>
+      route.fulfill({ status: 403, json: { error: "e2e: forbidden" } }),
+    );
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Cannot verify: no access to the saved zones");
+    await expect(zoneRow(page, "Door")).toBeVisible();
+
+    await saveZonesElsewhere(page, id, [DOCK]);
+    await page.locator("#cam-name").fill("e2e zones renamed");
+    const listed = page.waitForRequest(isCameraList);
+    const put = page.waitForRequest(isPut(id));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    await listed;
+    const body = (await put).postDataJSON() as Record<string, unknown>;
+
+    expect(body.zones).toEqual([DOCK]);
+    expect(body.name).toBe("e2e zones renamed");
+    await expect(zoneRow(page, "Loading dock")).toBeVisible();
+    await expect(zoneRow(page, "Door")).toHaveCount(0);
+    // The snapshot is routed away: the camera list says what is saved.
+    const cams = await engine<Array<{ id: number; zones: Zone[] }>>(page, "GET", "/cameras");
+    expect(cams.find((c) => c.id === id)?.zones).toEqual([DOCK]);
+  });
+
+  test("a drawing in progress keeps the zones it was drawn over in an unrelated save", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    await page.getByRole("button", { name: "New zone" }).click();
+    await clickCanvas(page, 0.6, 0.6);
+    const finish = page.getByRole("button", { name: "Finish (1 pt)" });
+    await expect(finish).toBeVisible();
+    receipt.set(applied(2));
+    await saveZonesElsewhere(page, id, [DOCK]);
+    await steadyRead(page);
+    await expect(status).toContainText("Unsaved changes; zones changed elsewhere", POLL);
+    await expect(zoneRow(page, "Door")).toBeVisible();
+
+    await page.locator("#cam-name").fill("e2e zones renamed");
+    receipt.set(applied(3));
+    const put = page.waitForRequest(isPut(id));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    expect(((await put).postDataJSON() as { zones: Zone[] }).zones).toEqual([DOOR]);
+    await expect(finish).toBeVisible();
+
+    // Ended empty, the drawing leaves the zones the save sent, applied.
+    await finish.locator("..").getByRole("button", { name: "Cancel" }).click();
+    await expect(status).toContainText("Applied to camera", POLL);
+    await expect(zoneRow(page, "Door")).toBeVisible();
+  });
+
+  test("a save whose re-reads of the saved zones both fail is refused, with nothing sent", async ({ page }) => {
     cameraId = await createCamera(page, [DOOR]);
     const id = cameraId;
     const receipt = await controlReceipt(page, id);
@@ -1034,14 +1099,21 @@ test.describe("zone application", () => {
     await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, (route) =>
       route.fulfill({ status: 500, json: { error: "e2e: snapshot unavailable" } }),
     );
+    await page.route("**/api/v1/cameras", (route) =>
+      isCameraList(route.request())
+        ? route.fulfill({ status: 500, json: { error: "e2e: cameras unavailable" } })
+        : route.fallback(),
+    );
     let puts = 0;
     page.on("request", (r) => {
       if (isPut(id)(r)) puts += 1;
     });
     await page.locator("#cam-name").fill("e2e zones renamed");
     const reread = page.waitForResponse((r) => isSnapshot(id)(r.request()));
+    const listed = page.waitForResponse((r) => isCameraList(r.request()));
     await page.getByRole("button", { name: /^save$/i }).click();
     await reread;
+    await listed;
 
     await expect(page.getByText(/^Not saved: this camera's saved zones could not be re-read/)).toBeVisible();
     await page.waitForTimeout(1_000);

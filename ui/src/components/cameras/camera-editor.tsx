@@ -25,6 +25,7 @@ import {
 import {
   getCameraStats,
   getStaticObjectDefaults,
+  listCameras,
   type CameraFrameStats,
 } from "@/api/system";
 import type {
@@ -213,6 +214,25 @@ type ZoneView = {
   awaiting: boolean;
   generation: number;
 };
+
+type SavedZones = { zones: ZoneConfig[] | undefined; revision: string | null };
+
+/**
+ * The camera's saved zones, read again just before a save: from the config
+ * snapshot, with their revision, or, when that read fails (a role that may
+ * save but not read it, say), from the camera list the draft came from,
+ * with no revision. Throws only when both reads fail.
+ */
+async function rereadSavedZones(cameraId: number): Promise<SavedZones> {
+  try {
+    const snap = parseConfigSnapshot(await getCameraConfigSnapshot(cameraId));
+    return { zones: snap.settings.zones, revision: snap.zones_revision };
+  } catch {
+    const listed = (await listCameras()).find((c) => c.id === cameraId);
+    if (!listed) throw new Error(`camera ${cameraId} is not listed`);
+    return { zones: listed.zones, revision: null };
+  }
+}
 
 /** A zone view with nothing read, showing `zones`. */
 const unreadZoneView = (zones: ZoneConfig[] | undefined): ZoneView => ({
@@ -615,14 +635,15 @@ export function CameraEditor({
     }
     // The save replaces the camera's zones whole. Unedited zones go out as
     // saved now, not as last read here, so an unrelated edit never reverts
-    // another operator's newer zones. Edited zones are sent as edited: the
-    // status says when they were changed elsewhere.
+    // another operator's newer zones. Edited zones, a drawing in progress
+    // included (it freezes the zones it was drawn over), are sent as shown:
+    // the status says when they were changed elsewhere.
     let cfg = draft;
-    if (!isNew && draft.zones === zoneView.synced) {
+    if (!isNew && !sketching && draft.zones === zoneView.synced) {
       setChecking(true);
-      let snap: CameraConfigSnapshot;
+      let saved: SavedZones;
       try {
-        snap = parseConfigSnapshot(await getCameraConfigSnapshot(camera.id));
+        saved = await rereadSavedZones(camera.id);
       } catch (err) {
         setError(
           `Not saved: this camera's saved zones could not be re-read, so saving could undo ` +
@@ -632,10 +653,14 @@ export function CameraEditor({
       } finally {
         setChecking(false);
       }
-      if (snap.zones_revision !== zoneView.base) {
-        const zones = snap.settings.zones;
+      const { zones, revision } = saved;
+      const changed =
+        revision !== null
+          ? revision !== zoneView.base
+          : JSON.stringify(zones) !== JSON.stringify(draft.zones);
+      if (changed) {
         cfg = { ...draft, zones };
-        setZoneView((v) => ({ ...v, synced: zones, base: snap.zones_revision }));
+        setZoneView((v) => ({ ...v, synced: zones, base: revision }));
         setDraft((d) => (d.zones === draft.zones ? { ...d, zones } : d));
       }
     }
