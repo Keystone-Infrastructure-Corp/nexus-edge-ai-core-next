@@ -111,6 +111,10 @@ struct DeliveryClock {
     first: Option<(DateTime<Utc>, Instant)>,
     /// At the previous one.
     last: Option<(DateTime<Utc>, Instant)>,
+    /// The latest accounting restart detected in this process, re-applied
+    /// by every check: the transaction that first wrote it may roll back
+    /// (a no-op once it committed).
+    restart: Option<DateTime<Utc>>,
     /// Test seam: the wall clock read instead of `Utc::now()`.
     #[cfg(test)]
     test_wall: Option<DateTime<Utc>>,
@@ -140,6 +144,13 @@ impl DeliveryState {
         // the jump until the engine restarts (extra rows, never lost ones);
         // re-anchor once a jump is confirmed if that row growth matters.
         (wall, jumped, wall.min(advanced(first)))
+    }
+
+    /// Keep `detected` pending with any earlier restart; the latest one.
+    fn pending_restart(&self, detected: Option<DateTime<Utc>>) -> Option<DateTime<Utc>> {
+        let mut c = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+        c.restart = c.restart.max(detected);
+        c.restart
     }
 }
 
@@ -480,7 +491,9 @@ impl Store {
     /// read or write, or it is behind a bucket already written. Either
     /// moves `accounting_since` (persisted, never backward) past the
     /// detection time and every written bucket, so no window overlapping
-    /// the discontinuity reads complete. Returns the prune horizon.
+    /// the discontinuity reads complete. Every later check re-applies the
+    /// restart, so a write that detects it and rolls back cannot consume
+    /// it. Returns the prune horizon.
     async fn check_clock(&self, conn: &mut SqliteConnection) -> Result<DateTime<Utc>, StoreError> {
         let (wall, jumped, horizon) = self.delivery.observe_clock();
         let newest: Option<i64> =
@@ -488,11 +501,13 @@ impl Store {
                 .fetch_one(&mut *conn)
                 .await?;
         let behind = newest.is_some_and(|m| wall.timestamp() + CLOCK_TOLERANCE_SECS < m);
-        if jumped || behind {
+        let detected = (jumped || behind).then(|| {
             let past_buckets = newest
                 .and_then(|m| DateTime::from_timestamp(m + 60, 0))
                 .unwrap_or(wall);
-            let restart = wall.max(past_buckets);
+            wall.max(past_buckets)
+        });
+        if let Some(restart) = self.delivery.pending_restart(detected) {
             // Same text shape as the migration's, so the comparison is by time.
             let moved = sqlx::query(
                 "UPDATE recording_delivery_baseline SET accounting_since = ?1
@@ -987,5 +1002,63 @@ mod tests {
         assert_eq!(snap.accounting_since, since);
         assert!(snap.windows.iter().all(|w| w.complete));
         assert_eq!(snap.windows[0].core.ordinary.generated_bytes, 3_000);
+    }
+
+    /// A forward jump detected by a write whose transaction then rolls
+    /// back (failed or cancelled), with the clock left jumped. Returns the
+    /// jumped wall time and the queued clip.
+    async fn jump_in_rolled_back_write(store: &Store, t0: DateTime<Utc>) -> (DateTime<Utc>, i64) {
+        set_wall(store, t0);
+        let clip = closed(store, t0 - Duration::minutes(30), 1_000).await;
+        let jumped = t0 + Duration::days(10);
+        set_wall(store, jumped);
+        let mut tx = store.pool.begin().await.unwrap();
+        let none = DeliveryCounters::default();
+        add_to_bucket(store, &mut tx, 1, RecordingSource::Ordinary, jumped, &none)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        (jumped, clip)
+    }
+
+    /// The rolled-back write does not consume the detection: the next
+    /// read still moves `accounting_since`, so no window reads complete
+    /// against the old baseline.
+    #[tokio::test]
+    async fn recording_delivery_clock_jump_survives_a_rolled_back_write_on_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let store = store_since(dir.path(), t0).await;
+        let (jumped, _) = jump_in_rolled_back_write(&store, t0).await;
+        let snap = store
+            .recording_delivery_stats(|| jumped + Duration::minutes(2), None)
+            .await
+            .unwrap();
+        // Persisted at millisecond precision.
+        assert_eq!(
+            snap.accounting_since.timestamp_millis(),
+            jumped.timestamp_millis()
+        );
+        assert!(snap.windows.iter().all(|w| !w.complete));
+    }
+
+    /// ...and so does the next committed write, before any read.
+    #[tokio::test]
+    async fn recording_delivery_clock_jump_survives_a_rolled_back_write_on_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let store = store_since(dir.path(), t0).await;
+        let (jumped, clip) = jump_in_rolled_back_write(&store, t0).await;
+        store
+            .record_upload_attempt(RecordingSource::Ordinary, clip, jumped, 1)
+            .await
+            .unwrap();
+        let since: String =
+            sqlx::query_scalar("SELECT accounting_since FROM recording_delivery_baseline")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        let since = crate::motion::parse_ts(&since).unwrap();
+        assert_eq!(since.timestamp_millis(), jumped.timestamp_millis());
     }
 }
