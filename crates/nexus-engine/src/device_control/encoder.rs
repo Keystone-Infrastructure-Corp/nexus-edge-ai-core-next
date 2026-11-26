@@ -442,11 +442,9 @@ fn bind_recording(
 
 #[cfg(test)]
 mod tests {
-    /// Per-run credential so no literal reaches a password sink.
-    fn test_secret(tag: &str) -> String {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{tag}-{}-{n}", std::process::id())
+    /// Random per-call credential: no literal reaches a password sink.
+    fn test_secret() -> String {
+        uuid::Uuid::now_v7().to_string()
     }
     use super::*;
     use crate::discovery::onvif_encoder::IntRange;
@@ -650,7 +648,7 @@ mod tests {
         OnvifTarget {
             endpoint: format!("http://{addr}/onvif/device_service"),
             username: "admin".into(),
-            password: test_secret("pw"),
+            password: test_secret(),
         }
     }
 
@@ -699,7 +697,7 @@ mod tests {
         let t = OnvifTarget {
             endpoint: format!("http://{addr}/onvif/device_service"),
             username: "admin".into(),
-            password: test_secret("pw"),
+            password: test_secret(),
         };
         let started = std::time::Instant::now();
         let got = recording_bindings(
@@ -715,7 +713,7 @@ mod tests {
         let dead = OnvifTarget {
             endpoint: "http://127.0.0.1:9/onvif/device_service".into(),
             username: "admin".into(),
-            password: test_secret("pw"),
+            password: test_secret(),
         };
         let got =
             recording_bindings(&dead, &[cfg("VE_main")], &rec(MAIN), Duration::from_secs(4)).await;
@@ -865,7 +863,7 @@ mod tests {
         OnvifTarget {
             endpoint: format!("http://{addr}/onvif/device_service"),
             username: "admin".into(),
-            password: test_secret("pw"),
+            password: test_secret(),
         }
     }
 
@@ -996,7 +994,7 @@ mod tests {
         let t = OnvifTarget {
             endpoint: format!("{}/onvif/device_service", srv.uri()),
             username: "admin".into(),
-            password: test_secret("pw"),
+            password: test_secret(),
         };
         let partial = |bitrate| VideoEncoderConfig {
             bitrate_limit: Some(bitrate),

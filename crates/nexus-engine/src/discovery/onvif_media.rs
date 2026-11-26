@@ -1002,11 +1002,9 @@ fn parse_output_level_range(body: &str) -> Result<(i32, i32), String> {
 
 #[cfg(test)]
 mod tests {
-    /// Per-run credential so no literal reaches a password sink.
-    fn test_secret(tag: &str) -> String {
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        format!("{tag}-{}-{n}", std::process::id())
+    /// Random per-call credential: no literal reaches a password sink.
+    fn test_secret() -> String {
+        uuid::Uuid::now_v7().to_string()
     }
     use super::*;
 
@@ -1393,7 +1391,7 @@ mod tests {
         use wiremock::matchers::body_string_contains;
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let srv = MockServer::start().await;
-        let (user, secret) = (test_secret("user"), test_secret("pw"));
+        let (user, secret) = (test_secret(), test_secret());
         let profiles = r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><e:Body><trt:GetProfilesResponse><trt:Profiles token="P1"><tt:Name>main</tt:Name><tt:VideoEncoderConfiguration token="E1"><tt:Encoding>H264</tt:Encoding></tt:VideoEncoderConfiguration></trt:Profiles></trt:GetProfilesResponse></e:Body></e:Envelope>"#;
         let uri = format!(
             r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema"><e:Body><GetStreamUriResponse><MediaUri><tt:Uri>rtsp://{user}:{secret}@cam/stream1</tt:Uri></MediaUri></GetStreamUriResponse></e:Body></e:Envelope>"#
@@ -1419,14 +1417,14 @@ mod tests {
         );
         let cap = Capture::default();
         let _g = tracing::subscriber::set_default(cap.clone());
-        let bound = query_profile_streams(&endpoint, &test_secret("u"), &test_secret("p"))
+        let bound = query_profile_streams(&endpoint, &test_secret(), &test_secret())
             .await
             .unwrap();
         assert_eq!(
             bound[0].uri.as_deref(),
             Some(format!("rtsp://{user}:{secret}@cam/stream1").as_str())
         );
-        query_streams(&endpoint, &test_secret("u"), &test_secret("p"))
+        query_streams(&endpoint, &test_secret(), &test_secret())
             .await
             .unwrap();
         let logs = cap.0.lock().unwrap().clone();
