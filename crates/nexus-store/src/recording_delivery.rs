@@ -918,7 +918,10 @@ mod tests {
             hot_path: None,
             sha256: Some("a".repeat(64)),
         };
-        store.close_clip(id, &close).await.unwrap();
+        store
+            .close_clip_at(id, &close, close.ended_at)
+            .await
+            .unwrap();
         id
     }
 

@@ -97,7 +97,11 @@ async fn closed_clip(
 ) -> i64 {
     let id = open_clip(store, camera_id, started).await;
     store
-        .close_clip(id, &close(started, size_bytes, sha))
+        .close_clip_at(
+            id,
+            &close(started, size_bytes, sha),
+            started + Duration::seconds(30),
+        )
         .await
         .unwrap();
     id
@@ -444,7 +448,7 @@ async fn recording_delivery_survives_restart_without_double_counting() {
     };
     let store = open_store(dir.path()).await;
     store
-        .close_clip(id, &close(at(10, 0, 0), 1_000, true))
+        .close_clip_at(id, &close(at(10, 0, 0), 1_000, true), at(10, 0, 30))
         .await
         .unwrap();
     store
@@ -1042,11 +1046,11 @@ async fn recording_delivery_baselines_existing_rows_without_history() {
         .await
         .unwrap();
     store
-        .close_clip(1, &close(at(9, 0, 0), 100, true))
+        .close_clip_at(1, &close(at(9, 0, 0), 100, true), at(9, 0, 30))
         .await
         .unwrap();
     store
-        .close_clip(3, &close(at(9, 59, 30), 300, true))
+        .close_clip_at(3, &close(at(9, 59, 30), 300, true), at(10, 0, 0))
         .await
         .unwrap();
     store
@@ -1073,4 +1077,29 @@ async fn recording_delivery_baselines_existing_rows_without_history() {
     );
     assert_eq!(w.core.alert.delivered_bytes, 20);
     assert!(snap.accounting_since > at(10, 30, 0));
+}
+
+/// A clip whose last frame was captured at 12:59:59 but finalized at
+/// 13:00:05 is generated in the 13:00 hour, where its delivery lands.
+#[tokio::test]
+async fn recording_delivery_counts_generation_at_finalization_not_last_frame() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let id = open_clip(&store, 1, at(12, 59, 0)).await;
+    let mut c = close(at(12, 59, 0), 3_600, true);
+    c.ended_at = at(12, 59, 59);
+    store.close_clip_at(id, &c, at(13, 0, 5)).await.unwrap();
+    store
+        .mark_cold_replicated(id, &cold_mark("a.mp4", at(13, 10, 0)))
+        .await
+        .unwrap();
+
+    let minute: i64 = sqlx::query_scalar(
+        "SELECT minute_utc FROM recording_minute_buckets
+          WHERE source_kind = 'ordinary' AND generated_bytes = 3600",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    assert_eq!(minute, at(13, 0, 0).timestamp(), "bucketed at finalization");
 }

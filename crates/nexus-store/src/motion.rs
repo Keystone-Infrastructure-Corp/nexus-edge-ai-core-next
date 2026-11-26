@@ -436,6 +436,19 @@ impl Store {
     /// the final clip bytes; the cold replicator gates upload on
     /// this being non-NULL.
     pub async fn close_clip(&self, clip_id: ClipId, close: &ClipClose) -> Result<(), StoreError> {
+        self.close_clip_at(clip_id, close, Utc::now()).await
+    }
+
+    /// [`Self::close_clip`] with the finalization wall time explicit.
+    /// SPEC-090 buckets ordinary generation at `finalized_at` (when the
+    /// clip became an upload candidate), not at `close.ended_at` (the
+    /// capture time of its last frame).
+    pub async fn close_clip_at(
+        &self,
+        clip_id: ClipId,
+        close: &ClipClose,
+        finalized_at: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         self.close_clip_on(&mut *tx, clip_id, close).await?;
         tx.commit().await?;
@@ -531,7 +544,7 @@ impl Store {
                 conn,
                 r.get(0),
                 RecordingSource::Ordinary,
-                close.ended_at,
+                finalized_at,
                 &generated,
             )
             .await?;
