@@ -341,8 +341,11 @@ pub trait ClipRecorder: Send + Sync {
     /// clips still registered for `camera_id`, wait for the camera's opens
     /// and closes still in flight (an open yet to register its clip, a close
     /// that already took one), and return when all of it is done; `Err`
-    /// when a clip could not be finalized. The engine calls it once a
-    /// camera's supervisor has ended and starts no replacement, nor removes
+    /// while a clip of the camera could not be finalized, by this drain or
+    /// by any earlier close, until a retry completes it or it has failed
+    /// three times (it stays in [`Self::recording_degradations`]). The
+    /// engine calls it once a camera's supervisor has ended and starts no
+    /// replacement, nor removes
     /// the camera's ingester, until it returns `Ok`: an aborted supervisor
     /// never reaches the close of a clip it held, which would otherwise keep
     /// recording beside the replacement's (SPEC-088 Z-4). Default no-op, as

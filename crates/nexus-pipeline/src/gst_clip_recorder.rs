@@ -116,7 +116,7 @@ use nexus_types::{CameraId, CodecKind};
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::fs;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::alert_clip::{
     alert_clip_inflight_path, alert_clip_rel_path, encode_alert_clip, trim_preroll, BoxFrame,
@@ -138,6 +138,13 @@ const EOS_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often `shutdown` looks for a clip an in-flight open registered while
 /// another owned task is still running.
 const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+
+/// Failed attempts at finalizing a clip, its close included, for which
+/// [`ClipRecorder::drain_camera`] keeps its camera stopping (SPEC-088).
+const FINALIZE_DRAINS: u32 = 3;
+
+/// Recording-health reason of a clip whose close did not finish.
+const UNFINALIZED: &str = "recording could not be finalized";
 
 /// Container stamped on every row this recorder writes.
 const CONTAINER: &str = "mp4";
@@ -183,6 +190,9 @@ pub struct GstClipRecorder {
     /// stream epoch ended the clip's media (#375/#376). Kept out of
     /// [`Self::open`] because the supervisor reads it on every frame.
     epoch_ended: Arc<PlRwLock<HashMap<ClipId, Arc<AtomicBool>>>>,
+    /// Clips whose writer was finalized but whose row step failed, kept
+    /// until a retry completes it, whoever awaited the close (SPEC-088).
+    unfinalized: Arc<PlMutex<HashMap<ClipId, Unfinalized>>>,
     /// Every running open/close task holds a receiver; `shutdown` waits
     /// on `closed()` until none is left (SPEC-088 Z-4).
     in_flight: watch::Sender<()>,
@@ -331,6 +341,23 @@ struct PumpStats {
 // gst::Pipeline / AppSrc are Send + Sync by GObject contract, so
 // OpenState is auto-Send + auto-Sync.
 
+/// The row step a close could not complete, retried as recorded: the
+/// clip's writer is already finalized and is never reopened.
+#[derive(Clone)]
+enum FinalStep {
+    Close(ClipClose),
+    Discard,
+}
+
+struct Unfinalized {
+    camera_id: CameraId,
+    step: FinalStep,
+    /// Failed attempts, the close's included.
+    attempts: u32,
+    retrying: bool,
+    error: String,
+}
+
 /// Per-camera in-flight alert clip, for burst coalescing (M-Alert-Clip).
 /// While one exists and its `deadline` hasn't passed, a new alert on the
 /// same camera coalesces into it (bumping the deadline) instead of
@@ -390,6 +417,7 @@ impl GstClipRecorder {
             panic: PlMutex::new(false),
             open: Arc::new(Mutex::new(HashMap::new())),
             epoch_ended: Arc::new(PlRwLock::new(HashMap::new())),
+            unfinalized: Arc::new(PlMutex::new(HashMap::new())),
             in_flight: watch::channel(()).0,
             camera_in_flight: PlMutex::new(HashMap::new()),
             shutting_down: Arc::new(PlMutex::new(false)),
@@ -736,6 +764,7 @@ struct Writers {
     bus: Option<Arc<dyn nexus_bus::Bus>>,
     open: Arc<Mutex<HashMap<ClipId, OpenState>>>,
     epoch_ended: Arc<PlRwLock<HashMap<ClipId, Arc<AtomicBool>>>>,
+    unfinalized: Arc<PlMutex<HashMap<ClipId, Unfinalized>>>,
 }
 
 impl GstClipRecorder {
@@ -746,6 +775,58 @@ impl GstClipRecorder {
             bus: self.bus.clone(),
             open: self.open.clone(),
             epoch_ended: self.epoch_ended.clone(),
+            unfinalized: self.unfinalized.clone(),
+        }
+    }
+
+    /// Retry `clip_id`'s failed row step. A `held` retry is the camera's
+    /// work, which its drain waits for; shutdown waits for every retry.
+    fn spawn_finalize_retry(
+        &self,
+        clip_id: ClipId,
+        camera_id: CameraId,
+        step: FinalStep,
+        held: bool,
+    ) {
+        let store = self.store.clone();
+        let unfinalized = self.unfinalized.clone();
+        let retry = async move {
+            let retried = match &step {
+                FinalStep::Close(close) => store.close_clip(clip_id, close).await,
+                FinalStep::Discard => store.discard_clip_metadata(clip_id).await,
+            };
+            let mut unfinalized = unfinalized.lock();
+            match retried {
+                Ok(()) => {
+                    unfinalized.remove(&clip_id);
+                    info!(
+                        clip_id,
+                        camera_id, "gst recorder: finalized a clip on retry"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        clip_id,
+                        camera_id,
+                        error = %e,
+                        "gst recorder: clip finalization retry failed"
+                    );
+                    if let Some(u) = unfinalized.get_mut(&clip_id) {
+                        u.attempts += 1;
+                        u.retrying = false;
+                        u.error = e.to_string();
+                    }
+                }
+            }
+        };
+        if held {
+            self.spawn_owned(camera_id, retry);
+        } else {
+            let in_flight = self.in_flight.subscribe();
+            tokio::spawn(async move {
+                let _in_flight = in_flight;
+                retry.await
+            });
         }
     }
 
@@ -803,6 +884,26 @@ impl GstClipRecorder {
 }
 
 impl Writers {
+    /// Keep `step`'s failure for the camera's later drains.
+    fn unfinalized(
+        &self,
+        handle: ClipHandle,
+        step: FinalStep,
+        e: nexus_store::StoreError,
+    ) -> RecorderError {
+        self.unfinalized.lock().insert(
+            handle.clip_id,
+            Unfinalized {
+                camera_id: handle.camera_id,
+                step,
+                attempts: 1,
+                retrying: false,
+                error: e.to_string(),
+            },
+        );
+        e.into()
+    }
+
     async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError> {
         let mut state = self
             .open
@@ -813,7 +914,7 @@ impl Writers {
         // Taken only by the close that won the clip: a racing close of the
         // same clip (shutdown's drain) must not take its epoch flag.
         let epoch_ended = self.epoch_ended.write().remove(&handle.clip_id);
-        let failure = state.health.guard("recording could not be finalized");
+        let failure = state.health.guard(UNFINALIZED);
 
         // Step 1: signal the live pump to stop and wait for it. Once
         // the pump returns we know no more push_buffer() calls are
@@ -983,7 +1084,9 @@ impl Writers {
                     );
                 }
             }
-            self.store.discard_clip_metadata(handle.clip_id).await?;
+            if let Err(e) = self.store.discard_clip_metadata(handle.clip_id).await {
+                return Err(self.unfinalized(handle, FinalStep::Discard, e));
+            }
             failure.complete();
             return Ok(ClipMeta {
                 clip_id: handle.clip_id,
@@ -1126,18 +1229,16 @@ impl Writers {
             }
         }
 
-        self.store
-            .close_clip(
-                handle.clip_id,
-                &ClipClose {
-                    ended_at: args.ended_at,
-                    duration_ms,
-                    size_bytes,
-                    hot_path: Some(rel),
-                    sha256,
-                },
-            )
-            .await?;
+        let close = ClipClose {
+            ended_at: args.ended_at,
+            duration_ms,
+            size_bytes,
+            hot_path: Some(rel),
+            sha256,
+        };
+        if let Err(e) = self.store.close_clip(handle.clip_id, &close).await {
+            return Err(self.unfinalized(handle, FinalStep::Close(close), e));
+        }
 
         debug!(
             camera_id = state.camera_id,
@@ -1573,6 +1674,35 @@ impl ClipRecorder for GstClipRecorder {
     }
 
     async fn drain_camera(&self, camera_id: CameraId) -> Result<(), RecorderError> {
+        // A clip a close could not finalize, whoever awaited it, is retried
+        // at its failed row step. After `FINALIZE_DRAINS` failed attempts it
+        // no longer holds the camera stopping, so recording resumes, but it
+        // stays in recording health until a retry completes it (SPEC-088).
+        let mut released = HashSet::new();
+        let mut retries = Vec::new();
+        for (&clip_id, u) in self.unfinalized.lock().iter_mut() {
+            if u.camera_id != camera_id {
+                continue;
+            }
+            let held = u.attempts < FINALIZE_DRAINS;
+            if !held {
+                released.insert(clip_id);
+                error!(
+                    clip_id,
+                    camera_id,
+                    attempts = u.attempts,
+                    error = %u.error,
+                    "gst recorder: clip still not finalized; no longer holding its camera \
+                     stopping, retrying in the background and reporting it in recording health"
+                );
+            }
+            if !std::mem::replace(&mut u.retrying, true) {
+                retries.push((clip_id, u.step.clone(), held));
+            }
+        }
+        for (clip_id, step, held) in retries {
+            self.spawn_finalize_retry(clip_id, camera_id, step, held);
+        }
         // `shutdown`'s loop for one camera: an open still in flight registers
         // its clip (or finalizes it itself) later, and a close in flight may
         // have taken its clip already; both are the camera's work too.
@@ -1615,7 +1745,17 @@ impl ClipRecorder for GstClipRecorder {
                 RecorderError::Io(std::io::Error::other(format!("clip drain task: {e}")))
             })??;
         }
-        Ok(())
+        let unfinalized = self.unfinalized.lock();
+        match unfinalized
+            .iter()
+            .find(|(clip_id, u)| u.camera_id == camera_id && !released.contains(*clip_id))
+        {
+            Some((clip_id, u)) => Err(RecorderError::Io(std::io::Error::other(format!(
+                "clip {clip_id} not finalized after {} attempts: {}",
+                u.attempts, u.error
+            )))),
+            None => Ok(()),
+        }
     }
 
     fn set_panic(&self, panic: bool) {
@@ -1638,6 +1778,17 @@ impl ClipRecorder for GstClipRecorder {
         let mut issues = self.recording_health.degradations();
         if !self.alert_clips_active() {
             issues.retain(|issue| issue.kind != RecordingKind::Alert);
+        }
+        // Outlives the camera's ingester: the clip is the old session's.
+        for u in self.unfinalized.lock().values() {
+            let issue = RecordingDegradation {
+                camera_id: u.camera_id,
+                kind: RecordingKind::Motion,
+                reason: UNFINALIZED.into(),
+            };
+            if !issues.contains(&issue) {
+                issues.push(issue);
+            }
         }
         for (&camera_id, ingester) in self.ingesters.read().iter() {
             let Some(codec_pin) = ingester.codec_pin() else {
@@ -6355,6 +6506,140 @@ mod epoch_tests {
         );
         assert_eq!(writer.current_state(), gst::State::Null);
         assert!(rec.open.lock().await.is_empty(), "clip left registered");
+    }
+
+    /// SPEC-088 review 9: a clip whose row could not be stamped (another
+    /// writer held the store) keeps its camera stopping: the next drain
+    /// retries the stamp, never the writer, and fails while the store is
+    /// still held. Once a retry stamps the row the drain succeeds, the
+    /// reconciler may start a replacement and nothing stays reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_finalization_holds_its_camera_until_a_retry_stamps_the_row() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, writer) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        // Every row write fails once SQLite's busy timeout runs out.
+        let held = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+
+        let first = rec.drain_camera(1).await;
+        let second = rec.drain_camera(1).await;
+        held.rollback().await.unwrap();
+        let third = rec.drain_camera(1).await;
+        rec.remove_camera_ingester(1);
+
+        assert!(first.is_err(), "the failed close was not reported");
+        assert!(second.is_err(), "the next drain forgot the failed close");
+        assert!(third.is_ok(), "a retry that stamped the row: {third:?}");
+        assert_eq!(writer.current_state(), gst::State::Null);
+        assert!(
+            finalized_playable(&store, &clips_dir, clip.clip_id).await,
+            "the retry did not stamp the row with the close's final file"
+        );
+        assert!(
+            rec.recording_degradations().is_empty(),
+            "a recovered clip is still reported: {:?}",
+            rec.recording_degradations()
+        );
+    }
+
+    /// SPEC-088 review 9: a clip that stays unfinalizable (its row is gone)
+    /// holds its camera stopping for three drains, the fourth releases it so
+    /// recording resumes, and recording health keeps reporting it after the
+    /// reconciler removed the camera's ingester. The same holds for the
+    /// reconciler's later passes, which poll a drain once and do not wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_persistent_finalization_failure_releases_its_camera_after_three_drains() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        for camera_id in [1, 2] {
+            let (clip, _, _) =
+                register_clip(&rec, &store, &clips_dir, camera_id, started_at, None).await;
+            store.discard_clip_metadata(clip.clip_id).await.unwrap();
+        }
+
+        let mut drained = Vec::new();
+        for _ in 0..4 {
+            drained.push(rec.drain_camera(1).await.is_ok());
+        }
+        let mut passes = vec![rec.drain_camera(2).await.is_ok()];
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let pass = tokio::time::timeout(Duration::ZERO, rec.drain_camera(2)).await;
+            passes.push(matches!(pass, Ok(Ok(()))));
+        }
+        rec.remove_camera_ingester(1);
+        rec.remove_camera_ingester(2);
+
+        assert_eq!(
+            drained,
+            [false, false, false, true],
+            "drains 1-3 must hold the camera stopping, the fourth release it"
+        );
+        assert_eq!(
+            passes,
+            [false, false, false, true],
+            "unwaited passes must release the camera after three failed attempts too"
+        );
+        for camera_id in [1, 2] {
+            assert!(
+                rec.recording_degradations()
+                    .iter()
+                    .any(|d| d.camera_id == camera_id && d.kind == RecordingKind::Motion),
+                "camera {camera_id}'s unfinalized clip vanished from recording health"
+            );
+        }
+    }
+
+    /// SPEC-088 review 9: the close's caller is aborted and the drain waiting
+    /// for that close runs out of time before the close fails. The failure
+    /// lives in the recorder, not in either future, so the next drain still
+    /// reports it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finalization_failing_after_its_drain_timed_out_reaches_the_next_drain() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec =
+            Arc::new(GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap());
+        // The close waits at its pump until the test lets it finish.
+        let (finish, pump_gate) = oneshot::channel::<()>();
+        let pump = tokio::spawn(async move {
+            let _ = pump_gate.await;
+            PumpStats::default()
+        });
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, Some(pump)).await;
+        store.discard_clip_metadata(clip.clip_id).await.unwrap();
+        close_then_abort_caller(&rec, clip).await;
+
+        let timed_out = tokio::time::timeout(Duration::from_millis(300), rec.drain_camera(1))
+            .await
+            .is_err();
+        let _ = finish.send(());
+        let next = tokio::time::timeout(Duration::from_secs(15), rec.drain_camera(1))
+            .await
+            .expect("the drain returns");
+
+        assert!(timed_out, "precondition: the first drain timed out");
+        assert!(next.is_err(), "the failed close was lost: {next:?}");
     }
 
     /// SPEC-088 Z-4 in `main`'s order: every supervisor is aborted, none is
