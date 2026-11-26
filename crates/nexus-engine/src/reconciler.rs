@@ -2128,6 +2128,8 @@ mod tests {
         /// When set, a camera's first frame source ends once this is
         /// notified, as [`SourceUntil`].
         end_first_source: Option<Arc<tokio::sync::Notify>>,
+        /// The `VirtualSource` frame size; 512x288 when unset.
+        frame_size: Option<(u32, u32)>,
     }
 
     /// Delivers frames until `end` is notified, then returns as
@@ -2325,10 +2327,11 @@ mod tests {
                     end: end.clone(),
                 }));
             }
+            let (width, height) = self.frame_size.unwrap_or((512, 288));
             Some(Box::new(nexus_pipeline::VirtualSource {
                 camera_id,
-                width: 512,
-                height: 288,
+                width,
+                height,
                 fps: 10,
             }))
         }
@@ -3414,6 +3417,81 @@ mod tests {
                 && !recorder.calls_of(8).contains(&ClipCall::IngesterRemoved)
                 && recorder.sources_built(8) == 1,
             "camera 7's policy saves stopped or restarted camera 8"
+        );
+    }
+
+    /// SPEC-077 — a threshold-only save changes the replacement's verdict.
+    /// On a 1024x2048 frame the mock person's box is 205x1024 px, a 1044 px
+    /// diagonal, and its 59 px drift cycle is 0.057 diagonals: still under
+    /// plan grid bounds of 0.10. With a 20 s dwell it is not hidden 7 s on;
+    /// once a 5 s dwell is saved, the replacement hides it 5 s after its
+    /// start, which a 20 s dwell could not do within the 10 s wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parking_dwell_only_save_changes_the_replacements_verdict() {
+        let mut camera = cam(None);
+        camera.behavior.parking_lot_mode = true;
+        camera.behavior.parking_policy_v2 = Some(ParkingPolicyV2 {
+            dwell_secs: 20.0,
+            max_speed_box_diagonals_per_sec: 0.10,
+            max_displacement_box_diagonals: 0.10,
+            max_observation_gap_secs: 3.0,
+        });
+        camera.zones = vec![ZoneConfig {
+            kind: ZoneKind::Parking,
+            polygon: vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+            ..corner()
+        }];
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder {
+            frame_size: Some((1024, 2048)),
+            ..ClipLogRecorder::default()
+        });
+        let mut args = reconciler_args(recorder, dir.path(), &[camera.clone()]).await;
+        args.static_object.anchor_persons = true;
+        let hidden = |args: &ReconcilerArgs| {
+            args.cache
+                .get(7)
+                .is_some_and(|e| e.objects.iter().any(nexus_tracker::is_object_static))
+        };
+
+        reconcile(&args).await.expect("initial pass");
+        wait_until("the first generation classifies the person", || {
+            args.cache.get(7).is_some_and(|e| {
+                e.objects
+                    .iter()
+                    .any(|o| o.attributes.contains_key(ALERT_EPOCH_ATTRIBUTE_KEY))
+            })
+        })
+        .await;
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(7);
+        while std::time::Instant::now() < until {
+            assert!(!hidden(&args), "hidden under a 20 s dwell");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let before = entry_of(&args.handles, 7);
+        camera
+            .behavior
+            .parking_policy_v2
+            .as_mut()
+            .expect("v2")
+            .dwell_secs = 5.0;
+        args.store.upsert_camera(&camera).await.expect("save");
+        reconcile(&args).await.expect("pass after the save");
+        let restarted = std::time::Instant::now();
+        assert!(
+            !Arc::ptr_eq(&entry_of(&args.handles, 7).task, &before.task),
+            "the dwell save did not restart camera 7"
+        );
+        wait_until("the replacement hides the person under a 5 s dwell", || {
+            hidden(&args)
+        })
+        .await;
+        let after = restarted.elapsed();
+        abort_all(&args.handles);
+        assert!(
+            after >= std::time::Duration::from_secs(5),
+            "hidden {after:?} after the restart: not its own dwell"
         );
     }
 
