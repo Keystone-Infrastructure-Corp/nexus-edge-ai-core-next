@@ -2879,20 +2879,15 @@ mod tests {
         }
     }
 
-    /// SPEC-088 — frames that never get through the detector never reach the
-    /// zone filters, so the generation stays unacknowledged: applying, then
-    /// failed once 30 s have passed since its start. A requested stop is not
-    /// a failure of its own.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_detector_that_fails_every_frame_never_applies_the_zones() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
-        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
-        let detector = Arc::new(FailingDetector::default());
-        // `spawn_supervisor`'s spawn with this detector in place of the router's.
-        let handle = spawn_camera(
+    /// `spawn_supervisor`'s spawn of camera 7 with `detector` in place of the
+    /// router's.
+    fn spawn_with_detector(
+        args: &ReconcilerArgs,
+        detector: Arc<dyn nexus_inference::Detector>,
+    ) -> nexus_pipeline::CameraHandle {
+        spawn_camera(
             cam(None),
-            detector.clone(),
+            detector,
             None,
             Arc::from(nexus_tracker::build_tracker(&args.tracker_cfg)),
             args.annotator.clone(),
@@ -2915,7 +2910,100 @@ mod tests {
             None,
             args.sink_router.clone(),
             args.alert_clip_schedule_gate.clone(),
+        )
+    }
+
+    /// Parks every `detect` call until the test lets it through, counting
+    /// the calls begun, so a test can act while a frame is being processed.
+    struct GatedDetector {
+        calls: AtomicUsize,
+        gate: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl nexus_inference::Detector for GatedDetector {
+        async fn detect(
+            &self,
+            _frame: &nexus_types::Frame,
+            _prompts: &[String],
+        ) -> Result<Vec<nexus_types::Detection>, nexus_inference::InferenceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.gate
+                .acquire()
+                .await
+                .expect("gate is never closed")
+                .forget();
+            Ok(Vec::new())
+        }
+
+        fn name(&self) -> &'static str {
+            "gated"
+        }
+    }
+
+    /// SPEC-088 review 8 — a frame acknowledges the request current when it
+    /// began, never one saved while it was being processed. A→B→A saved
+    /// while a frame of the generation that applied A is in its detector is
+    /// a new request for A: that frame must not certify it; the next does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_landing_mid_frame_is_acknowledged_only_by_a_later_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let a = zone_revision(&[]);
+        let mut b_cam = cam(None);
+        b_cam.zones.push(corner());
+        let detector = Arc::new(GatedDetector {
+            calls: AtomicUsize::new(0),
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let handle = spawn_with_detector(&args, detector.clone());
+        let in_detector = |n: usize| {
+            let detector = detector.clone();
+            move || detector.calls.load(Ordering::SeqCst) >= n
+        };
+
+        wait_until("frame 1 is in the detector", in_detector(1)).await;
+        detector.gate.add_permits(1);
+        // The loop is sequential: frame 2 in the detector means frame 1 is done.
+        wait_until("frame 2 is in the detector", in_detector(2)).await;
+        let before = status(&args, &a);
+        save(&args, &b_cam).await;
+        save(&args, &cam(None)).await;
+        detector.gate.add_permits(1);
+        wait_until("frame 3 is in the detector", in_detector(3)).await;
+        let after_frame_2 = status(&args, &a);
+        detector.gate.add_permits(1 << 16);
+        wait_until("a later frame applied the new request for A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let _ = handle.stop.send(true);
+        handle.task.await.expect("supervisor stops");
+
+        assert_eq!(
+            before.state,
+            ZoneApplicationState::Applied,
+            "precondition: frame 1 applied A"
         );
+        assert_eq!(
+            after_frame_2.state,
+            ZoneApplicationState::Applying,
+            "the frame in flight when A→B→A was saved acknowledged that newer request"
+        );
+    }
+
+    /// SPEC-088 — frames that never get through the detector never reach the
+    /// zone filters, so the generation stays unacknowledged: applying, then
+    /// failed once 30 s have passed since its start. A requested stop is not
+    /// a failure of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_detector_that_fails_every_frame_never_applies_the_zones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let detector = Arc::new(FailingDetector::default());
+        let handle = spawn_with_detector(&args, detector.clone());
         wait_until("the detector failed on several frames", || {
             detector.calls.load(Ordering::SeqCst) >= 5
         })
