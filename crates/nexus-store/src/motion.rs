@@ -1186,6 +1186,18 @@ impl Store {
         clip_id: ClipId,
         mark: &ClipColdMark,
     ) -> Result<(), StoreError> {
+        self.mark_cold_uploaded(clip_id, mark, None).await
+    }
+
+    /// [`Self::mark_cold_replicated`] after a transfer of `payload_bytes`:
+    /// SPEC-090 counts those bytes as delivered, so a clip whose stored
+    /// size is unknown is not delivered as 0. `None` counts the stored size.
+    pub async fn mark_cold_uploaded(
+        &self,
+        clip_id: ClipId,
+        mark: &ClipColdMark,
+        payload_bytes: Option<i64>,
+    ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE motion_clips
@@ -1211,7 +1223,7 @@ impl Store {
         .await?;
         if let Some(r) = counted {
             let delivered = DeliveryCounters {
-                delivered_bytes: r.get::<i64, _>(1).max(0),
+                delivered_bytes: payload_bytes.unwrap_or_else(|| r.get(1)).max(0),
                 ..DeliveryCounters::default()
             };
             add_to_bucket(

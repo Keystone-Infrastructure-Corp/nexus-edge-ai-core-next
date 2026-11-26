@@ -295,6 +295,18 @@ impl Store {
         id: AlertClipId,
         mark: &AlertClipColdMark,
     ) -> Result<(), StoreError> {
+        self.mark_alert_clip_cold_uploaded(id, mark, None).await
+    }
+
+    /// [`Store::mark_alert_clip_cold_replicated`] after a transfer of
+    /// `payload_bytes`, counted as delivered like
+    /// [`Store::mark_cold_uploaded`]. `None` counts the stored size.
+    pub async fn mark_alert_clip_cold_uploaded(
+        &self,
+        id: AlertClipId,
+        mark: &AlertClipColdMark,
+        payload_bytes: Option<i64>,
+    ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE alert_clips
@@ -320,7 +332,7 @@ impl Store {
         .await?;
         if let Some(r) = counted {
             let delivered = DeliveryCounters {
-                delivered_bytes: r.get::<i64, _>(1).max(0),
+                delivered_bytes: payload_bytes.unwrap_or_else(|| r.get(1)).max(0),
                 ..DeliveryCounters::default()
             };
             add_to_bucket(

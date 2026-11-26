@@ -998,13 +998,13 @@ async fn upload_alert_clip_one(
     // blob URL, which only a put receipt carries, and `put` is
     // idempotent (#759: skipping it left a blob with no cloud row).
     let announces = cfg.outbox.is_some() && backend.yields_cloud_url();
-    let cold_url = match backend.exists(&cold_path, sha256).await {
+    let (cold_url, payload_bytes) = match backend.exists(&cold_path, sha256).await {
         Ok(true) if !announces => {
             debug!(
                 alert_clip_id = clip.id,
                 cold_path, "cold replicator: backend already has alert clip; stamping pointer only"
             );
-            None
+            (None, None)
         }
         Ok(_) => {
             let abs = cfg.clips_dir.join(hot_path_rel);
@@ -1022,7 +1022,7 @@ async fn upload_alert_clip_one(
                 .put(&cold_path, &bytes, sha256)
                 .await
                 .map_err(UploadError::Backend)?;
-            receipt.cold_url
+            (receipt.cold_url, i64::try_from(bytes.len()).ok())
         }
         Err(e) => return Err(UploadError::Backend(e)),
     };
@@ -1044,13 +1044,14 @@ async fn upload_alert_clip_one(
     };
 
     store
-        .mark_alert_clip_cold_replicated(
+        .mark_alert_clip_cold_uploaded(
             clip.id,
             &AlertClipColdMark {
                 cold_handle: backend_handle.to_string(),
                 cold_path,
                 cold_uploaded_at: Utc::now(),
             },
+            payload_bytes,
         )
         .await
         .map_err(UploadError::Store)?;
@@ -1189,13 +1190,14 @@ async fn upload_one(
     };
 
     store
-        .mark_cold_replicated(
+        .mark_cold_uploaded(
             clip.id,
             &ClipColdMark {
                 cold_handle: backend_handle.to_string(),
                 cold_path: receipt.cold_path,
                 cold_uploaded_at: receipt.uploaded_at,
             },
+            i64::try_from(bytes.len()).ok(),
         )
         .await
         .map_err(UploadError::Store)?;
@@ -2682,5 +2684,62 @@ mod tests {
         assert_eq!(c.alert.delivered_bytes, 11);
         assert_eq!(c.alert.generated_bytes, 11);
         assert_eq!(c.ordinary.attempted_bytes, 0, "no motion tick ran");
+    }
+
+    /// SPEC-090 — a successful upload counts the bytes it sent as
+    /// delivered, even when the stored size is unknown (0), and only once.
+    #[tokio::test]
+    async fn recording_delivery_counts_uploaded_payload_when_size_unknown() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        tokio::fs::write(clips_dir.join("1/clip_0001.mp4"), vec![7u8; 1 << 20])
+            .await
+            .unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 0, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE motion_clips SET size_bytes = 0 WHERE id = ?")
+            .bind(clip_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        run_tick(&store, &clips_dir, &backend).await;
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+        alert_upload_pass(&cfg, &store, &registry).await;
+
+        let c = hour_counters(&store).await;
+        assert_eq!(c.ordinary.attempted_bytes, 1 << 20);
+        assert_eq!(c.ordinary.delivered_bytes, 1 << 20, "not the stored 0");
+        assert_eq!(c.alert.delivered_bytes, 11, "alert-bytes, not the stored 0");
+
+        // A duplicate completion leaves the count where it was.
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+        store
+            .mark_cold_replicated(
+                clip_id,
+                &ClipColdMark {
+                    cold_handle: "mock".into(),
+                    cold_path: clip.cold_path.unwrap(),
+                    cold_uploaded_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let marked: i64 =
+            sqlx::query_scalar("SELECT acct_delivered FROM motion_clips WHERE id = ?")
+                .bind(clip_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(marked, 1);
+        assert_eq!(
+            hour_counters(&store).await.ordinary.delivered_bytes,
+            1 << 20
+        );
     }
 }
