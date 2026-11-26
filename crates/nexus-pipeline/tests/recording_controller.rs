@@ -1373,6 +1373,107 @@ mod controller {
         assert_eq!(kept, [(0, "rev-start"), (0, "rev-2")], "{minutes:#?}");
     }
 
+    /// Each minute row: its index, legacy-closed time under `reason`, and
+    /// whether the trace had a gap.
+    async fn minute_ms(c: &Cam, reason: &str) -> Vec<(i64, u64, bool)> {
+        let minutes = c.store.list_recording_activity_minutes(1).await.unwrap();
+        minutes
+            .iter()
+            .map(|m| {
+                let counters: serde_json::Value = serde_json::from_str(&m.counters_json).unwrap();
+                (
+                    m.minute,
+                    counters["elapsed"]["legacy_closed"][reason]
+                        .as_u64()
+                        .unwrap(),
+                    counters["trace_incomplete"].as_bool().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// Codex review 6: a qualifying frame captured at 59.5 s finishes
+    /// analysis at 61 s, after the controller's clock passed the minute's
+    /// end; an empty frame captured at 60.5 s, used at 62 s, closes it
+    /// under 1 s of post-roll. The minute is cut on evidence, not on the
+    /// controller's clock, so all of [59.5, 60.5 s) is credited at capture
+    /// time, half to each minute, and the trace has no gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lagged_window_across_a_minute_is_credited_at_capture() {
+        use RecordingReason::{Activity, Quiet};
+        let mut c = cam(shadow(10_000), 0, false, false).await;
+        for ms in (0..=59_000).step_by(1_000) {
+            c.frame(ms, quiet()).await;
+        }
+        let person = EvidenceCounts {
+            observed: 1,
+            ..EvidenceCounts::default()
+        };
+        for (captured, counts, analysis_ms) in [
+            (59_500, person, 1_500),
+            (60_500, EvidenceCounts::default(), 1_000),
+        ] {
+            let (mono, wall) = c.clock(captured);
+            let arrived = c.producer.arrived(mono, wall);
+            c.send(RecordingCommand::Evidence(arrived), LONG)
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(analysis_ms)).await;
+            let analysed =
+                c.producer
+                    .analysed(mono, wall, AnalysisOutcome::Success, counts, Some(quiet()));
+            c.send(RecordingCommand::Evidence(analysed), LONG)
+                .await
+                .unwrap();
+        }
+        let trace = c
+            .stats
+            .recording_activity()
+            .trace(1, Instant::now(), Utc::now())
+            .unwrap();
+        let window: Vec<_> = trace
+            .transitions
+            .iter()
+            .filter(|t| t.at_ms >= 59_000)
+            .map(|t| (t.at_ms, t.reason))
+            .collect();
+        assert_eq!(window, [(59_500, Activity), (60_500, Quiet)], "{trace:#?}");
+        assert!(!trace.trace_incomplete, "{trace:#?}");
+        c.stop().await;
+        assert_eq!(
+            minute_ms(&c, "activity").await,
+            [(0, 1_000 + 500, false), (1, 500, false)],
+            "[2, 3 s) recovery and [59.5, 60 s), then [60, 60.5 s)"
+        );
+    }
+
+    /// A long stall still writes its minute rows before any stop: analysis
+    /// goes stale 1 s after the last frame (58.5 s), and the minute is cut
+    /// once its end is that stale deadline behind, degraded from the stale
+    /// instant.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stall_still_writes_its_minute_as_degraded() {
+        let mut c = cam(shadow(1_000), 0, false, false).await;
+        for ms in (0..=58_500).step_by(500) {
+            c.frame(ms, quiet()).await;
+        }
+        // The detector hangs: nothing more arrives.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let rows = loop {
+            let rows = minute_ms(&c, "degraded_coverage").await;
+            if !rows.is_empty() {
+                break rows;
+            }
+            assert!(Instant::now() < deadline, "no minute row during the stall");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let [(0, degraded, false)] = rows[..] else {
+            panic!("{rows:?}");
+        };
+        // [0, 2 s) before recovery, then from the stale wake at 59.501 s.
+        assert!((2_000 + 400..=2_000 + 499).contains(&degraded), "{rows:?}");
+    }
+
     /// A slow open is waited for, never raced: the frames behind it time
     /// out where their requester can see it, and the clip they then find is
     /// the one that open produced.

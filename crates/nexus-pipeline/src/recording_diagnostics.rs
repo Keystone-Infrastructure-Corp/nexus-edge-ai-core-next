@@ -265,8 +265,7 @@ impl RecordingDiagnostics {
     ) {
         if at_ms < self.credited_ms {
             // Never credit time twice: hold the clock and say the trace has a gap.
-            self.trace_incomplete = true;
-            self.clock_steps_back += 1;
+            self.step_back();
         }
         let at_ms = at_ms.max(self.credited_ms);
         self.credit(at_ms);
@@ -323,6 +322,13 @@ impl RecordingDiagnostics {
         self.last_success_ms = summary.last_success_ms;
         self.last_qualifying_ms = summary.last_activity_ms;
         self.last_failure_ms = summary.last_failure.map(|(at, _)| at);
+    }
+
+    /// A state was held at the latest traced time, its own clock behind
+    /// what is already credited: the trace has a gap.
+    fn step_back(&mut self) {
+        self.trace_incomplete = true;
+        self.clock_steps_back += 1;
     }
 
     /// The collector lost data (a summary was not saved): the trace has a gap.
@@ -426,8 +432,9 @@ pub struct TransitionTrace {
     pub transitions: Vec<Transition>,
     pub trace_incomplete: bool,
     /// Why it is incomplete: older transitions the full ring dropped, clock
-    /// steps back (that transition was held at the previous time), and the
-    /// collector's last failure.
+    /// steps back (that transition, or a change from evidence captured in a
+    /// minute whose row was already written, was held at the previous
+    /// time), and the collector's last failure.
     pub dropped_transitions: u64,
     pub clock_steps_back: u64,
     pub collector_error: Option<String>,
@@ -823,12 +830,25 @@ impl ShadowRecording {
         Some(origin + std::time::Duration::from_millis(at))
     }
 
-    /// When the minute being counted ends, so its row is written on time
-    /// even when nothing else happens.
+    /// When the minute being counted is cut if nothing traced has passed
+    /// its end, so its row is written even through a stall.
+    ///
+    /// A minute is cut, and its row written, when [`Self::record`] first
+    /// traces past its end: evidence at its capture, once the frontier has
+    /// passed it, or a wake at the controller's now. This timer waits until
+    /// the minute's end is the stale deadline (at most half a minute)
+    /// behind: a frontier still short of it is then stale, so the cut lands
+    /// where a stale-driven transition does, and while analysis is healthy
+    /// the stale deadline wakes first. Evidence used late inside a minute
+    /// not yet cut is credited at its capture; evidence captured in a
+    /// minute already cut is held at the latest traced time, and a change
+    /// it makes there is reported as a gap.
     pub fn next_minute(&self) -> Option<Instant> {
         let origin = self.shared.lock().origin?;
         let (index, _) = self.minute?;
-        Some(origin + std::time::Duration::from_millis((index + 1) * MINUTE_MS))
+        // shortcut: capped so the wake never passes the next minute's end (one row per cut cannot split it); a stale deadline over 30 s can then cut ahead of a still-fresh frontier, reported as a gap. Write a row per elapsed minute if those deadlines matter.
+        let cut_ms = (index + 1) * MINUTE_MS + self.stale_after_ms.min(MINUTE_MS / 2);
+        Some(origin + std::time::Duration::from_millis(cut_ms))
     }
 
     /// Trace the state once the writer acted on the latest answer, as of
@@ -836,9 +856,10 @@ impl ShadowRecording {
     /// evidence-driven state at its frame's capture, one the policy's
     /// deadline drove at the caller's now. A time before the latest traced
     /// one is held there, its wall clock run on with it: evidence used late
-    /// never runs the trace back. `writer_clip` is the open clip, `held`
-    /// that it is open only for the minimum duration. Returns the summaries
-    /// this finished.
+    /// never runs the trace back, and a change from one whose minute is
+    /// already cut is a gap ([`Self::next_minute`]). `writer_clip` is the
+    /// open clip, `held` that it is open only for the minimum duration.
+    /// Returns the summaries this finished.
     pub fn record(
         &mut self,
         captured_mono: Instant,
@@ -858,7 +879,11 @@ impl ShadowRecording {
         let mut shared = self.shared.lock();
         let origin = *shared.origin.get_or_insert(captured_mono);
         let mut at = millis(captured_mono, origin);
+        let mut held_past_its_minute = false;
         if let Some((last, ..)) = self.last.filter(|&(last, ..)| last > at) {
+            held_past_its_minute = self
+                .minute
+                .is_some_and(|(current, _)| at / MINUTE_MS < current);
             captured_at += chrono::Duration::milliseconds((last - at) as i64);
             at = last;
         }
@@ -887,7 +912,12 @@ impl ShadowRecording {
         if let Some((outcome, counts, summary)) = self.pass.take() {
             d.observe(outcome, counts, &summary);
         }
+        let transitions = d.transitions;
         d.transition(at, captured_at, writer_clip.is_some(), intent.open, reason);
+        if held_past_its_minute && d.transitions > transitions {
+            // A change whose own minute's row is written lands in a later one.
+            d.step_back();
+        }
         self.last = Some((at, captured_at, reason));
 
         if self.episode.as_ref().map(|e| e.clip_id) != writer_clip {
@@ -1463,11 +1493,12 @@ mod tests {
         }
 
         /// Run the controller's clock to `until`, waking at each policy
-        /// deadline before it.
+        /// deadline and minute timer before it.
         fn wait(&mut self, until: u64) {
-            while let Some(t) = self
-                .s
-                .next_change(self.at(self.now))
+            while let Some(t) = [self.s.next_change(self.at(self.now)), self.s.next_minute()]
+                .into_iter()
+                .flatten()
+                .min()
                 .filter(|&t| t < self.at(until))
             {
                 let ms = millis(t, self.t0);
@@ -1644,6 +1675,93 @@ mod tests {
             "[2, 3 s) recovery, then [10, 20.001 s)"
         );
         assert_eq!(s.shadow_recorded_ms, 3_000 + 15_000, "open through 25 s");
+    }
+
+    /// Codex review 6, the frame above across a minute, with the minute
+    /// timer firing: captured at 59.5 s and used at 61 s, closed by an empty
+    /// frame captured at 60.5 s and used at 62 s. The minute is not cut on
+    /// the controller's clock while its evidence can still arrive fresh, so
+    /// the window keeps its capture times.
+    #[test]
+    fn a_late_qualifying_frame_across_a_minute_keeps_its_capture_time() {
+        let mut r = Replay::start(1, 0);
+        r.healthy();
+        for ms in (10_000..=59_000).step_by(1_000) {
+            r.used(ms, ms, 0);
+        }
+        assert_eq!(r.used(59_500, 61_000, 1), Activity);
+        assert_eq!(r.used(60_500, 62_000, 0), Quiet);
+        assert_eq!(
+            r.trace(59_000),
+            [(59_500, true, Activity), (60_500, false, Quiet)]
+        );
+        assert_eq!(
+            r.snapshot().elapsed.legacy_closed.activity,
+            1_000 + 1_000,
+            "[2, 3 s) recovery and [59.5, 60.5 s)"
+        );
+    }
+
+    /// A stall under the longest stale deadline, a minute, still writes a
+    /// row for each minute, degraded throughout: the minute timer is never
+    /// late enough to pass the next minute's end.
+    #[test]
+    fn a_stall_under_the_longest_stale_deadline_writes_every_minute() {
+        let registry = RecordingActivityRegistry::default();
+        let policy = RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 60_000,
+        };
+        let mut s =
+            ShadowRecording::start(&registry, 3, 9, Some(policy), "rev-9", "iou-naive", 1, 0)
+                .unwrap();
+        let (t0, w0) = (Instant::now(), Utc::now());
+        let failed = AnalysisOutcome::Failed;
+        s.frame(t0, w0, failed, EvidenceCounts::default(), false, None);
+        let mut rows = Vec::new();
+        while rows.len() < 3 {
+            let t = s.next_minute().unwrap();
+            s.tick(t);
+            let wall = w0 + chrono::Duration::from_std(t - t0).unwrap();
+            rows.extend(s.record(t, wall, None, false).minute);
+        }
+        let degraded: Vec<_> = rows
+            .iter()
+            .map(|m| {
+                let c: serde_json::Value = serde_json::from_str(&m.counters_json).unwrap();
+                (
+                    m.minute,
+                    c["elapsed"]["legacy_closed"]["degraded_coverage"].as_u64(),
+                )
+            })
+            .collect();
+        let minute = Some(MINUTE_MS);
+        assert_eq!(degraded, [(0, minute), (1, minute), (2, minute)]);
+    }
+
+    /// Evidence captured in a minute already cut, here by the stale wake at
+    /// 65.001 s, is held at the latest traced time: a change it makes lands
+    /// late, and the trace reports the gap. Held evidence that changes
+    /// nothing moves no time and is no gap.
+    #[test]
+    fn evidence_older_than_a_cut_minute_is_a_reported_gap() {
+        let mut r = Replay::start(1, 0);
+        r.healthy();
+        for ms in (10_000..=55_000).step_by(1_000) {
+            r.used(ms, ms, 0);
+        }
+        r.wait(66_000);
+        assert_eq!(r.used(59_500, 66_000, 1), Activity);
+        let trace = r.registry.trace(3, r.at(r.now), r.wall(r.now)).unwrap();
+        assert!(trace.trace_incomplete);
+        assert_eq!(trace.clock_steps_back, 1);
+        assert_eq!(
+            trace.transitions.last().map(|t| (t.at_ms, t.reason)),
+            Some((65_001, Activity))
+        );
+        assert_eq!(r.used(59_800, 66_000, 1), Activity);
+        let trace = r.registry.trace(3, r.at(r.now), r.wall(r.now)).unwrap();
+        assert_eq!(trace.clock_steps_back, 1, "{trace:#?}");
     }
 
     #[test]
