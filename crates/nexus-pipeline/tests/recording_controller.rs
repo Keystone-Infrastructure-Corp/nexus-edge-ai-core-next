@@ -1649,6 +1649,31 @@ mod controller {
         );
     }
 
+    /// R-7: with `record_motion_clip_on_alert` off, an observed alert links
+    /// to the clip already open but never opens or renews one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observed_alerts_only_link_when_alert_recording_is_off() {
+        let mut cfg = observed(1);
+        cfg.record_motion_clip_on_alert = false;
+        let mut c = cam(cfg, 0, false, false).await;
+        c.until(1, "opened 1 512x288").await;
+        let during = c.event(0).await;
+        let receipt = c.alert(c.elapsed_ms(), &during).await;
+        assert_eq!(receipt.clip.map(|h| h.clip_id), Some(1));
+        c.analysing_until(5, "closed 1 ").await;
+        let after = c.event(1).await;
+        let receipt = c.alert(c.elapsed_ms(), &after).await;
+        assert!(receipt.clip.is_none(), "{:#?}", c.rec.calls());
+        let receipt = c.now(AnalysisOutcome::Success, 0).await;
+        assert!(
+            receipt.clip.is_none(),
+            "renewed nothing: {:#?}",
+            c.rec.calls()
+        );
+        assert_eq!(c.linked(&during).await, Some(1), "linkage kept");
+        assert_eq!(c.linked(&after).await, None);
+    }
+
     /// SPEC-089 — the runtime reports the revision of the saved policy the
     /// controller applied: the one it started with, then each live change's,
     /// including a new revision of an unchanged policy (an ABA saved between

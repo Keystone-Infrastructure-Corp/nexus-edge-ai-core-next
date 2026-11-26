@@ -819,7 +819,8 @@ impl Controller {
 
     async fn alert(&mut self, alert: Alert) -> Option<RecordingError> {
         let mut error = None;
-        if self.observed {
+        // Without alert recording an alert only links: it is not activity.
+        if self.observed && self.cfg.record_motion_clip_on_alert {
             let intent = self
                 .shadow
                 .as_mut()
