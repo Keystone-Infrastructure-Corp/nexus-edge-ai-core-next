@@ -1027,6 +1027,36 @@ mod controller {
                 .await
         }
 
+        /// Frame `ms` arrives (acknowledged within [`LONG`]), then its empty
+        /// successful analysis is sent within `timeout`. Returns the instant
+        /// the arrival was acknowledged: the controller's clock reached `ms`
+        /// by then and runs on in real time, so at any later instant `r` it
+        /// shows at least `ms + (r - acknowledged)`.
+        async fn arrive_then_analyse(
+            &mut self,
+            ms: u64,
+            motion: Motion,
+            timeout: Duration,
+        ) -> (Instant, Result<RecordingReceipt, RecordingError>) {
+            let (mono, wall) = self.clock(ms);
+            let arrived = self.producer.arrived(mono, wall);
+            self.send(RecordingCommand::Evidence(arrived), LONG)
+                .await
+                .unwrap();
+            let acknowledged = Instant::now();
+            let analysed = self.producer.analysed(
+                mono,
+                wall,
+                AnalysisOutcome::Success,
+                EvidenceCounts::default(),
+                Some(motion),
+            );
+            let receipt = self
+                .send(RecordingCommand::Evidence(analysed), timeout)
+                .await;
+            (acknowledged, receipt)
+        }
+
         async fn frame(&mut self, ms: u64, motion: Motion) -> RecordingReceipt {
             self.frame_within(ms, AnalysisOutcome::Success, 0, motion, LONG)
                 .await
@@ -1601,17 +1631,20 @@ mod controller {
             (false, AnalysisOutcome::Success),
         ] {
             let mut c = cam(shadow(1_000), 0, late, false).await;
-            for ms in (0..=58_000).step_by(1_000) {
+            // An arrival moves the controller's clock to its capture, so frames
+            // a stale deadline apart gave each analysis 1 ms before a stale wake.
+            for ms in (0..=58_800).step_by(200) {
                 c.frame(ms, quiet()).await;
             }
             // The controller's clock runs on from 59 s in real time.
-            let t59 = Instant::now();
-            let born = c
-                .frame_within(59_000, AnalysisOutcome::Success, 0, live(true), SHORT)
-                .await;
+            let sent = Instant::now();
+            let timeout = if late { SHORT } else { LONG };
+            let (t59, born) = c.arrive_then_analyse(59_000, live(true), timeout).await;
             assert_eq!(born.is_err(), late, "only the gated open is slow");
+            c.until(5, "opening").await;
             // Past the 60.5 s capture: an open ending sooner judges stale before it.
             tokio::time::sleep_until((t59 + Duration::from_millis(2_200)).into()).await;
+            let released = Instant::now();
             c.rec.opens.add_permits(FREE);
             let deadline = Instant::now() + LONG;
             let stale = loop {
@@ -1626,8 +1659,15 @@ mod controller {
                 assert!(Instant::now() < deadline, "never stale: {:#?}", trace(&c));
                 tokio::time::sleep(Duration::from_millis(20)).await;
             };
-            let wake = if late { 61_100..61_700 } else { 60_001..60_500 };
-            assert!(wake.contains(&stale), "{late}: {:#?}", trace(&c));
+            // Late: blocked in the open until released, then judged at once
+            // (500 ms for the open's store write under load). On time: before
+            // the 60.5 s capture.
+            let wake = if late {
+                59_000 + ms_between(t59, released)..59_000 + ms_between(sent, released) + 500
+            } else {
+                60_001..60_500
+            };
+            assert!(wake.contains(&stale), "{late}: {wake:?} {:#?}", trace(&c));
             let (mono, wall) = c.clock(60_500);
             let arrived = c.producer.arrived(mono, wall);
             c.send(RecordingCommand::Evidence(arrived), LONG)
@@ -1673,21 +1713,28 @@ mod controller {
         c.rec.closes.add_permits(1);
         c.healthy().await;
         c.until(3, "closed 1 ").await;
-        assert_eq!(clip_id(&c.now(AnalysisOutcome::Success, 1).await), Some(2));
-        let ms = c.elapsed_ms();
-        let closing = c
-            .frame_within(ms, AnalysisOutcome::Success, 0, quiet(), SHORT)
+        let activity = c.elapsed_ms();
+        let person = c
+            .frame_within(activity, AnalysisOutcome::Success, 1, quiet(), LONG)
             .await;
+        assert_eq!(clip_id(&person.unwrap()), Some(2));
+        // After the activity's millisecond: with no post-roll, a pass captured
+        // in it still keeps the clip open.
+        let ms = c.elapsed_ms().max(activity + 1);
+        let (acknowledged, closing) = c.arrive_then_analyse(ms, quiet(), SHORT).await;
         assert_eq!(closing.unwrap_err(), RecordingError::Timeout(SHORT));
+        c.until(5, "closing 2").await;
         // No evidence from here; the close ends 1.5 s after the quiet pass.
-        sleep_until(&c, ms + 1_500).await;
+        tokio::time::sleep_until((acknowledged + Duration::from_millis(1_500)).into()).await;
         c.rec.closes.add_permits(FREE);
         let released = tokio::time::Instant::now();
         c.until(15, "opened 3 ").await;
         let opened = c.rec.opened.lock()[&3];
         let late = opened.saturating_duration_since(released);
+        // The next unrelated wake, the 10 s stall check, is 8.5 s after the
+        // release; 500 ms covers the close's and the open's store writes under load.
         assert!(
-            late < Duration::from_millis(100),
+            late < Duration::from_millis(500),
             "reopened {late:?} after the close: {:#?}",
             c.rec.calls()
         );
@@ -1713,13 +1760,12 @@ mod controller {
         }
         // The controller's clock runs on from 3.8 s in real time.
         let sent = Instant::now();
-        let closing = c
-            .frame_within(3_800, AnalysisOutcome::Success, 0, quiet(), SHORT)
-            .await;
+        let (acknowledged, closing) = c.arrive_then_analyse(3_800, quiet(), SHORT).await;
         assert_eq!(closing.unwrap_err(), RecordingError::Timeout(SHORT));
-        tokio::time::sleep_until((sent + Duration::from_millis(1_500)).into()).await;
+        c.until(5, "closing 1").await;
+        tokio::time::sleep_until((acknowledged + Duration::from_millis(1_500)).into()).await;
+        let released = Instant::now();
         c.rec.closes.add_permits(FREE);
-        let held = sent.elapsed().as_millis() as u64;
         let deadline = Instant::now() + Duration::from_secs(3);
         let stale = loop {
             let at = trace(&c)
@@ -1734,10 +1780,13 @@ mod controller {
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
         let trace = trace(&c);
+        // Blocked in the close until released, then judged at once (500 ms
+        // for the close's store write under load; the minute cut is at 61 s).
+        let wake =
+            3_800 + ms_between(acknowledged, released)..3_800 + ms_between(sent, released) + 500;
         assert!(
-            (5_200..=3_800 + held + 100).contains(&stale),
-            "stale at {stale}, close ended about {}: {trace:#?}",
-            3_800 + held
+            wake.contains(&stale),
+            "stale at {stale}, not in {wake:?}: {trace:#?}"
         );
         let window: Vec<_> = trace
             .transitions
@@ -2209,6 +2258,10 @@ mod controller {
     /// Sleep until `ms` on the test's capture clock.
     async fn sleep_until(c: &Cam, ms: u64) {
         tokio::time::sleep(Duration::from_millis(ms.saturating_sub(c.elapsed_ms()))).await;
+    }
+
+    fn ms_between(from: Instant, to: Instant) -> u64 {
+        to.duration_since(from).as_millis() as u64
     }
 
     fn clip_id(receipt: &RecordingReceipt) -> Option<i64> {
