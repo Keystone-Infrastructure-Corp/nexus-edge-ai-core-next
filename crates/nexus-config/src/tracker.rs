@@ -106,6 +106,13 @@ pub struct ByteTrackConfig {
     /// track. Safe when `n >= max_velocity_per_frame + half_max_bbox_dim`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spatial_bucket_size_px: Option<u32>,
+    /// Confidence an unmatched detection needs to start a track. `None`
+    /// keeps the v1 behaviour (`low_confidence`). Set it to the normal
+    /// detector threshold when a camera's `score_threshold` is lowered to
+    /// feed the second-pass recovery match: weaker detections then keep an
+    /// existing track alive but never start one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_track_confidence: Option<f32>,
 }
 
 impl Default for ByteTrackConfig {
@@ -120,6 +127,7 @@ impl Default for ByteTrackConfig {
             display_smoothing_alpha: default_bytetrack_display_smoothing_alpha(),
             motion_match_box_lengths_per_sec: default_bytetrack_motion_match_box_lengths_per_sec(),
             spatial_bucket_size_px: None,
+            new_track_confidence: None,
         }
     }
 }

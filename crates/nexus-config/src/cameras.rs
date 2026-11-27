@@ -312,6 +312,21 @@ pub struct CameraBehavior {
     /// 16:9 per cell). `None` defaults to `G2x2` at the call site.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tile_grid: Option<TileGridConfig>,
+    /// Discovery crops: row-major cell indices of [`tile_grid`] (`0` =
+    /// top-left) that get a stage-2 pass on a schedule even when stage-1
+    /// found nothing there. The density cascade above can only re-examine
+    /// cells stage-1 already detected in, so it never finds a distant
+    /// object stage-1 missed outright. Needs `tile_enabled = true`; works
+    /// with or without `tile_trigger`. Only adds detail when
+    /// [`supervisor_width`] is above the detector input width. Due cells
+    /// are taken first out of `tile_max_per_frame`. Empty = off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tile_discovery_cells: Vec<u32>,
+    /// Seconds after which a discovery cell is due again. `None` = 5.
+    /// The real interval is this plus `ceil(cells / tile_max_per_frame)`
+    /// analysed frames, so size it against the camera's analysed fps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tile_discovery_revisit_secs: Option<u32>,
 }
 
 /// M_TILE_REINFER (G1) — wire-shape tile grid preset.
