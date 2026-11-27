@@ -216,26 +216,44 @@ type ZoneView = {
   generation: number;
 };
 
-type SavedZones = { zones: ZoneConfig[] | undefined; revision: string | null };
+type Saved = { camera: CameraConfig; zones: ZoneConfig[] | undefined; revision: string | null };
 
 /**
- * The camera's saved zones, read again just before a save: from the config
- * snapshot, with their revision, or, when that read fails (a role that may
- * save but not read it, say), from the camera list the draft came from,
- * with no revision. Throws only when both reads fail. The save expects the
- * snapshot's revision, so another save landing after this read is refused
- * (409), never overwritten. The list gives no revision to expect: that save
- * is unconditional, as before, and still overwrites one landing after it.
+ * The camera as saved, read again just before a save: whole from the camera
+ * list and, with `zones`, its zones with their revision from the config
+ * snapshot, read first. When that read fails (a role that may save but not
+ * read it, say) the zones are the listed ones, with no revision. Throws when
+ * the list cannot be read. The save expects the snapshot's revision, so
+ * another save landing after this read is refused (409), never overwritten.
+ * The list gives no revision to expect: that save is unconditional, as
+ * before, and still overwrites one landing after it, as does a save landing
+ * after the list read in any field outside the zones.
  */
-async function rereadSavedZones(cameraId: number): Promise<SavedZones> {
-  try {
-    const snap = parseConfigSnapshot(await getCameraConfigSnapshot(cameraId));
-    return { zones: snap.settings.zones, revision: snap.zones_revision };
-  } catch {
-    const listed = (await listCameras()).find((c) => c.id === cameraId);
-    if (!listed) throw new Error(`camera ${cameraId} is not listed`);
-    return { zones: listed.zones, revision: null };
+async function rereadSaved(cameraId: number, zones: boolean): Promise<Saved> {
+  let snap: CameraConfigSnapshot | null = null;
+  if (zones) {
+    try {
+      snap = parseConfigSnapshot(await getCameraConfigSnapshot(cameraId));
+    } catch {
+      // The listed zones stand in, with no revision.
+    }
   }
+  const camera = (await listCameras()).find((c) => c.id === cameraId);
+  if (!camera) throw new Error(`camera ${cameraId} is not listed`);
+  return snap
+    ? { camera, zones: snap.settings.zones, revision: snap.zones_revision }
+    : { camera, zones: camera.zones, revision: null };
+}
+
+/**
+ * `theirs` with every field `mine` changed from `base` (by value), and
+ * `mine`'s zones, which the zone view tracks by identity.
+ */
+function rebase(mine: CameraConfig, base: CameraConfig, theirs: CameraConfig): CameraConfig {
+  const edited = Object.entries(mine).filter(
+    ([k, v]) => k === "zones" || JSON.stringify(v) !== JSON.stringify(base[k as keyof CameraConfig]),
+  );
+  return { ...theirs, ...Object.fromEntries(edited) };
 }
 
 /** A zone view with nothing read, showing `zones`. */
@@ -323,6 +341,10 @@ export function CameraEditor({
 }) {
   const qc = useQueryClient();
   const [draft, setDraft] = useState<CameraConfig>(camera);
+  // The full-config write base: the camera as last saved here, or as opened.
+  // A save sends every field the draft has not changed from it as saved by
+  // then; an access reset returns the draft to it.
+  const writeBase = useRef(camera);
   const [error, setError] = useState<string | null>(null);
   // Tracks whether the operator has hand-edited the ONVIF endpoint. While
   // false, the endpoint auto-tracks the RTSP URL host (see the URL input's
@@ -607,15 +629,16 @@ export function CameraEditor({
     // A save begun before stays on the engine but no longer sets what this
     // editor sent or synced: its zones would read as an edit or a verdict.
     resetSave();
-    onvifEndpointTouched.current = Boolean(camera.onvif?.endpoint);
-    setDraft(camera);
+    const base = writeBase.current;
+    onvifEndpointTouched.current = Boolean(base.onvif?.endpoint);
+    setDraft(base);
     setError(null);
-    setZoneView(unreadZoneView(camera.zones));
+    setZoneView(unreadZoneView(base.zones));
     if (changed) {
       restartQuery(qc, snapshotKey(camera.id));
       restartQuery(qc, statsKey(camera.id));
     }
-  }, [qc, camera, authority, denied, resetSave]);
+  }, [qc, camera.id, authority, denied, resetSave]);
 
   const set = <K extends keyof CameraConfig>(
     k: K,
@@ -658,54 +681,65 @@ export function CameraEditor({
     // is refused (409), never overwritten. Unedited zones go out as saved
     // now, not as last read here, so an unrelated edit never reverts another
     // operator's newer zones; they expect their re-read revision (see
-    // `rereadSavedZones`). Edited zones, a drawing in progress included (it
+    // `rereadSaved`). Edited zones, a drawing in progress included (it
     // freezes the zones it was drawn over), are sent as shown, expecting the
     // latest snapshot read here since the latest save, installed or held by
     // the drawing: once one has read another operator's save, the status
     // says the zones changed elsewhere and saving replaces them knowingly.
-    // With no snapshot read, nothing is expected.
+    // With no snapshot read, nothing is expected. Every other field the
+    // draft has not changed from the write base goes out as saved now too,
+    // so a save never reverts another operator's change to a field not
+    // edited here.
     let cfg = draft;
     const read = snap && snap.seq > zoneSaveSeq(camera.id) ? snap : zoneView.installed?.read;
     let expected = read?.body.zones_revision;
-    if (!isNew && !sketching && draft.zones === zoneView.synced) {
+    if (!isNew) {
+      const zonesClean = !sketching && draft.zones === zoneView.synced;
       setChecking(true);
-      let saved: SavedZones;
+      let saved: Saved;
       try {
-        saved = await rereadSavedZones(camera.id);
+        saved = await rereadSaved(camera.id, zonesClean);
       } catch (err) {
         setError(
-          `Not saved: this camera's saved zones could not be re-read, so saving could undo ` +
-            `another operator's zone changes (${err instanceof Error ? err.message : String(err)}). Try again.`,
+          `Not saved: this camera could not be re-read, so saving could undo ` +
+            `another operator's changes (${err instanceof Error ? err.message : String(err)}). Try again.`,
         );
         return;
       } finally {
         setChecking(false);
       }
-      const { zones, revision } = saved;
-      expected = revision ?? undefined;
-      const changed =
-        revision !== null
-          ? revision !== zoneView.base
-          : JSON.stringify(zones) !== JSON.stringify(draft.zones);
-      if (changed) {
-        cfg = { ...draft, zones };
-        setZoneView((v) => ({ ...v, synced: zones, base: revision }));
-        setDraft((d) => (d.zones === draft.zones ? { ...d, zones } : d));
+      cfg = rebase(draft, writeBase.current, saved.camera);
+      if (zonesClean) {
+        const { zones, revision } = saved;
+        expected = revision ?? undefined;
+        const changed =
+          revision !== null
+            ? revision !== zoneView.base
+            : JSON.stringify(zones) !== JSON.stringify(draft.zones);
+        if (changed) {
+          cfg = { ...cfg, zones };
+          setZoneView((v) => ({ ...v, synced: zones, base: revision }));
+          setDraft((d) => (d.zones === draft.zones ? { ...d, zones } : d));
+        }
       }
     }
     mutation.mutate({ cfg, expected }, {
       // Not called once `resetSave` fenced the save. The PUT answer carries
-      // no revision and is not applied: the post-save snapshot and a fresh
-      // receipt decide. Typing since the save began stays, because the
-      // draft is never replaced by the answer.
-      onSuccess: (_saved, { cfg }) =>
+      // no revision and its zones are not applied: the post-save snapshot
+      // and a fresh receipt decide. Outside the zones it is the write base
+      // now, and every field not typed in since the save began shows it;
+      // typing since then stays.
+      onSuccess: (saved, { cfg }) => {
+        writeBase.current = saved;
+        setDraft((d) => rebase(d, draft, saved));
         setZoneView((v) => ({
           ...v,
           savedAt: Date.now(),
           awaiting: true,
           synced: cfg.zones,
           base: null,
-        })),
+        }));
+      },
     });
   };
 

@@ -119,13 +119,16 @@ async function createCamera(page: Page, zones: Zone[]): Promise<number> {
   return cam.id;
 }
 
-/** Another operator's full-config save of the camera with `zones`. */
-async function saveZonesElsewhere(page: Page, id: number, zones: Zone[]) {
+/** Another operator's full-config save of the camera with `change` over what is saved. */
+async function saveElsewhere(page: Page, id: number, change: Record<string, unknown>) {
   const cams = await engine<Array<Record<string, unknown>>>(page, "GET", "/cameras");
   const cam = cams.find((c) => c.id === id);
   if (!cam) throw new Error(`camera ${id} not listed`);
-  await engine(page, "PUT", `/cameras/${id}`, { ...cam, zones });
+  await engine(page, "PUT", `/cameras/${id}`, { ...cam, ...change });
 }
+
+/** Another operator's full-config save of the camera with `zones`. */
+const saveZonesElsewhere = (page: Page, id: number, zones: Zone[]) => saveElsewhere(page, id, { zones });
 
 async function zonesRevision(page: Page, id: number): Promise<string> {
   return (await engine<{ zones_revision: string }>(page, "GET", `/admin/cameras/${id}/config-snapshot`))
@@ -1006,6 +1009,88 @@ test.describe("zone application", () => {
     expect(await zonesRevision(page, id)).toBe(theirs);
   });
 
+  // The editor stays open after a save. What it saved is its base then: a
+  // later save from the same sheet keeps what another operator saved since
+  // in every field it has not edited, and typing during a save stays.
+  test("a second save from the same editor keeps another operator's change to a field it did not edit", async ({
+    page,
+  }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    await page.locator("#cam-name").fill("e2e zones renamed");
+    const save = await holdSave(page, id);
+    await page.getByRole("button", { name: /^save$/i }).click();
+    await save.parked;
+    await page.locator("#cam-fps").fill("5");
+    receipt.set(applied(2));
+    const first = page.waitForResponse((r) => isPut(id)(r.request()));
+    save.release();
+    expect((await first).ok()).toBe(true);
+    await expect(status).toContainText("Applied to camera", POLL);
+    await expect(page.locator("#cam-fps")).toHaveValue("5");
+    await expect(page.locator("#cam-name")).toHaveValue("e2e zones renamed");
+
+    // Saved since, over this editor's save: a rename, and a source this
+    // editor never touched.
+    const THEIR_URL = "rtsp://e2e:url-secret@127.0.0.1:9/theirs";
+    await saveElsewhere(page, id, { name: "Their name", url: THEIR_URL });
+    await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
+    receipt.set(applied(3));
+    const put = page.waitForRequest(isPut(id));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    const sent = await put;
+    expect(sent.postDataJSON()).toMatchObject({
+      name: "Their name",
+      url: THEIR_URL,
+      max_fps: 5,
+      onvif: ONVIF,
+      zones: [{ ...DOOR, name: "Gate" }],
+    });
+    expect((await sent.response())?.ok()).toBe(true);
+    const cams = await engine<Array<Record<string, unknown>>>(page, "GET", "/cameras");
+    expect(cams.find((c) => c.id === id)).toMatchObject({ name: "Their name", url: THEIR_URL, max_fps: 5 });
+    await expect(page.locator("#cam-name")).toHaveValue("Their name");
+    await expect(page.locator("#cam-url")).toHaveValue(THEIR_URL);
+    await expect(status).toContainText("Applied to camera", POLL);
+  });
+
+  test("an access reset after a save returns the editor to what was saved", async ({ page }) => {
+    cameraId = await createCamera(page, [DOOR]);
+    const id = cameraId;
+    const receipt = await controlReceipt(page, id);
+    receipt.set(applied(1));
+    await page.goto(`/cameras/${id}`);
+    const status = page.getByTestId("zone-application");
+    await expect(status).toContainText("Applied to camera");
+
+    await page.locator("#cam-name").fill("e2e zones renamed");
+    receipt.set(applied(2));
+    const saved = page.waitForResponse((r) => isPut(id)(r.request()));
+    await page.getByRole("button", { name: /^save$/i }).click();
+    expect((await saved).ok()).toBe(true);
+    await expect(status).toContainText("Applied to camera", POLL);
+    await page.locator("#cam-fps").fill("5");
+
+    // Another save makes the editor reload the saved zones, and that read
+    // is now refused: the access is gone, and the unsaved edit with it.
+    await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, (route) =>
+      route.fulfill({ status: 403, json: { error: "e2e: forbidden" } }),
+    );
+    receipt.set(applied(3));
+    await saveZonesElsewhere(page, id, [DOCK]);
+    await steadyRead(page);
+    await expect(status).toContainText("Cannot verify: no access to the saved zones", POLL);
+    await expect(page.locator("#cam-fps")).toHaveValue("0");
+    await expect(page.locator("#cam-name")).toHaveValue("e2e zones renamed");
+    await expect(zoneRow(page, "Door")).toBeVisible();
+  });
+
   /**
    * Park the editor's next save of camera `id` until `release`, then land
    * another operator's save of `zones` first: after the editor re-read the
@@ -1257,7 +1342,7 @@ test.describe("zone application", () => {
     await reread;
     await listed;
 
-    await expect(page.getByText(/^Not saved: this camera's saved zones could not be re-read/)).toBeVisible();
+    await expect(page.getByText(/^Not saved: this camera could not be re-read/)).toBeVisible();
     await page.waitForTimeout(1_000);
     expect(puts).toBe(0);
     await expect(page.getByRole("button", { name: /^save$/i })).toBeEnabled();
