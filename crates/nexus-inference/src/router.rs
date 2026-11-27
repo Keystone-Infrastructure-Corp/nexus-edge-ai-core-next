@@ -840,10 +840,19 @@ mod tests {
         );
     }
 
-    fn open_vocab_cam(id: i64, threshold: f32, size: u32) -> CameraConfig {
+    /// A packless kind whose detector emits the mock body's one 0.92 box.
+    /// Without `ort`, `open_vocab` is that body and also drops what is below
+    /// its build threshold; with `ort`, a packless real kind degrades to
+    /// `unavailable` and emits nothing, so only `mock` (no build threshold) can.
+    #[cfg(not(feature = "ort"))]
+    const EMITS: &str = "open_vocab";
+    #[cfg(feature = "ort")]
+    const EMITS: &str = "mock";
+
+    fn override_cam(id: i64, threshold: f32, size: u32) -> CameraConfig {
         let mut c = cam(id, None);
         c.detector.model_override = Some(ModelConfig {
-            kind: "open_vocab".into(),
+            kind: EMITS.into(),
             score_threshold: threshold,
             input_width: size,
             input_height: size,
@@ -879,8 +888,8 @@ mod tests {
     #[tokio::test]
     async fn shared_layer_applies_each_cameras_own_threshold_in_either_order() {
         let cfg = cfg_with_kind("mock");
-        let strict = open_vocab_cam(1, 0.95, 640);
-        let loose = open_vocab_cam(2, 0.50, 640);
+        let strict = override_cam(1, 0.95, 640);
+        let loose = override_cam(2, 0.50, 640);
         for cams in [
             vec![strict.clone(), loose.clone()],
             vec![loose.clone(), strict.clone()],
@@ -904,10 +913,10 @@ mod tests {
     /// its own threshold, lower or higher than `inference.model`'s.
     #[tokio::test]
     async fn override_on_the_default_layer_keeps_its_own_threshold() {
-        let mut cfg = cfg_with_kind("open_vocab");
+        let mut cfg = cfg_with_kind(EMITS);
         cfg.model.score_threshold = 0.95;
         let plain = cam(1, None);
-        let loose = open_vocab_cam(2, 0.50, 0);
+        let loose = override_cam(2, 0.50, 0);
         let mut loose = loose;
         if let Some(m) = loose.detector.model_override.as_mut() {
             m.input_width = cfg.model.input_width;
@@ -943,17 +952,17 @@ mod tests {
     #[tokio::test]
     async fn threshold_edited_after_boot_reports_requested_and_effective() {
         let cfg = cfg_with_kind("mock");
-        let boot = open_vocab_cam(1, 0.50, 640);
+        let boot = override_cam(1, 0.50, 640);
         let router = InferenceRouter::build(&cfg, std::slice::from_ref(&boot)).unwrap();
 
-        let raised = open_vocab_cam(1, 0.95, 640);
+        let raised = override_cam(1, 0.95, 640);
         assert_eq!(
             router.score_thresholds_for_camera(&raised),
             Some((0.95, 0.95))
         );
         assert_eq!(detection_count(&router, &raised).await, 0);
 
-        let lowered = open_vocab_cam(1, 0.20, 640);
+        let lowered = override_cam(1, 0.20, 640);
         assert_eq!(
             router.score_thresholds_for_camera(&lowered),
             Some((0.20, 0.50))
@@ -965,9 +974,9 @@ mod tests {
     /// lowered that layer's floor.
     #[tokio::test]
     async fn an_ensemble_override_that_fell_back_gets_the_default_threshold() {
-        let mut cfg = cfg_with_kind("open_vocab");
+        let mut cfg = cfg_with_kind(EMITS);
         cfg.model.score_threshold = 0.95;
-        let mut loose = open_vocab_cam(1, 0.50, cfg.model.input_width);
+        let mut loose = override_cam(1, 0.50, cfg.model.input_width);
         if let Some(m) = loose.detector.model_override.as_mut() {
             m.input_height = cfg.model.input_height;
         }
@@ -997,7 +1006,7 @@ mod tests {
             ..Default::default()
         }];
         let router = InferenceRouter::build(&cfg, &[]).unwrap();
-        let fallen = open_vocab_cam(1, 0.99, 640);
+        let fallen = override_cam(1, 0.99, 640);
         assert_eq!(router.score_thresholds_for_camera(&fallen), None);
         assert_eq!(detection_count(&router, &fallen).await, 1);
     }
@@ -1008,12 +1017,12 @@ mod tests {
     fn effective_threshold_covers_the_low_res_layer_floor() {
         let cfg = cfg_with_kind("mock");
         let with_low_res = |threshold| {
-            let mut c = open_vocab_cam(1, threshold, 640);
+            let mut c = override_cam(1, threshold, 640);
             c.behavior.detector_downscale_to_width = Some(320);
             c.behavior.detector_downscale_to_height = Some(320);
             c
         };
-        let cams = [with_low_res(0.50), open_vocab_cam(2, 0.20, 640)];
+        let cams = [with_low_res(0.50), override_cam(2, 0.20, 640)];
         let router = InferenceRouter::build(&cfg, &cams).unwrap();
         assert!(router.detector_for_camera_low_res(&cams[0]).is_some());
         assert_eq!(
@@ -1055,7 +1064,7 @@ mod tests {
     /// member keeps its own threshold whatever the shared detector emits.
     #[tokio::test]
     async fn ensemble_members_lower_the_shared_floor_and_keep_their_own_threshold() {
-        let mut cfg = cfg_with_kind("yolo");
+        let mut cfg = cfg_with_kind(EMITS);
         cfg.model.score_threshold = 0.50;
         let member = |kind: &str, threshold| ModelConfig {
             kind: kind.into(),
@@ -1067,7 +1076,7 @@ mod tests {
         let mut ens = cam(1, None);
         ens.detector.model_override = Some(ModelConfig {
             kind: "ensemble".into(),
-            members: vec![member("yolo", 0.20), member("mock", 0.95)],
+            members: vec![member(EMITS, 0.20), member("mock", 0.95)],
             ..Default::default()
         });
         let router = InferenceRouter::build(&cfg, std::slice::from_ref(&ens)).unwrap();
