@@ -98,7 +98,8 @@ pub struct EncoderPut {
 
 /// `PUT /v1/admin/cameras/{id}/encoder` — write one encoder config.
 /// The token must be one the camera lists and every changed value must
-/// fit *that* configuration's options; otherwise nothing is written.
+/// fit *that* configuration's options (on a codec switch: an offered codec,
+/// and every value by its options); otherwise nothing is written.
 /// Fields the request omits keep the camera's current values, except the
 /// old codec's GOP length and profile when the request changes `encoding`.
 pub async fn encoder_put(
@@ -239,7 +240,9 @@ fn merge(new: VideoEncoderConfig, current: &VideoEncoderConfig) -> VideoEncoderC
 
 /// Every field the write changes must fit the selected configuration's
 /// options. Unchanged fields are the camera's own values and are not
-/// re-judged; a range the camera does not report is left to the camera.
+/// re-judged, except on a codec switch: the new encoding must be one the
+/// configuration offers, and every value, inherited ones too, is judged by
+/// that codec's options. A range the camera does not report is left to it.
 fn check_write(
     new: &VideoEncoderConfig,
     current: &VideoEncoderConfig,
@@ -263,6 +266,18 @@ fn check_write(
             _ => Ok(()),
         }
     }
+    let blank = VideoEncoderConfig::default();
+    let current = if new.encoding != current.encoding {
+        if let Some(e) = &new.encoding {
+            if !options.encodings.iter().any(|c| c.eq_ignore_ascii_case(e)) {
+                return Err(format!("encoding {e} not offered for this configuration"));
+            }
+        }
+        // The old codec's values were never judged by this codec's options.
+        &blank
+    } else {
+        current
+    };
     int(
         "bitrate_limit",
         new.bitrate_limit,
@@ -821,6 +836,71 @@ mod tests {
         );
     }
 
+    /// A codec switch judges each value it carries over from the old codec
+    /// by the new codec's options; without a switch it is left to the camera.
+    #[test]
+    fn a_codec_switch_rejudges_every_inherited_value() {
+        use crate::discovery::onvif_encoder::FloatRange;
+        let opts = VideoEncoderOptions {
+            quality_range: Some(FloatRange { min: 1.0, max: 6.0 }),
+            encoding_interval_range: Some(IntRange { min: 1, max: 3 }),
+            encodings: vec!["H264".into(), "H265".into()],
+            ..sub_options()
+        };
+        let h264 = VideoEncoderConfig {
+            quality: Some(4.0),
+            encoding_interval: Some(1),
+            ..sub_config()
+        };
+        let h265 = |c: &VideoEncoderConfig| VideoEncoderConfig {
+            encoding: Some("H265".into()),
+            ..c.clone()
+        };
+        assert_eq!(check_write(&h265(&h264), &h264, &opts), Ok(()));
+        for (field, current) in [
+            (
+                "bitrate_limit",
+                VideoEncoderConfig {
+                    bitrate_limit: Some(8000),
+                    ..h264.clone()
+                },
+            ),
+            (
+                "resolution",
+                VideoEncoderConfig {
+                    width: Some(2592),
+                    height: Some(1520),
+                    ..h264.clone()
+                },
+            ),
+            (
+                "frame_rate_limit",
+                VideoEncoderConfig {
+                    frame_rate_limit: Some(30),
+                    ..h264.clone()
+                },
+            ),
+            (
+                "encoding_interval",
+                VideoEncoderConfig {
+                    encoding_interval: Some(9),
+                    ..h264.clone()
+                },
+            ),
+            (
+                "quality",
+                VideoEncoderConfig {
+                    quality: Some(9.0),
+                    ..h264.clone()
+                },
+            ),
+        ] {
+            let got = check_write(&h265(&current), &current, &opts);
+            assert!(got.as_ref().is_err_and(|e| e.starts_with(field)), "{got:?}");
+            assert_eq!(check_write(&current, &current, &opts), Ok(()), "{field}");
+        }
+    }
+
     /// An H264 and a JPEG configuration, as a mixed-codec camera lists them.
     const MIXED_CONFIGS: &str = concat!(
         r#"<trt:Configurations token="VE_sub"><tt:Name>sub</tt:Name><tt:Encoding>H264</tt:Encoding>"#,
@@ -1123,6 +1203,8 @@ mod tests {
                     "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options>",
                     "<tt:H264><tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>200</tt:Max></tt:GovLengthRange><tt:H264ProfilesSupported>High</tt:H264ProfilesSupported></tt:H264>",
                     "<tt:H265><tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>20</tt:Max></tt:GovLengthRange><tt:H265ProfilesSupported>Main</tt:H265ProfilesSupported></tt:H265>",
+                    "<tt:JPEG><tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable></tt:JPEG>",
+                    "<tt:MPEG4><tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable></tt:MPEG4>",
                     "</trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>",
                 ),
             ),
@@ -1190,5 +1272,119 @@ mod tests {
         }
         let body = written(&t, &srv, put("H264", None, None)).await.unwrap();
         assert!(body.contains("<tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>"), "{body}");
+    }
+
+    /// `VE_low` (512 kbps) and `VE_ok` (2048 kbps), both H264 1280x720 at
+    /// 15 fps, interval 1 and quality 4, on a camera offering H264 and H265
+    /// but no JPEG; H265's 1024 kbps bitrate floor sits between the two.
+    async fn switch_camera() -> (wiremock::MockServer, OnvifTarget) {
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let config = |token: &str, kbps: u32| {
+            format!(
+                r#"<trt:Configurations token="{token}"><tt:Name>{token}</tt:Name><tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution><tt:Quality>4</tt:Quality><tt:RateControl><tt:FrameRateLimit>15</tt:FrameRateLimit><tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>{kbps}</tt:BitrateLimit></tt:RateControl><tt:H264><tt:GovLength>30</tt:GovLength></tt:H264></trt:Configurations>"#
+            )
+        };
+        let codec = |name: &str| {
+            format!(
+                "<tt:{name}><tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable><tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>25</tt:Max></tt:FrameRateRange><tt:EncodingIntervalRange><tt:Min>1</tt:Min><tt:Max>3</tt:Max></tt:EncodingIntervalRange></tt:{name}>"
+            )
+        };
+        let srv = MockServer::start().await;
+        for (action, inner) in [
+            (
+                "GetVideoEncoderConfigurations",
+                format!(
+                    "<trt:GetVideoEncoderConfigurationsResponse>{}{}</trt:GetVideoEncoderConfigurationsResponse>",
+                    config("VE_low", 512),
+                    config("VE_ok", 2048)
+                ),
+            ),
+            (
+                "GetVideoEncoderConfigurationOptions",
+                format!(
+                    "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options><tt:QualityRange><tt:Min>1</tt:Min><tt:Max>6</tt:Max></tt:QualityRange>{}{}<tt:Extension><tt:H264><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>4096</tt:Max></tt:BitrateRange></tt:H264><tt:H265><tt:BitrateRange><tt:Min>1024</tt:Min><tt:Max>8192</tt:Max></tt:BitrateRange></tt:H265></tt:Extension></trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>",
+                    codec("H264"),
+                    codec("H265")
+                ),
+            ),
+            (
+                "SetVideoEncoderConfiguration",
+                "<trt:SetVideoEncoderConfigurationResponse/>".into(),
+            ),
+        ] {
+            Mock::given(body_string_contains(action))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body>{inner}</s:Body></s:Envelope>"#
+                )))
+                .mount(&srv)
+                .await;
+        }
+        let t = OnvifTarget {
+            endpoint: format!("{}/onvif/device_service", srv.uri()),
+            username: "admin".into(),
+            password: test_secret(),
+        };
+        (srv, t)
+    }
+
+    /// [`encoder_put`]'s preflight, then its write only when that passed.
+    async fn put(t: &OnvifTarget, req: VideoEncoderConfig) -> Result<(), StatusCode> {
+        let config = preflight(t, req, PUT_READ_BUDGET)
+            .await
+            .map_err(|ApiError(s, _)| s)?;
+        set_config(t, &config, false).await.unwrap();
+        Ok(())
+    }
+
+    /// The SetVideoEncoderConfiguration bodies `srv` received.
+    async fn sets(srv: &wiremock::MockServer) -> Vec<String> {
+        srv.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("SetVideoEncoderConfiguration"))
+            .collect()
+    }
+
+    /// A PUT switching H264 to H265 writes the camera's other values
+    /// unchanged, so each must fit H265's options: a bitrate under H265's
+    /// floor is a 400 with no write; a set that fits is written as is.
+    #[tokio::test]
+    async fn a_codec_switch_judges_the_inherited_values_by_the_new_codec() {
+        let (srv, t) = switch_camera().await;
+        let h265 = |token: &str| VideoEncoderConfig {
+            encoding: Some("H265".into()),
+            ..cfg(token)
+        };
+        assert_eq!(put(&t, h265("VE_low")).await, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(put(&t, h265("VE_ok")).await, Ok(()));
+        let sets = sets(&srv).await;
+        assert_eq!(sets.len(), 1, "only the valid switch is written: {sets:?}");
+        for field in [
+            r#"token="VE_ok""#,
+            "<tt:Encoding>H265</tt:Encoding>",
+            "<tt:Width>1280</tt:Width><tt:Height>720</tt:Height>",
+            "<tt:Quality>4</tt:Quality>",
+            "<tt:FrameRateLimit>15</tt:FrameRateLimit><tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>2048</tt:BitrateLimit>",
+        ] {
+            assert!(sets[0].contains(field), "{field} missing: {}", sets[0]);
+        }
+    }
+
+    /// An encoding the configuration does not offer, unknown (AV1) or a
+    /// known codec without an option block (JPEG), is a 400 with no write.
+    #[tokio::test]
+    async fn an_encoding_the_configuration_does_not_offer_is_refused_before_the_write() {
+        let (srv, t) = switch_camera().await;
+        for codec in ["AV1", "JPEG"] {
+            let req = VideoEncoderConfig {
+                encoding: Some(codec.into()),
+                ..cfg("VE_ok")
+            };
+            assert_eq!(put(&t, req).await, Err(StatusCode::BAD_REQUEST), "{codec}");
+        }
+        assert_eq!(sets(&srv).await, Vec::<String>::new());
     }
 }

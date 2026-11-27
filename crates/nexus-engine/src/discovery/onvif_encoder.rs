@@ -85,6 +85,10 @@ pub struct VideoEncoderOptions {
     pub encoding_interval_range: Option<IntRange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub profiles_supported: Vec<String>,
+    /// Every codec with an option block, whichever `encoding` was asked:
+    /// the PUT's preflight only, so the GET's `options` shape is unchanged.
+    #[serde(skip)]
+    pub encodings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -395,6 +399,9 @@ fn parse_options(body: &str, encoding: Option<&str>) -> VideoEncoderOptions {
                     res_w = None;
                     res_h = None;
                 }
+                if CODEC_SECTIONS.contains(&n.as_str()) && !out.encodings.contains(&n) {
+                    out.encodings.push(n.clone());
+                }
                 stack.push(n.clone());
                 capture = Some(n);
                 acc.clear();
@@ -583,6 +590,7 @@ mod tests {
             })
         );
         assert_eq!(o.profiles_supported, vec!["Baseline", "High"]);
+        assert_eq!(o.encodings, vec!["H264"], "one entry per codec");
     }
 
     /// A mixed-codec answer keeps only the asked codec's ranges and
@@ -620,6 +628,7 @@ mod tests {
                 bitrate_range: Some(IntRange { min: 32, max: 4096 }),
                 profiles_supported: vec!["Main".into()],
                 encoding_interval_range: None,
+                encodings: vec!["JPEG".into(), "H264".into()],
             }
         );
         let jpeg = parse_options(&body, Some("JPEG"));
@@ -633,6 +642,7 @@ mod tests {
                     min: 32,
                     max: 16384
                 }),
+                encodings: vec!["JPEG".into(), "H264".into()],
                 ..VideoEncoderOptions::default()
             }
         );
