@@ -24,6 +24,7 @@
 //!   forward jump while running deletes no history.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
@@ -59,6 +60,15 @@ const WINDOW_SECONDS: [i64; 2] = [60 * 60, 24 * 60 * 60];
 pub(crate) struct DeliveryState {
     clock: Mutex<DeliveryClock>,
     transfers: Mutex<Transfers>,
+    /// Test seam: the stats read signals the sender and waits on the
+    /// receiver just before it opens its read transaction.
+    #[cfg(test)]
+    test_before_pin: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 /// Clip ids an uploader is transferring now, per queue; `None` until that
@@ -83,6 +93,19 @@ impl DeliveryState {
         self.transfers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    #[cfg(test)]
+    async fn test_pause_before_pin(&self) {
+        let seam = self
+            .test_before_pin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((reached, resume)) = seam {
+            let _ = reached.send(());
+            let _ = resume.await;
+        }
     }
 }
 
@@ -111,9 +134,9 @@ struct DeliveryClock {
     first: Option<(DateTime<Utc>, Instant)>,
     /// At the previous one.
     last: Option<(DateTime<Utc>, Instant)>,
-    /// The latest accounting restart detected in this process, re-applied
-    /// by every check: the transaction that first wrote it may roll back
-    /// (a no-op once it committed).
+    /// The latest accounting restart detected in this process or kept on
+    /// disk by an earlier one, re-applied by every check: the transaction
+    /// that first wrote it may roll back (a no-op once it committed).
     restart: Option<DateTime<Utc>>,
     /// Test seam: the wall clock read instead of `Utc::now()`.
     #[cfg(test)]
@@ -124,14 +147,31 @@ impl DeliveryState {
     /// Read the clocks: the wall time, whether it moved more than
     /// [`CLOCK_TOLERANCE_SECS`] apart from monotonic time since the
     /// previous reading, and the latest wall time monotonic time vouches
-    /// for since the first reading (the prune horizon).
-    fn observe_clock(&self) -> (DateTime<Utc>, bool, DateTime<Utc>) {
+    /// for since the first reading (the prune horizon). The first reading
+    /// also takes up a restart an earlier process kept in `gap_file`.
+    fn observe_clock(
+        &self,
+        gap_file: impl FnOnce() -> Option<PathBuf>,
+    ) -> (DateTime<Utc>, bool, DateTime<Utc>) {
         let mut c = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
         #[cfg(test)]
         let wall = c.test_wall.unwrap_or_else(Utc::now);
         #[cfg(not(test))]
         let wall = Utc::now();
         let mono = Instant::now();
+        if c.first.is_none() {
+            // A file there but unreadable (a torn write) is a gap at an
+            // unknown time: restart from now.
+            let kept = gap_file().and_then(|f| match std::fs::read_to_string(f) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                r => Some(
+                    r.ok()
+                        .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
+                        .map_or(wall, |t| t.with_timezone(&Utc)),
+                ),
+            });
+            c.restart = c.restart.max(kept);
+        }
         let advanced = |(w, m): (DateTime<Utc>, Instant)| {
             w + Duration::from_std(mono.duration_since(m)).unwrap_or(Duration::zero())
         };
@@ -151,6 +191,16 @@ impl DeliveryState {
         let mut c = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
         c.restart = c.restart.max(detected);
         c.restart
+    }
+
+    /// Write the pending restart to `file` for the next process. Under the
+    /// clock lock, so a concurrent gap cannot replace a later restart with
+    /// an earlier one.
+    fn keep_restart(&self, file: &Path) -> std::io::Result<()> {
+        let c = self.clock.lock().unwrap_or_else(PoisonError::into_inner);
+        c.restart.map_or(Ok(()), |r| {
+            std::fs::write(file, r.to_rfc3339_opts(SecondsFormat::Millis, true))
+        })
     }
 }
 
@@ -531,7 +581,7 @@ impl Store {
     /// restart, so a write that detects it and rolls back cannot consume
     /// it. Returns the prune horizon.
     async fn check_clock(&self, conn: &mut SqliteConnection) -> Result<DateTime<Utc>, StoreError> {
-        let (wall, jumped, horizon) = self.delivery.observe_clock();
+        let (wall, jumped, horizon) = self.delivery.observe_clock(|| self.gap_file());
         let newest: Option<i64> =
             sqlx::query_scalar("SELECT MAX(minute_utc) FROM recording_minute_buckets")
                 .fetch_one(&mut *conn)
@@ -559,14 +609,32 @@ impl Store {
         Ok(horizon)
     }
 
+    /// Beside the database: the pending restart, kept for the next process
+    /// in case this one stops before it commits. Never removed, since
+    /// re-applying a committed restart is a no-op. `None` in memory.
+    fn gap_file(&self) -> Option<PathBuf> {
+        let opts = self.pool.connect_options();
+        let db = opts.get_filename();
+        (db != Path::new(":memory:")).then(|| {
+            let mut f = db.as_os_str().to_owned();
+            f.push("-accounting-gap");
+            f.into()
+        })
+    }
+
     /// SPEC-090 — an accounting write failed at `at`: the counters now
     /// understate what happened, so treat it as a discontinuity. The gap is
-    /// kept pending (as a detected clock jump is) and applied now if the
-    /// store allows; every later check re-applies it until it commits.
-    // shortcut: the pending gap lives in memory, so a process restart before
-    // it commits forgets it; persist it if accounting writes fail that long.
+    /// kept pending (as a detected clock jump is), written to
+    /// [`Self::gap_file`] first, since SQLite may be what is failing, and
+    /// applied now if the store allows; every later check, in this process
+    /// or the next, re-applies it until it commits.
     pub async fn record_accounting_gap(&self, at: DateTime<Utc>) {
         self.delivery.pending_restart(Some(at));
+        if let Some(f) = self.gap_file() {
+            if let Err(e) = self.delivery.keep_restart(&f) {
+                tracing::error!(error = %e, file = %f.display(), "recording delivery: accounting gap not kept on disk");
+            }
+        }
         let applied = async {
             let mut conn = self.pool.acquire().await?;
             self.check_clock(&mut conn).await
@@ -716,19 +784,22 @@ impl Store {
         // A jump with no write since must not leave its windows complete;
         // checked outside the read transaction, which then never writes.
         self.check_clock(&mut *self.pool.acquire().await?).await?;
-        // Read before the snapshot: a transfer that completes in between is
-        // no longer queued there, so the marked rows stay a subset.
-        let (ordinary_ids, alert_ids) = {
-            let t = self.delivery.transfers();
-            (t.ordinary.clone(), t.alert.clone())
-        };
+        #[cfg(test)]
+        self.delivery.test_pause_before_pin().await;
         let mut tx = self.pool.begin().await?;
         let since: String = sqlx::query_scalar(
             "SELECT accounting_since FROM recording_delivery_baseline WHERE id = 1",
         )
         .fetch_one(&mut *tx)
         .await?;
-        // WAL pins the read snapshot at the first read, just above.
+        // WAL pins the read snapshot at the first read, just above. Read the
+        // transfers after it: a transfer's guard drops before its failure
+        // commits, so one the snapshot shows failed is never marked, and
+        // the query keeps the marked rows a subset of the snapshot's queue.
+        let (ordinary_ids, alert_ids) = {
+            let t = self.delivery.transfers();
+            (t.ordinary.clone(), t.alert.clone())
+        };
         let now = clock();
         let accounting_since = crate::motion::parse_ts(&since)?;
         let ordinary = queue_totals(
@@ -1124,17 +1195,9 @@ mod tests {
         assert_eq!(since.timestamp_millis(), jumped.timestamp_millis());
     }
 
-    /// A transient write failure on an attempt counter, then a delivery:
-    /// the windows overlapping the failure read incomplete (never complete
-    /// with attempted 0 / delivered 1000), and a gap whose own write also
-    /// fails stays pending until the store recovers.
-    #[tokio::test]
-    async fn recording_delivery_failed_accounting_write_marks_windows_incomplete() {
-        let dir = tempfile::tempdir().unwrap();
-        let t0 = Utc::now();
-        let store = store_since(dir.path(), t0 - Duration::hours(2)).await;
-        set_wall(&store, t0);
-        let clip = closed(&store, t0 - Duration::minutes(30), 1_000).await;
+    /// Make every bucket insert and baseline update fail, as if SQLite
+    /// were unavailable for writes.
+    async fn fail_accounting_writes(store: &Store) {
         for t in ["recording_minute_buckets", "recording_delivery_baseline"] {
             sqlx::query(&format!(
                 "CREATE TRIGGER fail_{t} BEFORE {} ON {t}
@@ -1149,6 +1212,28 @@ mod tests {
             .await
             .unwrap();
         }
+    }
+
+    fn cold_mark(at: DateTime<Utc>) -> crate::ClipColdMark {
+        crate::ClipColdMark {
+            cold_handle: "local".into(),
+            cold_path: "p".into(),
+            cold_uploaded_at: at,
+        }
+    }
+
+    /// A transient write failure on an attempt counter, then a delivery:
+    /// the windows overlapping the failure read incomplete (never complete
+    /// with attempted 0 / delivered 1000), and a gap whose own write also
+    /// fails stays pending until the store recovers.
+    #[tokio::test]
+    async fn recording_delivery_failed_accounting_write_marks_windows_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let store = store_since(dir.path(), t0 - Duration::hours(2)).await;
+        set_wall(&store, t0);
+        let clip = closed(&store, t0 - Duration::minutes(30), 1_000).await;
+        fail_accounting_writes(&store).await;
         store
             .record_upload_attempt(RecordingSource::Ordinary, clip, t0, 1_000)
             .await
@@ -1162,15 +1247,7 @@ mod tests {
             .unwrap();
         set_wall(&store, failed_at);
         store
-            .mark_cold_uploaded(
-                clip,
-                &crate::ClipColdMark {
-                    cold_handle: "local".into(),
-                    cold_path: "p".into(),
-                    cold_uploaded_at: failed_at,
-                },
-                Some(1_000),
-            )
+            .mark_cold_uploaded(clip, &cold_mark(failed_at), Some(1_000))
             .await
             .unwrap_err();
         sqlx::query("DROP TRIGGER fail_recording_delivery_baseline")
@@ -1178,15 +1255,7 @@ mod tests {
             .await
             .unwrap();
         store
-            .mark_cold_uploaded(
-                clip,
-                &crate::ClipColdMark {
-                    cold_handle: "local".into(),
-                    cold_path: "p".into(),
-                    cold_uploaded_at: failed_at,
-                },
-                Some(1_000),
-            )
+            .mark_cold_uploaded(clip, &cold_mark(failed_at), Some(1_000))
             .await
             .unwrap();
         let snap = store
@@ -1205,6 +1274,117 @@ mod tests {
         assert_eq!(
             snap.accounting_since.timestamp_millis(),
             failed_at.timestamp_millis()
+        );
+    }
+
+    /// The gap's own write fails too and the engine restarts before the
+    /// store recovers: the next process still applies the gap, so the
+    /// delivery it then counts (attempt never counted) sits in no
+    /// complete window.
+    #[tokio::test]
+    async fn recording_delivery_accounting_gap_survives_a_restart_before_it_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let store = store_since(dir.path(), t0 - Duration::hours(2)).await;
+        set_wall(&store, t0);
+        let clip = closed(&store, t0 - Duration::minutes(30), 1_000).await;
+        fail_accounting_writes(&store).await;
+        store
+            .record_upload_attempt(RecordingSource::Ordinary, clip, t0, 1_000)
+            .await
+            .unwrap_err();
+        let failed_at = t0 + Duration::seconds(5);
+        store.record_accounting_gap(failed_at).await;
+        store.pool.close().await;
+
+        let store = open(dir.path()).await;
+        set_wall(&store, failed_at + Duration::minutes(1));
+        for t in ["recording_minute_buckets", "recording_delivery_baseline"] {
+            sqlx::query(&format!("DROP TRIGGER fail_{t}"))
+                .execute(&store.pool)
+                .await
+                .unwrap();
+        }
+        store
+            .mark_cold_uploaded(clip, &cold_mark(failed_at), Some(1_000))
+            .await
+            .unwrap();
+        let snap = store
+            .recording_delivery_stats(|| failed_at + Duration::minutes(2), None)
+            .await
+            .unwrap();
+        assert_eq!(snap.windows[0].core.ordinary.delivered_bytes, 1_000);
+        assert_eq!(snap.windows[0].core.ordinary.attempted_bytes, 0);
+        for w in &snap.windows {
+            assert!(
+                !w.complete,
+                "the {} s window overlaps the gap",
+                w.window_seconds
+            );
+        }
+        assert_eq!(
+            snap.accounting_since.timestamp_millis(),
+            failed_at.timestamp_millis()
+        );
+    }
+
+    /// A torn gap file is a gap at an unknown time: the process that finds
+    /// it restarts accounting at its first reading.
+    #[tokio::test]
+    async fn recording_delivery_unreadable_gap_file_restarts_accounting_now() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let store = store_since(dir.path(), t0).await;
+        std::fs::write(store.gap_file().unwrap(), "").unwrap();
+        set_wall(&store, t0);
+        let snap = store
+            .recording_delivery_stats(|| t0 + Duration::minutes(2), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            snap.accounting_since.timestamp_millis(),
+            t0.timestamp_millis()
+        );
+        assert!(snap.windows.iter().all(|w| !w.complete));
+    }
+
+    /// An upload fails between the stats read starting and its snapshot
+    /// being pinned. As in the replicator, the transfer guard drops when
+    /// the upload returns and the failure (backoff) commits after it, both
+    /// before the pin: the clip is in backoff and, with no transfer left,
+    /// not in flight.
+    #[tokio::test]
+    async fn recording_delivery_transfer_failed_before_the_snapshot_is_not_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let store = store_since(dir.path(), t0).await;
+        set_wall(&store, t0);
+        let clip = closed(&store, t0 - Duration::minutes(30), 1_000).await;
+        store.track_transfers(RecordingSource::Ordinary);
+        let transfer = store.begin_transfer(RecordingSource::Ordinary, clip);
+        let (reached, at_seam) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        *store.delivery.test_before_pin.lock().unwrap() = Some((reached, resumed));
+        let stats = tokio::spawn({
+            let store = store.clone();
+            async move { store.recording_delivery_stats(move || t0, None).await }
+        });
+
+        at_seam.await.unwrap();
+        drop(transfer);
+        store
+            .record_cold_upload_failure(clip, t0, "boom", Some(t0 + Duration::hours(1)), false)
+            .await
+            .unwrap();
+        resume.send(()).unwrap();
+
+        let snap = stats.await.unwrap().unwrap();
+        assert_eq!(snap.ordinary.backoff.count, 1);
+        assert_eq!(snap.ordinary.ready.count, 0);
+        assert_eq!(
+            snap.ordinary.in_flight.unwrap().count,
+            0,
+            "the failed clip is not also in flight"
         );
     }
 }
