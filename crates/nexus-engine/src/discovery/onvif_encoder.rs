@@ -185,8 +185,9 @@ fn set_config_body(c: &VideoEncoderConfig, force_persistence: bool) -> String {
         .use_count
         .map(|u| format!("<tt:UseCount>{u}</tt:UseCount>"))
         .unwrap_or_default();
-    let encoding = c
-        .encoding
+    // ONVIF encodings are upper-case (`H264`, `JPEG`, …), whatever case was asked.
+    let enc = c.encoding.as_deref().map(str::to_ascii_uppercase);
+    let encoding = enc
         .as_ref()
         .map(|e| format!("<tt:Encoding>{}</tt:Encoding>", xml_escape(e)))
         .unwrap_or_default();
@@ -221,7 +222,7 @@ fn set_config_body(c: &VideoEncoderConfig, force_persistence: bool) -> String {
     };
     // Codec-specific block of the encoding written (JPEG has none); an
     // unreported encoding keeps the H264 default.
-    let block = match c.encoding.as_deref() {
+    let block = match enc.as_deref() {
         Some("H264") | None => Some(("H264", "H264Profile")),
         Some("H265") => Some(("H265", "H265Profile")),
         Some("MPEG4") => Some(("MPEG4", "Mpeg4Profile")),

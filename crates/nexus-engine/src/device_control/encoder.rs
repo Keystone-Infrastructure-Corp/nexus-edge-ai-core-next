@@ -197,7 +197,7 @@ async fn check_selected(
         .ok_or_else(unknown_token)?;
     // A codec switch drops the old codec's GOP length and profile: only the
     // request's own are written, and they are judged as changes.
-    if new.encoding.is_some() && new.encoding != current.encoding {
+    if new.encoding.is_some() && !same_codec(&new, &current) {
         current.gov_length = None;
         current.profile = None;
     }
@@ -215,6 +215,15 @@ async fn check_selected(
     .map_err(enc_err)?;
     check_write(&merged, &current, &options).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     Ok(merged)
+}
+
+/// Whether `a` and `b` carry the same encoding: ONVIF's are `H264`,
+/// `JPEG`, …, so letter case is not significant.
+fn same_codec(a: &VideoEncoderConfig, b: &VideoEncoderConfig) -> bool {
+    match (&a.encoding, &b.encoding) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        (x, y) => x == y,
+    }
 }
 
 /// `new`'s set fields over the camera's `current` values. The write sends
@@ -267,7 +276,7 @@ fn check_write(
         }
     }
     let blank = VideoEncoderConfig::default();
-    let current = if new.encoding != current.encoding {
+    let current = if !same_codec(new, current) {
         if let Some(e) = &new.encoding {
             if !options.encodings.iter().any(|c| c.eq_ignore_ascii_case(e)) {
                 return Err(format!("encoding {e} not offered for this configuration"));
@@ -898,6 +907,12 @@ mod tests {
             let got = check_write(&h265(&current), &current, &opts);
             assert!(got.as_ref().is_err_and(|e| e.starts_with(field)), "{got:?}");
             assert_eq!(check_write(&current, &current, &opts), Ok(()), "{field}");
+            // The camera's own codec in another letter case is no switch.
+            let lower = VideoEncoderConfig {
+                encoding: Some("h264".into()),
+                ..current.clone()
+            };
+            assert_eq!(check_write(&lower, &current, &opts), Ok(()), "{field}");
         }
     }
 
@@ -1181,7 +1196,8 @@ mod tests {
 
     /// A PUT that switches the encoding writes no GOP length or profile
     /// left over from the old codec, judges the ones it sends by the new
-    /// codec's options, and an unchanged encoding keeps the camera's.
+    /// codec's options, and an unchanged encoding, in any letter case,
+    /// keeps the camera's.
     #[tokio::test]
     async fn an_encoding_switch_drops_the_old_codecs_gop_length_and_profile() {
         use wiremock::matchers::body_string_contains;
@@ -1272,6 +1288,18 @@ mod tests {
         }
         let body = written(&t, &srv, put("H264", None, None)).await.unwrap();
         assert!(body.contains("<tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>"), "{body}");
+        // An encoding matches in any letter case and is written upper-case.
+        let body = written(&t, &srv, put("h264", None, None)).await.unwrap();
+        assert!(body.contains("<tt:Encoding>H264</tt:Encoding>"), "{body}");
+        assert!(body.contains("<tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>"), "{body}");
+        let body = written(&t, &srv, put("h265", None, None)).await.unwrap();
+        assert!(body.contains("<tt:Encoding>H265</tt:Encoding>"), "{body}");
+        assert!(!body.contains("GovLength"), "{body}");
+        let body = written(&t, &srv, put("h265", Some(15), Some("Main")))
+            .await
+            .unwrap();
+        assert!(body.contains("<tt:Encoding>H265</tt:Encoding>"), "{body}");
+        assert!(body.contains("<tt:H265><tt:GovLength>15</tt:GovLength><tt:H265Profile>Main</tt:H265Profile></tt:H265>"), "{body}");
     }
 
     /// `VE_low` (512 kbps) and `VE_ok` (2048 kbps), both H264 1280x720 at
