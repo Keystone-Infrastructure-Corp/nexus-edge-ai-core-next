@@ -1103,5 +1103,14 @@ mod tests {
         };
         build_with_context(&cfg, &ctx).unwrap();
         assert_eq!(*asked.lock(), vec!["mock".to_string()]);
+
+        // The pool backend builds in this process too (thread workers and
+        // the fail-soft fallback), so it asks as well.
+        asked.lock().clear();
+        cfg.backend = nexus_config::InferenceBackendKind::Pool;
+        cfg.pool_worker_kind = nexus_config::PoolWorkerKind::Thread;
+        cfg.workers = 1;
+        build_with_context(&cfg, &ctx).unwrap();
+        assert!(!asked.lock().is_empty());
     }
 }

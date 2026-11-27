@@ -178,11 +178,18 @@ pub struct InferenceLayer {
 
 /// Build the inference layer per config.
 pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
+    build_layer(cfg, &BuildContext::default())
+}
+
+fn build_layer(
+    cfg: &InferenceConfig,
+    ctx: &BuildContext,
+) -> Result<InferenceLayer, InferenceError> {
     match cfg.backend {
         InferenceBackendKind::InProcess => {
             info!(model = %cfg.model.kind, "building in-process detector");
             Ok(InferenceLayer {
-                detector: build_detector(cfg)?,
+                detector: build_detector_with_context(cfg, ctx)?,
                 pool: None,
             })
         }
@@ -198,7 +205,7 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
             for slot in 0..n {
                 let backend: Arc<dyn DetectorBackend> = match cfg.pool_worker_kind {
                     PoolWorkerKind::Thread => {
-                        let det = build_detector(cfg)?;
+                        let det = build_detector_with_context(cfg, ctx)?;
                         Arc::new(ThreadIsolatedBackend::start(slot as i32, det, cfg)?)
                     }
                     PoolWorkerKind::Process => {
@@ -210,7 +217,7 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
                 backends.push(backend);
             }
             let fallback = if cfg.fail_soft {
-                let det = build_detector(&fail_soft_cfg(cfg))?;
+                let det = build_detector_with_context(&fail_soft_cfg(cfg), ctx)?;
                 Some(Arc::new(InProcessBackend::new(-1, det)) as Arc<dyn DetectorBackend>)
             } else {
                 None
@@ -222,10 +229,6 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
             })
         }
     }
-}
-
-fn build_detector(cfg: &InferenceConfig) -> Result<Arc<dyn Detector>, InferenceError> {
-    build_detector_with_context(cfg, &BuildContext::default())
 }
 
 /// Config for the pool's fail-soft fallback.
@@ -284,8 +287,16 @@ pub fn build_with_context(
             // not yet implemented — fall back to the plain `build` path.
             // The router will warn if a camera asked for yoloe_visual on
             // a pool backend; for now the default in-process path is the
-            // expected production shape.
-            build(cfg)
+            // expected production shape. The shared score floor still
+            // applies: thread workers and the fail-soft fallback build in
+            // this process. (A process worker builds one layer alone.)
+            build_layer(
+                cfg,
+                &BuildContext {
+                    score_floor: ctx.score_floor.clone(),
+                    ..Default::default()
+                },
+            )
         }
     }
 }
