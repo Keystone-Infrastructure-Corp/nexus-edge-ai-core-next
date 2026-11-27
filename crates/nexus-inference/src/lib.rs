@@ -331,6 +331,22 @@ fn build_detector_with_context(
     Ok(inner)
 }
 
+/// Threshold to build an ensemble member's detector at: the lowest of its
+/// own, its siblings' on the same model (they share one cached detector on
+/// Hailo, in a process worker too), and the router's shared floor.
+fn member_build_threshold(
+    members: &[nexus_config::ModelConfig],
+    member: &nexus_config::ModelConfig,
+    ctx: &BuildContext,
+) -> f32 {
+    members
+        .iter()
+        .filter(|m| router::same_floor(m, member))
+        .map(|m| m.score_threshold)
+        .chain(ctx.score_floor.as_ref().map(|floor| floor(member)))
+        .fold(member.score_threshold, f32::min)
+}
+
 fn build_detector_kind(
     cfg: &InferenceConfig,
     _ctx: &BuildContext,
@@ -486,10 +502,8 @@ fn build_detector_kind(
                 // Built at the shared floor, so a standalone layer that
                 // reuses this detector (Hailo caches per HEF) is not capped
                 // at the member's threshold, whichever is built first.
-                if let Some(floor) = &_ctx.score_floor {
-                    derived.model.score_threshold =
-                        floor(member_cfg).min(member_cfg.score_threshold);
-                }
+                derived.model.score_threshold =
+                    member_build_threshold(&cfg.model.members, member_cfg, _ctx);
                 match build_detector_with_context(&derived, _ctx) {
                     // Re-apply the member's own threshold on top.
                     Ok(det) => members.push(Arc::new(caps::MinScoreDetector::new(

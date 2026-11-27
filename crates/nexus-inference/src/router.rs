@@ -84,6 +84,11 @@ impl LayerKey {
     }
 }
 
+/// Whether two models share one threshold floor (one detector on Hailo).
+pub(crate) fn same_floor(a: &ModelConfig, b: &ModelConfig) -> bool {
+    LayerKey::from_model(a).floor_key() == LayerKey::from_model(b).floor_key()
+}
+
 pub struct InferenceRouter {
     /// Default identity — used by every camera that doesn't override.
     default_key: LayerKey,
@@ -1112,5 +1117,27 @@ mod tests {
         cfg.workers = 1;
         build_with_context(&cfg, &ctx).unwrap();
         assert!(!asked.lock().is_empty());
+    }
+
+    /// Two members of one ensemble on the same model are built at the
+    /// lower of their thresholds, with no router context (a process
+    /// worker has none); a different model is left alone.
+    #[test]
+    fn sibling_ensemble_members_on_one_model_build_at_the_lower_threshold() {
+        let m = |kind: &str, threshold| ModelConfig {
+            kind: kind.into(),
+            score_threshold: threshold,
+            ..Default::default()
+        };
+        let members = [m("yolo", 0.50), m("yolo26n", 0.20), m("mock", 0.90)];
+        let ctx = BuildContext::default();
+        assert_eq!(
+            crate::member_build_threshold(&members, &members[0], &ctx),
+            0.20
+        );
+        assert_eq!(
+            crate::member_build_threshold(&members, &members[2], &ctx),
+            0.90
+        );
     }
 }
