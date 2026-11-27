@@ -467,7 +467,13 @@ fn build_detector_kind(
                 }
                 let derived = router::derive_inference_cfg(cfg, member_cfg);
                 match build_detector_with_context(&derived, _ctx) {
-                    Ok(det) => members.push(det),
+                    // Re-apply the member's own threshold: on Hailo the
+                    // detector is cached per HEF and may have been built
+                    // lower for a standalone camera on the same model.
+                    Ok(det) => members.push(Arc::new(caps::MinScoreDetector::new(
+                        det,
+                        member_cfg.score_threshold,
+                    ))),
                     Err(e) => warn!(
                         member_kind = %member_cfg.kind,
                         "ensemble member build failed; skipped: {e}"

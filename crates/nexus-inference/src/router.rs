@@ -136,26 +136,44 @@ impl InferenceRouter {
         // lost its candidates inside the detector, by camera order.
         let mut floors: BTreeMap<LayerKey, f32> = BTreeMap::new();
         floors.insert(default_key.floor_key(), default_cfg.model.score_threshold);
+        let mut lower = |key: LayerKey, threshold: f32| {
+            floors
+                .entry(key.floor_key())
+                .and_modify(|f| *f = f.min(threshold))
+                .or_insert(threshold);
+        };
         for cam in cameras {
             let base = cam.detector.model_override.as_ref();
-            let mut keys: Vec<LayerKey> = base.map(LayerKey::from_model).into_iter().collect();
+            let threshold = base.map_or(default_cfg.model.score_threshold, |m| m.score_threshold);
+            if let Some(m) = base {
+                lower(LayerKey::from_model(m), threshold);
+            }
             if let (Some(dw), Some(dh)) = (
                 cam.behavior.detector_downscale_to_width,
                 cam.behavior.detector_downscale_to_height,
             ) {
-                keys.push(LayerKey {
-                    kind: base.map_or(&default_cfg.model.kind, |m| &m.kind).clone(),
-                    input_w: dw,
-                    input_h: dh,
-                });
+                lower(
+                    LayerKey {
+                        kind: base.map_or(&default_cfg.model.kind, |m| &m.kind).clone(),
+                        input_w: dw,
+                        input_h: dh,
+                    },
+                    threshold,
+                );
             }
-            let threshold = base.map_or(default_cfg.model.score_threshold, |m| m.score_threshold);
-            for key in keys {
-                floors
-                    .entry(key.floor_key())
-                    .and_modify(|f| *f = f.min(threshold))
-                    .or_insert(threshold);
-            }
+        }
+        // An ensemble member shares a standalone layer's detector on Hailo
+        // (cached per HEF), so its threshold lowers that layer's floor too.
+        // shortcut: an ensemble built before a standalone layer still caches
+        // its member at the member's threshold; build members at the floor
+        // if a standalone camera ever needs less than a member on Hailo.
+        let models = std::iter::once(&default_cfg.model).chain(
+            cameras
+                .iter()
+                .filter_map(|c| c.detector.model_override.as_ref()),
+        );
+        for member in models.flat_map(|m| &m.members) {
+            lower(LayerKey::from_model(member), member.score_threshold);
         }
         let with_floor = |mut cfg: InferenceConfig, key: &LayerKey| {
             if let Some(floor) = floors.get(&key.floor_key()) {
@@ -1017,5 +1035,39 @@ mod tests {
             router.score_thresholds_for_camera(&cam(2, None)),
             Some((0.50, 0.50))
         );
+    }
+
+    /// An ensemble member's threshold lowers the floor of the standalone
+    /// layer for the same model (one cached detector on Hailo), and the
+    /// member keeps its own threshold whatever the shared detector emits.
+    #[tokio::test]
+    async fn ensemble_members_lower_the_shared_floor_and_keep_their_own_threshold() {
+        let mut cfg = cfg_with_kind("yolo");
+        cfg.model.score_threshold = 0.50;
+        let member = |kind: &str, threshold| ModelConfig {
+            kind: kind.into(),
+            score_threshold: threshold,
+            input_width: cfg.model.input_width,
+            input_height: cfg.model.input_height,
+            ..Default::default()
+        };
+        let mut ens = cam(1, None);
+        ens.detector.model_override = Some(ModelConfig {
+            kind: "ensemble".into(),
+            members: vec![member("yolo", 0.20), member("mock", 0.95)],
+            ..Default::default()
+        });
+        let router = InferenceRouter::build(&cfg, std::slice::from_ref(&ens)).unwrap();
+        assert_eq!(
+            router.floors.get(&LayerKey::from_model(&cfg.model)),
+            Some(&0.20)
+        );
+        assert_eq!(
+            router.score_thresholds_for_camera(&cam(2, None)),
+            Some((0.50, 0.50))
+        );
+        // Both members emit one 0.92 box: the 0.20 member's passes, the
+        // 0.95 member's is filtered at its own threshold.
+        assert_eq!(detection_count(&router, &ens).await, 1);
     }
 }
