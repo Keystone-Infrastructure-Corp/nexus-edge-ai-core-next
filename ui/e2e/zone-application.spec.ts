@@ -1179,11 +1179,19 @@ test.describe("zone application", () => {
     await page.getByRole("button", { name: /^save$/i }).click();
     await listed;
     const body = (await put).postDataJSON() as Record<string, unknown>;
+    // The read before the save ended before the list was read: this is the one after it.
+    const reread = page.waitForResponse((r) => isSnapshot(id)(r.request()));
 
     expect(body.zones).toEqual([DOCK]);
     expect(body.name).toBe("e2e zones renamed");
+    // Denied again after the save is no new denial: nothing resets the editor
+    // to the camera as opened. A reset lands within milliseconds of the read.
+    await reread;
+    await page.waitForTimeout(1_000);
+    await expect(status).toContainText("Cannot verify: no access to the saved zones");
     await expect(zoneRow(page, "Loading dock")).toBeVisible();
     await expect(zoneRow(page, "Door")).toHaveCount(0);
+    await expect(page.locator("#cam-name")).toHaveValue("e2e zones renamed");
     // The snapshot is routed away: the camera list says what is saved.
     const cams = await engine<Array<{ id: number; zones: Zone[] }>>(page, "GET", "/cameras");
     expect(cams.find((c) => c.id === id)?.zones).toEqual([DOCK]);

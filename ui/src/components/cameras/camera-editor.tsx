@@ -591,7 +591,12 @@ export function CameraEditor({
   // a role change reads the saved zones again as the new role.
   const user = useSession()?.user;
   const authority = user ? `${user.id}:${user.role}` : "";
-  const denied = [snapQ.error, statsQ.error].some(isDenied);
+  // A re-read of a query never answered clears its error until it settles:
+  // that is no access regained, so a denial holds through it.
+  const readDenied = [snapQ.error, statsQ.error].some(isDenied);
+  const [denied, setDenied] = useState(readDenied);
+  const rereading = snapQ.fetchStatus !== "idle" || statsQ.fetchStatus !== "idle";
+  if (readDenied !== denied && !(denied && rereading)) setDenied(readDenied);
   const heldAs = useRef({ authority, denied });
   useEffect(() => {
     const was = heldAs.current;
