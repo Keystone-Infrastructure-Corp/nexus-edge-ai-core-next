@@ -12,13 +12,13 @@ Then read the shared core at `../nexus-home/.agents/skills/implement-loop-core/S
 `$NEXUS_HOME/.agents/skills/implement-loop-core/SKILL.md`). With no nexus-home checkout, clone
 it and run its `bin/nexus-setup`; do not run the loop from memory. Run
 `nx-il check-core --config .agents/implement-loop.config` (`nx-il` is on PATH under the Claude
-plugin; elsewhere `$NEXUS_HOME/bin/nx-il`). Where this file is stricter than the core, it
+plugin; elsewhere `../nexus-home/bin/nx-il`). Where this file is stricter than the core, it
 wins for this repo.
 
 ## Workspace
 
 ```bash
-nx-il start nexus-edge-ai-core-next <slug>   # /tmp/nx-<slug>-edge, branch, ledger
+nx-il start . <slug>   # from the edge checkout: /tmp/nx-<slug>-edge, branch, ledger
 ```
 
 - Base `origin/main`. Every Rust worktree has a distinct `CARGO_TARGET_DIR` (the `export`
@@ -29,7 +29,8 @@ nx-il start nexus-edge-ai-core-next <slug>   # /tmp/nx-<slug>-edge, branch, ledg
   owned processes.
 - Refresh/rebase the integration tree onto `origin/main` before dispatch and before every
   top-level commit, per `AGENTS.md`, preserving local work; resolve conflicts and rerun
-  affected gates if the base changes.
+  affected gates if the base changes. A PR follow-up or `@claude` run never rebases,
+  per the core.
 - Record each original dispatched base SHA in the ledger; it never changes for that unit
   even if origin/main or the integration tree advances. Units never rebase or merge;
   redispatch from a fresh pinned base when needed. When accepting a report, the ancestor
