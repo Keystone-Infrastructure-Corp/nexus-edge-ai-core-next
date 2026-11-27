@@ -123,10 +123,6 @@ impl InferenceRouter {
         visual_prompt_store: Option<Arc<dyn VisualPromptStore>>,
         visual_embedding_dim: Option<usize>,
     ) -> Result<Self, InferenceError> {
-        let ctx = BuildContext {
-            visual_prompt_store,
-            visual_embedding_dim,
-        };
         let default_key = LayerKey::from_model(&default_cfg.model);
         let mut layers: BTreeMap<LayerKey, InferenceLayer> = BTreeMap::new();
 
@@ -164,9 +160,8 @@ impl InferenceRouter {
         }
         // An ensemble member shares a standalone layer's detector on Hailo
         // (cached per HEF), so its threshold lowers that layer's floor too.
-        // shortcut: an ensemble built before a standalone layer still caches
-        // its member at the member's threshold; build members at the floor
-        // if a standalone camera ever needs less than a member on Hailo.
+        // Members are built at that floor too (`BuildContext::score_floor`),
+        // so build order does not matter.
         let models = std::iter::once(&default_cfg.model).chain(
             cameras
                 .iter()
@@ -175,6 +170,19 @@ impl InferenceRouter {
         for member in models.flat_map(|m| &m.members) {
             lower(LayerKey::from_model(member), member.score_threshold);
         }
+        let ctx = BuildContext {
+            visual_prompt_store,
+            visual_embedding_dim,
+            score_floor: Some(Arc::new({
+                let floors = floors.clone();
+                move |m: &ModelConfig| {
+                    floors
+                        .get(&LayerKey::from_model(m).floor_key())
+                        .copied()
+                        .unwrap_or(m.score_threshold)
+                }
+            })),
+        };
         let with_floor = |mut cfg: InferenceConfig, key: &LayerKey| {
             if let Some(floor) = floors.get(&key.floor_key()) {
                 cfg.model.score_threshold = *floor;
@@ -1069,5 +1077,31 @@ mod tests {
         // Both members emit one 0.92 box: the 0.20 member's passes, the
         // 0.95 member's is filtered at its own threshold.
         assert_eq!(detection_count(&router, &ens).await, 1);
+    }
+
+    /// An ensemble member is built at the shared floor, not its own
+    /// threshold, so a standalone camera on the same model asking for less
+    /// is not capped by an ensemble that happened to be built first.
+    #[test]
+    fn ensemble_members_are_built_at_the_shared_floor() {
+        let mut cfg = cfg_with_kind("ensemble");
+        cfg.model.members = vec![ModelConfig {
+            kind: "mock".into(),
+            score_threshold: 0.50,
+            ..Default::default()
+        }];
+        let asked = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let ctx = BuildContext {
+            score_floor: Some(Arc::new({
+                let asked = asked.clone();
+                move |m: &ModelConfig| {
+                    asked.lock().push(m.kind.clone());
+                    0.20
+                }
+            })),
+            ..Default::default()
+        };
+        build_with_context(&cfg, &ctx).unwrap();
+        assert_eq!(*asked.lock(), vec!["mock".to_string()]);
     }
 }

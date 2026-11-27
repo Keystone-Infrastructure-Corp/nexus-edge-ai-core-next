@@ -250,6 +250,9 @@ fn fail_soft_cfg(cfg: &InferenceConfig) -> InferenceConfig {
     cfg
 }
 
+/// See [`BuildContext::score_floor`].
+pub type ScoreFloor = Arc<dyn Fn(&nexus_config::ModelConfig) -> f32 + Send + Sync>;
+
 /// Context plumbed through detector construction for kinds that need
 /// extra deps the bare `InferenceConfig` doesn't carry (e.g. yoloe
 /// visual-prompt embeddings backed by SQLite).
@@ -257,6 +260,9 @@ fn fail_soft_cfg(cfg: &InferenceConfig) -> InferenceConfig {
 pub struct BuildContext {
     pub visual_prompt_store: Option<Arc<dyn VisualPromptStore>>,
     pub visual_embedding_dim: Option<usize>,
+    /// Threshold to BUILD an ensemble member's detector at, when lower
+    /// than the member's own: the router's shared floor for that model.
+    pub score_floor: Option<ScoreFloor>,
 }
 
 /// Same as [`build`] but accepts a [`BuildContext`] so yoloe-visual and
@@ -465,11 +471,16 @@ fn build_detector_kind(
                     );
                     continue;
                 }
-                let derived = router::derive_inference_cfg(cfg, member_cfg);
+                let mut derived = router::derive_inference_cfg(cfg, member_cfg);
+                // Built at the shared floor, so a standalone layer that
+                // reuses this detector (Hailo caches per HEF) is not capped
+                // at the member's threshold, whichever is built first.
+                if let Some(floor) = &_ctx.score_floor {
+                    derived.model.score_threshold =
+                        floor(member_cfg).min(member_cfg.score_threshold);
+                }
                 match build_detector_with_context(&derived, _ctx) {
-                    // Re-apply the member's own threshold: on Hailo the
-                    // detector is cached per HEF and may have been built
-                    // lower for a standalone camera on the same model.
+                    // Re-apply the member's own threshold on top.
                     Ok(det) => members.push(Arc::new(caps::MinScoreDetector::new(
                         det,
                         member_cfg.score_threshold,
