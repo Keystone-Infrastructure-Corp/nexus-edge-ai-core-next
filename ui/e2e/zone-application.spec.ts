@@ -1348,4 +1348,70 @@ test.describe("zone application", () => {
     await expect(page.getByRole("button", { name: /^save$/i })).toBeEnabled();
     await expect(page.locator("#cam-name")).toHaveValue("e2e zones renamed");
   });
+
+  // The access reset drops the edit while the save re-reads the camera, so
+  // the save it was waiting to send is dropped too, whatever the re-read answers.
+  for (const reread of ["answered", "failed"] as const) {
+    test(`an access change during the re-read before a save sends nothing (re-read ${reread})`, async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR]);
+      const id = cameraId;
+      const receipt = await controlReceipt(page, id);
+      receipt.set(applied(1));
+      await page.goto(`/cameras/${id}`);
+      const status = page.getByTestId("zone-application");
+      await expect(status).toContainText("Applied to camera");
+      let puts = 0;
+      page.on("request", (r) => {
+        if (isPut(id)(r)) puts += 1;
+      });
+
+      // The save's re-read of the camera list is parked until released.
+      let seen: (r: Request) => void = () => {};
+      let release = () => {};
+      const parked = new Promise<Request>((resolve) => (seen = resolve));
+      const opened = new Promise<void>((resolve) => (release = resolve));
+      let held = false;
+      await zoneRow(page, "Door").getByRole("textbox").fill("Gate");
+      await page.route("**/api/v1/cameras", async (route) => {
+        if (!isCameraList(route.request()) || held) return route.fallback();
+        held = true;
+        seen(route.request());
+        await opened;
+        if (reread === "failed") await route.fulfill({ status: 500, json: { error: "e2e: cameras unavailable" } });
+        else await route.fallback();
+      });
+      await page.getByRole("button", { name: /^save$/i }).click();
+      const listRead = await parked;
+
+      // Meanwhile the next stats read answers 401, and the refresh it
+      // triggers carries the operator role: the editor resets.
+      let refreshes = 0;
+      await page.route("**/api/v1/auth/refresh", async (route) => {
+        const res = await route.fetch();
+        const tokens = (await res.json()) as { user: Record<string, unknown> };
+        refreshes += 1;
+        await route.fulfill({ response: res, json: { ...tokens, user: { ...tokens.user, role: "operator" } } });
+      });
+      let expire = true;
+      await page.route(`**/api/v1/cameras/${id}/stats`, (route) => {
+        if (!expire) return route.fallback();
+        expire = false;
+        return route.fulfill({ status: 401, json: { error: "e2e: token expired" } });
+      });
+      await steadyRead(page);
+      await expect.poll(() => refreshes, POLL).toBe(1);
+      await expect(zoneRow(page, "Gate")).toHaveCount(0);
+
+      release();
+      await listRead.response();
+      await page.waitForTimeout(1_000);
+      expect(puts, "the edit the reset dropped is never sent").toBe(0);
+      const cams = await engine<Array<{ id: number; zones: Zone[] }>>(page, "GET", "/cameras");
+      expect(cams.find((c) => c.id === id)?.zones).toEqual([DOOR]);
+      await expect(zoneRow(page, "Door")).toBeVisible();
+      await expect(page.getByText(/^Not saved/)).toHaveCount(0);
+      await expect(status.getByText("Unsaved changes")).toHaveCount(0);
+      await expect(page.getByRole("button", { name: /^save$/i })).toBeEnabled();
+    });
+  }
 });

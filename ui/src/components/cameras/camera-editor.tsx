@@ -695,11 +695,15 @@ export function CameraEditor({
     let expected = read?.body.zones_revision;
     if (!isNew) {
       const zonesClean = !sketching && draft.zones === zoneView.synced;
+      // An access reset during the re-read (it marks a zone save) dropped
+      // this draft: the save is dropped too, with nothing sent or reported.
+      const fence = zoneSaveSeq(camera.id);
       setChecking(true);
       let saved: Saved;
       try {
         saved = await rereadSaved(camera.id, zonesClean);
       } catch (err) {
+        if (zoneSaveSeq(camera.id) !== fence) return;
         setError(
           `Not saved: this camera could not be re-read, so saving could undo ` +
             `another operator's changes (${err instanceof Error ? err.message : String(err)}). Try again.`,
@@ -708,6 +712,7 @@ export function CameraEditor({
       } finally {
         setChecking(false);
       }
+      if (zoneSaveSeq(camera.id) !== fence) return;
       cfg = rebase(draft, writeBase.current, saved.camera);
       if (zonesClean) {
         const { zones, revision } = saved;
