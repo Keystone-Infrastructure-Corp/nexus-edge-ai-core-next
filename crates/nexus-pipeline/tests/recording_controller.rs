@@ -2683,6 +2683,83 @@ mod controller {
         );
     }
 
+    /// PR #406, Codex P1: observed closed its clip while ByteTrack still
+    /// predicts a track nothing observes. Rolled back to legacy, that live
+    /// track is legacy's to record: its first frame opens a clip, though the
+    /// track was born long before. With no live track, nothing opens.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rollback_with_no_clip_opens_one_for_still_live_motion() {
+        for still_live in [false, true] {
+            let mut c = observed_and_quiet(1, 0).await;
+            let t = c.elapsed_ms();
+            let motion = || Motion {
+                live: still_live,
+                ..quiet()
+            };
+            assert!(
+                c.frame(t, motion()).await.clip.is_none(),
+                "predicted-only: {:#?}",
+                c.rec.calls()
+            );
+            let receipt = c
+                .send(
+                    RecordingCommand::PolicyChanged(None, "rev-legacy".into()),
+                    LONG,
+                )
+                .await
+                .unwrap();
+            assert!(receipt.clip.is_none(), "{:#?}", c.rec.calls());
+            let first = c.frame(t + 200, motion()).await;
+            assert_eq!(
+                clip_id(&first),
+                still_live.then_some(2),
+                "still live: {still_live}, {:#?}",
+                c.rec.calls()
+            );
+        }
+    }
+
+    /// PR #406, Codex P1: a legacy frame ends its post-roll while carrying
+    /// an alert (alert recording off), so its close waits for the alert to
+    /// link. A switch to observed lands between the two: observed now owns
+    /// the close and still wants the clip, so the alert links to it and it
+    /// stays open. One clip, no gap.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn entering_observed_cancels_legacys_deferred_close() {
+        let mut cfg = config(None);
+        cfg.record_motion_clip_on_alert = false;
+        let mut c = cam(cfg, 0, false, false).await;
+        assert_eq!(clip_id(&c.frame(0, live(true)).await), Some(1));
+        c.frame(100, quiet()).await;
+        let event = c.event(1_200).await;
+        let alerted = Motion {
+            alerts: 1,
+            ..quiet()
+        };
+        // Post-roll ended at 1.1 s: the close waits for this frame's alert.
+        assert_eq!(clip_id(&c.frame(1_200, alerted).await), Some(1));
+        let switched = c
+            .send(
+                RecordingCommand::PolicyChanged(observed(1).policy, "rev-observed".into()),
+                LONG,
+            )
+            .await
+            .unwrap();
+        assert_eq!(clip_id(&switched), Some(1));
+        let linked = c.alert(1_200, &event).await;
+        assert_eq!(
+            (clip_id(&linked), c.linked(&event).await),
+            (Some(1), Some(1)),
+            "{:#?}",
+            c.rec.calls()
+        );
+        assert_eq!(
+            c.rec.calls(),
+            ["opening", "opened 1 512x288"],
+            "one clip, still open"
+        );
+    }
+
     /// R-7: with `record_motion_clip_on_alert` off, an observed alert links
     /// to the clip already open but never opens or renews one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -715,8 +715,13 @@ impl Controller {
             // The frame arrived: its file deadlines first, as legacy's loop did.
             self.rotate_if_due(e.captured_mono, e.captured_at, false)
                 .await;
-        } else if let (Some(motion), false) = (&e.motion, self.observed) {
-            (close_now, error) = self.legacy(e.captured_mono, e.captured_at, motion).await;
+        } else if let Some(motion) = &e.motion {
+            if self.observed {
+                // Kept for a rollback: legacy owes still-live motion a clip.
+                self.live = motion.live;
+            } else {
+                (close_now, error) = self.legacy(e.captured_mono, e.captured_at, motion).await;
+            }
         }
         let alerts = e.motion.as_ref().map_or(0, |m| m.alerts);
         let mut ending = None;
@@ -950,14 +955,17 @@ impl Controller {
         }
         self.start_policy();
         if was_observed && !self.observed {
-            // Rollback: legacy takes the open clip over, its post-roll from now.
+            // Rollback: legacy takes the open clip over, its post-roll from now;
+            // with none open, its first frame opens one for still-live motion.
             self.post_roll = PostRoll::new(self.cfg.post_roll_secs);
-            self.pending_open = false;
+            self.pending_open = self.clip.is_none() && self.live;
             self.pending_links.clear();
             self.hold = None;
         }
         let (now, wall) = self.now();
         if self.observed {
+            // Observed owns every close now: legacy's deferred one would end the clip it keeps.
+            self.deferred_close = None;
             let intent = self.intent_now(now);
             self.drive(intent, now, wall).await;
         }
