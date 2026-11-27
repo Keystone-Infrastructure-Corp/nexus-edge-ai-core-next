@@ -2364,13 +2364,21 @@ mod tests {
         recorder.drains.lock().push_back(Drain::Stalls);
 
         // Both bounds elapse on the paused clock; every virtual second the
-        // test records what the camera reads as.
-        tokio::time::pause();
+        // test records what the camera reads as. The clock pauses only once
+        // the pass has asked the supervisor to stop: its store read before
+        // that runs on sqlx's connection thread, which a paused clock does
+        // not wait for, so a slow answer let it auto-advance past the pool's
+        // acquire timeout.
         let began = tokio::time::Instant::now();
         let pass = tokio::spawn({
             let args = args.clone();
             async move { reconcile(&args).await }
         });
+        wait_until("the pass asked the supervisor to stop", || {
+            pass.is_finished() || *original.stop.borrow()
+        })
+        .await;
+        tokio::time::pause();
         let mut seen = Vec::new();
         while !pass.is_finished() {
             seen.push((status(&args, &a).state, is_original(&args.handles)));
