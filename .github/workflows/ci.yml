@@ -414,15 +414,24 @@ jobs:
         with:
           path: /opt/onnxruntime
           # ort 2.0.0-rc.12 (api-24 feature) binds to onnxruntime 1.24.x ABI; bump together.
-          key: onnxruntime-linux-x64-1.24.1-v1
+          key: onnxruntime-linux-x64-1.24.1-nuget-v1
 
+      # The microsoft/onnxruntime GitHub repository, and with it the release
+      # tarball, now answers 404. Microsoft's NuGet package carries the same
+      # linux-x64 libraries; the engine loads them through ORT_DYLIB_PATH, so
+      # the shared objects are all it needs. Pinned by digest.
       - name: download onnxruntime shared lib
         if: steps.ort-cache.outputs.cache-hit != 'true'
         run: |
           ORT_VERSION=1.24.1
-          curl -fsSL "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-${ORT_VERSION}.tgz" \
-            | sudo tar -xz -C /opt
-          sudo mv /opt/onnxruntime-linux-x64-${ORT_VERSION} /opt/onnxruntime
+          ORT_NUPKG_SHA256=5fca4421974b450711520f17a27e527fec60a78c2b6f9db3b05c159d9b5a346d
+          curl -fsSL -o /tmp/ort.nupkg \
+            "https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/${ORT_VERSION}/microsoft.ml.onnxruntime.${ORT_VERSION}.nupkg"
+          echo "${ORT_NUPKG_SHA256}  /tmp/ort.nupkg" | sha256sum -c -
+          sudo mkdir -p /opt/onnxruntime/lib
+          sudo unzip -j -o /tmp/ort.nupkg 'runtimes/linux-x64/native/*' -d /opt/onnxruntime/lib
+          rm /tmp/ort.nupkg
+          test -e /opt/onnxruntime/lib/libonnxruntime.so
 
       - name: export onnxruntime paths
         run: |
