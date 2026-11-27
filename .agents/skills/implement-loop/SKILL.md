@@ -12,7 +12,7 @@ Then read the shared core at `../nexus-home/.agents/skills/implement-loop-core/S
 `$NEXUS_HOME/.agents/skills/implement-loop-core/SKILL.md`). With no nexus-home checkout, clone
 it and run its `bin/nexus-setup`; do not run the loop from memory. Run
 `nx-il check-core --config .agents/implement-loop.config` (`nx-il` is on PATH under the Claude
-plugin; elsewhere `../nexus-home/bin/nx-il`). Where this file is stricter than the core, it
+plugin; elsewhere `$NEXUS_HOME/bin/nx-il` when set, else `../nexus-home/bin/nx-il`). Where this file is stricter than the core, it
 wins for this repo.
 
 ## Workspace
@@ -20,6 +20,9 @@ wins for this repo.
 ```bash
 nx-il start . <slug>   # from the edge checkout: /tmp/nx-<slug>-edge, branch, ledger
 ```
+
+`$TOP` below is the worktree path `nx-il start` prints (`/tmp/nx-<slug>-edge`); set `TOP=<that path>`
+in every shell that runs a gate, since each command starts in a fresh shell.
 
 - Base `origin/main`. Every Rust worktree has a distinct `CARGO_TARGET_DIR` (the `export`
   line it prints, `/tmp/nx-<slug>-target-edge`); a unit's is
