@@ -8,6 +8,7 @@
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::{AnnotatorConfig, CameraConfig, ClipsConfig, StaticObjectConfig};
