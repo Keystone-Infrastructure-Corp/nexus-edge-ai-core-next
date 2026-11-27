@@ -273,21 +273,32 @@ const MERGE_IOU: f32 = 0.5;
 /// into stage-1 so an object both passes saw (or two adjacent tiles saw)
 /// reaches the tracker once, then apply the global `top_k`. Stage-1 is
 /// kept whole: its boxes never suppress each other here, and a stage-2
-/// box that overlaps a same-label stage-1 box is the one dropped.
+/// box that overlaps a same-label stage-1 box is the one dropped, after
+/// lending that box its confidence if higher.
 // shortcut: plain IoU, so a tile-edge fragment of a box stage-1 saw whole
 // can survive (IoU < 0.5); upgrade to overlapping tiles if that shows up.
 pub fn merge_stage2(
-    stage1: Vec<Detection>,
+    mut stage1: Vec<Detection>,
     stage2: Vec<Detection>,
     top_k: Option<usize>,
 ) -> Vec<Detection> {
     // Stage-1 duplicates go first: one must not suppress a neighbour in
-    // the NMS below and then be dropped itself.
+    // the NMS below and then be dropped itself. The stage-1 box keeps its
+    // geometry but takes the tile's confidence when that is higher, so a
+    // weak first-pass box confirmed by a strong crop can still start a
+    // track under `new_track_confidence`.
     let mut stage2 = stage2;
     stage2.retain(|d| {
-        !stage1
-            .iter()
-            .any(|s| s.label == d.label && nexus_inference::nms::iou(&s.bbox, &d.bbox) > MERGE_IOU)
+        let dup = stage1.iter_mut().find(|s| {
+            s.label == d.label && nexus_inference::nms::iou(&s.bbox, &d.bbox) > MERGE_IOU
+        });
+        match dup {
+            Some(s) => {
+                s.confidence = s.confidence.max(d.confidence);
+                false
+            }
+            None => true,
+        }
     });
     let stage2 = nexus_inference::nms::nms_per_label(stage2, MERGE_IOU, None);
     let mut merged = stage1;
@@ -845,7 +856,8 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                ("person".to_string(), 600.0, 0.6),
+                // Stage-1's box, at the tile's higher confidence.
+                ("person".to_string(), 600.0, 0.8),
                 ("vehicle.car".to_string(), 601.0, 0.7),
                 ("person".to_string(), 812.0, 0.4),
             ]
@@ -857,7 +869,26 @@ mod tests {
             Some(1),
         );
         assert_eq!(capped.len(), 1);
-        assert_eq!(capped[0].confidence, 0.6);
+        assert_eq!((capped[0].bbox.x1, capped[0].confidence), (600.0, 0.8));
+    }
+
+    /// A weak stage-1 box confirmed by a strong tile box keeps its place
+    /// and takes the tile's confidence; a weaker tile box changes nothing.
+    #[test]
+    fn merge_raises_a_stage1_box_to_its_tile_duplicates_confidence() {
+        let merged = merge_stage2(
+            vec![labelled("person", 600.0, 0.2)],
+            vec![labelled("person", 601.0, 0.8)],
+            None,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].bbox.x1, merged[0].confidence), (600.0, 0.8));
+        let merged = merge_stage2(
+            vec![labelled("person", 600.0, 0.6)],
+            vec![labelled("person", 601.0, 0.3)],
+            None,
+        );
+        assert_eq!(merged[0].confidence, 0.6);
     }
 
     /// Two overlapping same-label stage-1 boxes (one person behind
