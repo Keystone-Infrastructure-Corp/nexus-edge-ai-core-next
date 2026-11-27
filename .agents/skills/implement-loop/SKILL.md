@@ -12,7 +12,7 @@ Then read the shared core at `../nexus-home/.agents/skills/implement-loop-core/S
 `$NEXUS_HOME/.agents/skills/implement-loop-core/SKILL.md`). With no nexus-home checkout, clone
 it and run its `bin/nexus-setup`; do not run the loop from memory. Run
 `nx-il check-core --config .agents/implement-loop.config` (`nx-il` is on PATH under the Claude
-plugin; elsewhere `$NEXUS_HOME/bin/nx-il` when set, else `../nexus-home/bin/nx-il`). Where this file is stricter than the core, it
+plugin; elsewhere `$NEXUS_HOME/bin/nx-il` when set, else `../nexus-home/bin/nx-il`, resolved to an absolute path before you leave the checkout). Where this file is stricter than the core, it
 wins for this repo.
 
 ## Workspace
