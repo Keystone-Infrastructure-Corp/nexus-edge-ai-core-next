@@ -1144,7 +1144,7 @@ async fn run_camera(
                     // viewer needs to see them to render the
                     // "static" indicator; the partition below keeps
                     // them out of rule eval + the motion lifecycle.
-                    sf.classify(&frame, &mut tracked);
+                    sf.classify_frame(&frame, &mut tracked, !skip_detector);
                 }
                 // Built once: the cache, FRAME_METADATA and (via
                 // `dynamic_tracks`) the rule / sighting / motion consumers

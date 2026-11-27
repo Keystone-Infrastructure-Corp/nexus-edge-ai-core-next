@@ -169,15 +169,19 @@ struct ParkingV2 {
     /// Analysis-frame size; a change resets every candidate and rescales
     /// every anchor.
     geometry: Option<(u32, u32)>,
-    /// Classified frames so far.
+    /// Classified frames the detector ran on so far.
     seq: u64,
     tracks: HashMap<TrackId, V2Track>,
 }
 
 struct V2Track {
     window: StillnessWindow,
+    /// The verdict of its last observation, which a frame the detector
+    /// skipped repeats.
+    still: bool,
     alert_epoch: u64,
-    /// The `seq` of the last frame that carried this track, and its capture ms.
+    /// The `seq` of the last detector frame that carried this track, and its
+    /// capture ms.
     seen_seq: u64,
     seen_ms: u64,
     /// The last observed center and its capture ms.
@@ -186,8 +190,8 @@ struct V2Track {
     /// off, the center of its first qualified dwell).
     parked_at: Option<(f32, f32)>,
     /// Owns `parked_at`: observed there after a qualified dwell and seen on
-    /// every frame since, within the observation gap and the ID-reuse step.
-    /// Only an owner seen leaving erases the anchor.
+    /// every detector frame since, within the observation gap and the
+    /// ID-reuse step. Only an owner seen leaving erases the anchor.
     owner: bool,
 }
 
@@ -362,13 +366,26 @@ impl StaticObjectFilter {
     /// Mutates `objects` in place (only the attributes maps of
     /// suppressed tracks); mutates internal per-track state and the
     /// persistent anchor registry.
-    pub fn classify(&mut self, _frame: &Frame, objects: &mut [TrackedObject]) {
+    pub fn classify(&mut self, frame: &Frame, objects: &mut [TrackedObject]) {
+        self.classify_frame(frame, objects, true);
+    }
+
+    /// [`Self::classify`], told whether the detector ran on `frame`. On a
+    /// frame the crowd skip policy kept from it, a v2 track's predicted-only
+    /// box (or absence) is no observation: it neither ends nor credits the
+    /// track's dwell. Legacy cameras classify every frame alike.
+    pub fn classify_frame(
+        &mut self,
+        _frame: &Frame,
+        objects: &mut [TrackedObject],
+        detector_ran: bool,
+    ) {
         let mut dirty = false;
         // Wall-clock used to refresh / age anchors. Pulled from the
         // frame so tests and replay scenarios behave deterministically.
         let frame_ms = _frame.captured_at.timestamp_millis();
         if self.parking_v2.is_some() {
-            self.classify_v2(_frame, objects);
+            self.classify_v2(_frame, objects, detector_ran);
             self.sweep_anchors(frame_ms);
             return;
         }
@@ -635,7 +652,7 @@ impl StaticObjectFilter {
     /// its own qualified dwell. Only then does it place, match or refresh
     /// an anchor, and only one whose center is also inside a parking zone,
     /// so anchors outside the zones age out on their TTL.
-    fn classify_v2(&mut self, frame: &Frame, objects: &mut [TrackedObject]) {
+    fn classify_v2(&mut self, frame: &Frame, objects: &mut [TrackedObject], detector_ran: bool) {
         let eligible: Vec<bool> = objects
             .iter()
             .map(|o| self.is_anchor_eligible(&o.label))
@@ -683,6 +700,7 @@ impl StaticObjectFilter {
             // Pixels of the old geometry say nothing about the new one.
             for t in v2.tracks.values_mut() {
                 t.window.miss();
+                t.still = false;
                 t.last = None;
                 t.owner = false;
                 if t.parked_at.take().is_some() {
@@ -690,7 +708,9 @@ impl StaticObjectFilter {
                 }
             }
         }
-        v2.seq += 1;
+        if detector_ran {
+            v2.seq += 1;
+        }
         let (fw, fh) = (frame.width.max(1) as f32, frame.height.max(1) as f32);
         let zones = &v2.zones;
         let in_parking = |(x, y): (f32, f32)| {
@@ -705,6 +725,7 @@ impl StaticObjectFilter {
             }
             let t = v2.tracks.entry(o.track_id).or_insert_with(|| V2Track {
                 window: StillnessWindow::new(params),
+                still: false,
                 alert_epoch: 0,
                 seen_seq: 0,
                 seen_ms: 0,
@@ -712,17 +733,20 @@ impl StaticObjectFilter {
                 parked_at: None,
                 owner: false,
             });
-            // Missing from the last frame: nothing observed it there, and a
-            // tracker may have given its id to another object, which
-            // inherits no parked episode; its anchor is left to expire.
-            if t.seen_seq + 1 != v2.seq {
-                t.window.miss();
-                t.owner = false;
-                if t.parked_at.take().is_some() {
-                    t.alert_epoch += 1;
+            if detector_ran {
+                // Missing from the last detector frame: nothing observed it
+                // there, and a tracker may have given its id to another
+                // object, which inherits no parked episode; its anchor is
+                // left to expire.
+                if t.seen_seq + 1 != v2.seq {
+                    t.window.miss();
+                    t.owner = false;
+                    if t.parked_at.take().is_some() {
+                        t.alert_epoch += 1;
+                    }
                 }
+                (t.seen_seq, t.seen_ms) = (v2.seq, at_ms);
             }
-            (t.seen_seq, t.seen_ms) = (v2.seq, at_ms);
             let mut still = false;
             match o.detection_bbox {
                 Some(b) => {
@@ -830,11 +854,15 @@ impl StaticObjectFilter {
                         t.owner = true;
                     }
                 }
+                // A frame the detector skipped observed nothing either way:
+                // the track keeps its window, ownership and last verdict.
+                None if !detector_ran => still = t.still,
                 None => {
                     t.window.miss();
                     t.owner = false;
                 }
             }
+            t.still = still;
             if still {
                 o.attributes
                     .insert(STATIC_ATTRIBUTE_KEY.into(), Value::Bool(true));
@@ -2259,6 +2287,82 @@ mod tests {
             back.iter().copied().find(|&ms| ms >= 9_700 + 5_000),
             "a fresh observed dwell from reacquisition"
         );
+    }
+
+    /// The car as ByteTrack emits it on a frame whose detector skipped or
+    /// missed it: a predicted-only box. The IoU tracker emits nothing there.
+    fn skipped_predicted() -> Vec<TrackedObject> {
+        vec![coasting(vehicle(1, 400.0, 500.0))]
+    }
+
+    /// The capture ms of the first frame on which a parked car is static,
+    /// with the detector run only on every `n`th frame, from the first, and
+    /// missing the car on its `missed` frames. Once static, it stays static
+    /// on every frame that carries it.
+    fn first_static_skipping(
+        n: usize,
+        skipped: fn() -> Vec<TrackedObject>,
+        missed: &[i64],
+        frames: &[i64],
+    ) -> Option<i64> {
+        let mut f = v2_filter();
+        let mut first = None;
+        for (k, &ms) in frames.iter().enumerate() {
+            let ran = k.is_multiple_of(n);
+            let mut objs = match (ran, missed.contains(&ms)) {
+                (false, _) => skipped(),
+                (true, true) => skipped_predicted(),
+                (true, false) => vec![vehicle(1, 400.0, 500.0)],
+            };
+            f.classify_frame(&frame(1, 0, ms), &mut objs, ran);
+            let hidden = objs.first().map(is_object_static);
+            if first.is_some() {
+                assert_ne!(hidden, Some(false), "n = {n}: unhidden at {ms} ms");
+            } else if hidden == Some(true) {
+                first = Some(ms);
+            }
+        }
+        first
+    }
+
+    /// A frame the crowd skip policy kept from the detector observes nothing
+    /// either way: the parked car's predicted-only box or absence there
+    /// neither ends nor credits its dwell, so it is hidden at the same
+    /// capture time as without skips, and stays hidden on skipped frames.
+    #[test]
+    fn v2_detector_skipped_frames_neither_end_nor_credit_a_dwell() {
+        // 1.2 fps: 5 s is frame 6, a detector frame for n = 2 and n = 3.
+        let frames = capture_ms(1.2, 0, 12_000);
+        let unskipped = first_static(&mut v2_filter(), &frames, |_| vehicle(1, 400.0, 500.0));
+        assert_eq!(unskipped, Some(5_000));
+        let absent: fn() -> Vec<TrackedObject> = Vec::new;
+        for n in [2, 3] {
+            for (shape, skipped) in [
+                ("predicted", skipped_predicted as fn() -> _),
+                ("absent", absent),
+            ] {
+                assert_eq!(
+                    first_static_skipping(n, skipped, &[], &frames),
+                    unskipped,
+                    "n = {n}, {shape} on skipped frames"
+                );
+            }
+        }
+    }
+
+    /// A frame the detector ran without matching the car is still a miss
+    /// between skipped frames: a fresh dwell starts at its next observation.
+    #[test]
+    fn v2_a_detector_miss_between_skipped_frames_still_ends_a_dwell() {
+        let frames = capture_ms(1.2, 0, 15_000);
+        // Missed at 5 s; observed again at 6 667 ms (n = 2), 7 500 ms (n = 3).
+        for (n, want) in [(2, 11_667), (3, 12_500)] {
+            assert_eq!(
+                first_static_skipping(n, skipped_predicted, &[5_000], &frames),
+                Some(want),
+                "n = {n}"
+            );
+        }
     }
 
     /// The same pixel center on a new frame geometry is a new candidate.

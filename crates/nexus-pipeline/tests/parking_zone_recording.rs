@@ -285,6 +285,8 @@ struct Scenario {
     policy: Option<ParkingPolicyV2>,
     scripted_ids: bool,
     anchor_ttl_secs: Option<u32>,
+    /// The crowd skip policy's `n`: the detector runs on every `n`th frame.
+    skip_every_n: Option<u32>,
 }
 
 impl Scenario {
@@ -295,6 +297,7 @@ impl Scenario {
             policy: Some(policy()),
             scripted_ids: false,
             anchor_ttl_secs: None,
+            skip_every_n: None,
         }
     }
 }
@@ -418,6 +421,9 @@ async fn run(s: Scenario, dir: &Path) -> Outcome {
             parking_lot_mode: true,
             parking_policy_v2: s.policy,
             anchor_ttl_secs: s.anchor_ttl_secs,
+            // Threshold 0: crowded from the first frame.
+            detector_skip_crowded_threshold: s.skip_every_n.map(|_| 0),
+            detector_skip_every_n_frames: s.skip_every_n,
             ..Default::default()
         },
         onvif: Default::default(),
@@ -638,6 +644,58 @@ async fn a_new_arrival_is_alerted_and_recorded_until_its_own_dwell() {
     );
     assert_eq!(o.opened, vec![wall0()], "recorded from arrival");
     assert_eq!(o.anchors, vec![(128.0, 144.0)], "the stall's one anchor");
+}
+
+/// Under the crowd skip policy the detector runs on every `n`th frame only
+/// and the tracker coasts the parked car through the rest. A skipped frame
+/// observes nothing either way: the car is hidden as long after its arrival
+/// as without skipping, stays hidden on skipped frames, alerts once, and its
+/// motion and recording end at its dwell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_parked_car_completes_its_dwell_across_skipped_detector_frames() {
+    for n in [None, Some(2), Some(3)] {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let times = every(500, 0, 20_000);
+        let mut s = Scenario::v2(shots(&times, |_, _| vec![in_stall()]));
+        // Each detector interval (0.5, 1 and 1.5 s) divides a 6 s dwell.
+        s.policy = Some(ParkingPolicyV2 {
+            dwell_secs: 6.0,
+            ..policy()
+        });
+        s.skip_every_n = n;
+        let o = run(s, dir.path()).await;
+        // The policy skips the first n - 1 frames of every n.
+        let arrival = n.map_or(0, |n| n as usize - 1);
+        let parked = times[arrival] + 6_000;
+        for (k, &ms) in times.iter().enumerate() {
+            if k < arrival {
+                assert!(o.metadata[k].objects.is_empty(), "n = {n:?}, {ms} ms");
+            } else {
+                assert_eq!(
+                    o.static_at(k, 0.25, 0.5),
+                    ms >= parked,
+                    "n = {n:?}, {ms} ms"
+                );
+            }
+        }
+        assert_eq!(o.fired("any_vehicle"), vec![arrival], "n = {n:?}");
+        assert!(o.fired("lingering_vehicle").is_empty(), "n = {n:?}");
+        assert_eq!(
+            o.motion_at(MotionEventKind::Born),
+            vec![times[arrival]],
+            "n = {n:?}"
+        );
+        assert_eq!(
+            o.motion_at(MotionEventKind::Died),
+            vec![parked],
+            "n = {n:?}"
+        );
+        assert!(
+            o.clips.iter().all(|(_, end)| end.is_some()),
+            "n = {n:?}: recording ends after the dwell: {:?}",
+            o.clips
+        );
+    }
 }
 
 /// An established parked car whose detection drops out for three frames:
