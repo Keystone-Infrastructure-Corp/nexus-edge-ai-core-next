@@ -1946,6 +1946,72 @@ test.describe("zone application", () => {
       await expect(status).toContainText("Applied to camera", POLL);
     });
 
+    // Without parking, parking-lot mode is a plain field: a save that takes
+    // another operator's newer zones takes their parking-lot mode with them.
+    test("an engine without parking keeps another operator's parking-lot mode beside their newer zones", async ({
+      page,
+    }) => {
+      cameraId = await createCamera(page, [DOOR]);
+      const id = cameraId;
+      await withoutParking(page, id);
+      const receipt = await controlReceipt(page, id);
+      receipt.set(applied(1));
+      receipt.setParking(() => "missing");
+      await page.goto(`/cameras/${id}`);
+      const status = page.getByTestId("zone-application");
+      await expect(status).toContainText("Applied to camera");
+
+      await saveElsewhere(page, id, { zones: [DOCK], parking_lot_mode: true });
+      await page.locator("#cam-name").fill("e2e zones renamed");
+      receipt.set(applied(2));
+      const put = page.waitForRequest(isPut(id));
+      await save(page);
+      expect((await put).postDataJSON()).toMatchObject({
+        name: "e2e zones renamed",
+        zones: [DOCK],
+        parking_lot_mode: true,
+      });
+      await expect(page.getByLabel("Enable parking-lot mode")).toBeChecked();
+      await expect(status).toContainText("Applied to camera", POLL);
+    });
+
+    // Saved before the editor's first read of the saved settings lands, the
+    // v2 policy it sent is the one it shows: the save is Applied, not an
+    // unsaved change.
+    test("a save before the first saved-settings read lands is Applied with its v2 policy", async ({ page }) => {
+      cameraId = await createCamera(page, [DOOR, STALLS], PARKED);
+      const id = cameraId;
+      const receipt = await controlReceipt(page, id);
+      receipt.set(applied(1));
+      let first = true;
+      let seen = () => {};
+      let release = () => {};
+      const parked = new Promise<void>((resolve) => (seen = resolve));
+      const opened = new Promise<void>((resolve) => (release = resolve));
+      await page.route(`**/api/v1/admin/cameras/${id}/config-snapshot`, async (route) => {
+        if (!first) return route.fallback();
+        first = false;
+        seen();
+        await opened;
+        // The save's settling cancels this read: nothing is left to answer.
+        await route.continue().catch(() => {});
+      });
+      await page.goto(`/cameras/${id}`);
+      await parked;
+      await expect(optIn(page)).toHaveCount(0);
+
+      await page.locator("#cam-name").fill("e2e zones renamed");
+      receipt.set(applied(2));
+      const put = page.waitForResponse((r) => isPut(id)(r.request()));
+      await save(page);
+      expect((await put).ok()).toBe(true);
+      const status = page.getByTestId("zone-application");
+      await expect(status).toContainText("Applied to camera", POLL);
+      await expect(optIn(page)).toBeChecked();
+      await expect(page.getByText("Unsaved changes")).toHaveCount(0);
+      release();
+    });
+
     test("a parking edit a rolled-back core no longer reports is refused; saved parking passes through", async ({
       page,
     }) => {
