@@ -7263,7 +7263,9 @@ mod tests {
                     .unwrap_or_default();
                 let created = between(&body, "<wsu:Created>", "</wsu:Created>");
                 let digest = crate::discovery::onvif_soap::compute_password_digest(
-                    &nonce, created, "secret2",
+                    &nonce,
+                    created,
+                    edited.onvif.password.as_deref().unwrap(),
                 );
                 let accepted = uri.path() == "/onvif/v2/device_service"
                     && between(&body, "<wsse:Username>", "</wsse:Username>") == "admin2"
@@ -7295,7 +7297,7 @@ mod tests {
             onvif: nexus_config::CameraOnvif {
                 endpoint: Some(format!("http://{addr}/onvif/device_service")),
                 username: Some("admin".into()),
-                password: Some("secret".into()),
+                password: Some(uuid::Uuid::now_v7().to_string()),
             },
             talk_down: Default::default(),
             zones: vec![],
@@ -7305,7 +7307,7 @@ mod tests {
         edited.onvif = nexus_config::CameraOnvif {
             endpoint: Some(format!("http://{addr}/onvif/v2/device_service")),
             username: Some("admin2".into()),
-            password: Some("secret2".into()),
+            password: Some(uuid::Uuid::now_v7().to_string()),
         };
         let stub = axum::Router::new()
             .fallback(onvif_stub)
@@ -8870,7 +8872,7 @@ mod tests {
         a_camera.onvif = nexus_config::CameraOnvif {
             endpoint: Some(format!("http://{addr}/onvif/device_service")),
             username: Some("admin".into()),
-            password: Some("secret".into()),
+            password: Some(uuid::Uuid::now_v7().to_string()),
         };
         store.upsert_camera(&a_camera).await.unwrap();
         let mut b_camera = a_camera.clone();
@@ -9067,7 +9069,7 @@ mod tests {
         b_camera.onvif = nexus_config::CameraOnvif {
             endpoint: Some(format!("http://{addr}/onvif/device_service")),
             username: Some("admin".into()),
-            password: Some("secret".into()),
+            password: Some(uuid::Uuid::now_v7().to_string()),
         };
         store.upsert_camera(&b_camera).await.unwrap();
         b_camera.zones = vec![snapshot_zone("b", 0.3)];
