@@ -7227,6 +7227,144 @@ mod tests {
         ));
     }
 
+    /// SPEC-088 — a camera edit (new ONVIF credentials and endpoint path)
+    /// that lands after the dangerous write first loads the camera but
+    /// before its lockstep persist is kept, host-rewritten, by that
+    /// persist; the re-probe must then use the persisted camera, not the
+    /// stale first load. The stub makes that edit while answering
+    /// `SetNetworkInterfaces`, and answers the `GetSystemDateAndTime`
+    /// re-probe only at the new path with a WS-Security digest of the new
+    /// credentials — a probe built from the first load gets `401`s, `502`.
+    #[tokio::test]
+    async fn network_dangerous_write_reprobes_with_the_persisted_camera() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+        use base64::Engine as _;
+
+        fn between<'a>(s: &'a str, open: &str, close: &str) -> &'a str {
+            s.split_once(open)
+                .and_then(|(_, rest)| rest.split_once(close))
+                .map_or("", |(v, _)| v)
+        }
+
+        async fn onvif_stub(
+            State((store, edited)): State<(Arc<Store>, nexus_config::CameraConfig)>,
+            uri: axum::http::Uri,
+            body: String,
+        ) -> axum::response::Response {
+            if body.contains("SetNetworkInterfaces") {
+                store.upsert_camera(&edited).await.unwrap();
+                let soap = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl"><s:Body><tds:SetNetworkInterfacesResponse><tds:RebootNeeded>false</tds:RebootNeeded></tds:SetNetworkInterfacesResponse></s:Body></s:Envelope>"#;
+                return (StatusCode::OK, soap).into_response();
+            }
+            if body.contains("GetSystemDateAndTime") {
+                let nonce = base64::engine::general_purpose::STANDARD
+                    .decode(between(&body, "Base64Binary\">", "</wsse:Nonce>"))
+                    .unwrap_or_default();
+                let created = between(&body, "<wsu:Created>", "</wsu:Created>");
+                let digest = crate::discovery::onvif_soap::compute_password_digest(
+                    &nonce, created, "secret2",
+                );
+                let accepted = uri.path() == "/onvif/v2/device_service"
+                    && between(&body, "<wsse:Username>", "</wsse:Username>") == "admin2"
+                    && between(&body, "PasswordDigest\">", "</wsse:Password>") == digest;
+                if !accepted {
+                    return (StatusCode::UNAUTHORIZED, "stale path or credentials").into_response();
+                }
+            }
+            (StatusCode::OK, "<ok/>").into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        const SECRET: &[u8] = b"network-reprobe-persisted-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let cam = nexus_config::CameraConfig {
+            id: 22,
+            name: "cam-22".into(),
+            ingest: nexus_config::CameraIngest {
+                url: "rtsp://192.168.50.50:554/stream".parse().unwrap(),
+                analysis_url: None,
+                enabled: true,
+                max_fps: 0,
+                codec: None,
+            },
+            detector: nexus_config::CameraDetector::default(),
+            behavior: nexus_config::CameraBehavior::default(),
+            onvif: nexus_config::CameraOnvif {
+                endpoint: Some(format!("http://{addr}/onvif/device_service")),
+                username: Some("admin".into()),
+                password: Some("secret".into()),
+            },
+            talk_down: Default::default(),
+            zones: vec![],
+        };
+        store.upsert_camera(&cam).await.unwrap();
+        let mut edited = cam.clone();
+        edited.onvif = nexus_config::CameraOnvif {
+            endpoint: Some(format!("http://{addr}/onvif/v2/device_service")),
+            username: Some("admin2".into()),
+            password: Some("secret2".into()),
+        };
+        let stub = axum::Router::new()
+            .fallback(onvif_stub)
+            .with_state((store.clone(), edited));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, stub.into_make_service()).await;
+        });
+
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/cameras/22/network/interface")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "interface": { "token": "eth0", "dhcp": false, "address": "192.168.50.77", "prefix_length": 24 },
+                    "new_endpoint_host": "127.0.0.1"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "body: {body:?}");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["reachable"], true);
+
+        // The persist kept the concurrent edit and still rewrote the host.
+        let after = store
+            .list_cameras()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == 22)
+            .unwrap();
+        assert_eq!(after.ingest.url.host_str(), Some("127.0.0.1"));
+        assert_eq!(
+            after.onvif.endpoint.as_deref(),
+            Some(format!("http://{addr}/onvif/v2/device_service").as_str())
+        );
+        assert_eq!(after.onvif.username.as_deref(), Some("admin2"));
+
+        let rows = store
+            .list_audit_for_resource("camera", "22", 10)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.action == "camera.onvif.network.interface")
+            .expect("expected a camera.onvif.network.interface audit row");
+        assert!(matches!(
+            row.outcome,
+            nexus_store::audit::AuditOutcome::Success
+        ));
+    }
+
     /// Every registered route+method pair resolves to a handler —
     /// no `405 Method Not Allowed` (wrong method on a real path) and
     /// no `404` (path never registered). Runs in dev-mode (no admin

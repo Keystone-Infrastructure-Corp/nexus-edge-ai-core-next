@@ -69,7 +69,8 @@ fn target_from(cam: &nexus_config::CameraConfig) -> Result<OnvifTarget, ApiError
 /// Apply `rewrite` to the camera as stored now, persist it if that changed
 /// anything, and signal the hot-reload reconciler to respawn the camera
 /// source at its new address — the "respawn the camera source" half of the
-/// lockstep safety net. Returns whether it persisted.
+/// lockstep safety net. Returns whether it persisted, and the camera as
+/// stored after the call (any edit made since the caller loaded it included).
 ///
 /// SPEC-088 — a save like any other: re-read, written and requested inside
 /// the zone save boundary, so a zone save made while the camera was being
@@ -78,12 +79,12 @@ async fn persist_and_respawn(
     s: &ApiState,
     id: CameraId,
     rewrite: impl FnOnce(&mut nexus_config::CameraConfig) -> Result<bool, String>,
-) -> Result<bool, ApiError> {
+) -> Result<(bool, nexus_config::CameraConfig), ApiError> {
     let registry = s.frame_stats.zone_application();
     let saving = registry.saves().write().await;
     let mut cam = load_camera(s, id).await?;
     if !rewrite(&mut cam).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))? {
-        return Ok(false);
+        return Ok((false, cam));
     }
     s.store.upsert_camera(&cam).await?;
     registry.request(
@@ -99,7 +100,7 @@ async fn persist_and_respawn(
             &serde_json::json!({ "kind": "camera", "action": "upsert", "camera_id": id }),
         )
         .await;
-    Ok(true)
+    Ok((true, cam))
 }
 
 /// Re-probe a camera at the (rewritten) ONVIF endpoint until it
@@ -343,7 +344,7 @@ pub async fn network_safe_put(
     // Lockstep port rewrite for a protocol-port change.
     let mut endpoint_rewritten = false;
     if let NetworkSafeRequest::SetNetworkProtocols { protocols } = &req {
-        endpoint_rewritten =
+        (endpoint_rewritten, _) =
             persist_and_respawn(&s, id, |c| Ok(rewrite_camera_ports(c, protocols))).await?;
     }
 
@@ -523,9 +524,12 @@ pub async fn network_interface_put(
         .await;
         return Err(ApiError(StatusCode::BAD_REQUEST, e));
     }
-    persist_and_respawn(&s, id, |c| rewrite_camera_host(c, &new_host).map(|()| true)).await?;
+    let (_, cam) =
+        persist_and_respawn(&s, id, |c| rewrite_camera_host(c, &new_host).map(|()| true)).await?;
 
-    // 4. Re-probe at the new address; fail loud if unreachable.
+    // 4. Re-probe at the new address with the camera as persisted (an
+    //    ONVIF credential or path edit since the first load included);
+    //    fail loud if unreachable.
     let new_t = target_from(&cam)?;
     let reachable = reprobe(&new_t.endpoint, &new_t.username, &new_t.password)
         .await
