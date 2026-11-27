@@ -99,7 +99,8 @@ pub struct EncoderPut {
 /// `PUT /v1/admin/cameras/{id}/encoder` — write one encoder config.
 /// The token must be one the camera lists and every changed value must
 /// fit *that* configuration's options; otherwise nothing is written.
-/// Fields the request omits keep the camera's current values.
+/// Fields the request omits keep the camera's current values, except the
+/// old codec's GOP length and profile when the request changes `encoding`.
 pub async fn encoder_put(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
@@ -189,11 +190,17 @@ async fn check_selected(
         onvif_encoder::get_video_encoder_configurations(&t.endpoint, &t.username, &t.password)
             .await
             .map_err(enc_err)?;
-    let current = configs
-        .iter()
+    let mut current = configs
+        .into_iter()
         .find(|c| c.token == new.token)
         .ok_or_else(unknown_token)?;
-    let merged = merge(new, current);
+    // A codec switch drops the old codec's GOP length and profile: only the
+    // request's own are written, and they are judged as changes.
+    if new.encoding.is_some() && new.encoding != current.encoding {
+        current.gov_length = None;
+        current.profile = None;
+    }
+    let merged = merge(new, &current);
     // Judged by the codec being written: a camera may list every codec's.
     let options = onvif_encoder::get_video_encoder_configuration_options(
         &t.endpoint,
@@ -205,7 +212,7 @@ async fn check_selected(
     )
     .await
     .map_err(enc_err)?;
-    check_write(&merged, current, &options).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    check_write(&merged, &current, &options).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     Ok(merged)
 }
 
@@ -1090,5 +1097,98 @@ mod tests {
             .collect();
         assert_eq!(sets.len(), 1, "only the in-range write is sent: {sets:?}");
         assert!(sets[0].contains("<tt:EncodingInterval>2</tt:EncodingInterval>"));
+    }
+
+    /// A PUT that switches the encoding writes no GOP length or profile
+    /// left over from the old codec, judges the ones it sends by the new
+    /// codec's options, and an unchanged encoding keeps the camera's.
+    #[tokio::test]
+    async fn an_encoding_switch_drops_the_old_codecs_gop_length_and_profile() {
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let srv = MockServer::start().await;
+        for (action, inner) in [
+            (
+                "GetVideoEncoderConfigurations",
+                concat!(
+                    r#"<trt:GetVideoEncoderConfigurationsResponse><trt:Configurations token="VE_sub"><tt:Name>sub</tt:Name><tt:Encoding>H264</tt:Encoding>"#,
+                    r#"<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>"#,
+                    r#"<tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>"#,
+                    r#"</trt:Configurations></trt:GetVideoEncoderConfigurationsResponse>"#,
+                ),
+            ),
+            (
+                "GetVideoEncoderConfigurationOptions",
+                concat!(
+                    "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options>",
+                    "<tt:H264><tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>200</tt:Max></tt:GovLengthRange><tt:H264ProfilesSupported>High</tt:H264ProfilesSupported></tt:H264>",
+                    "<tt:H265><tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>20</tt:Max></tt:GovLengthRange><tt:H265ProfilesSupported>Main</tt:H265ProfilesSupported></tt:H265>",
+                    "</trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>",
+                ),
+            ),
+            (
+                "SetVideoEncoderConfiguration",
+                "<trt:SetVideoEncoderConfigurationResponse/>",
+            ),
+        ] {
+            Mock::given(body_string_contains(action))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body>{inner}</s:Body></s:Envelope>"#
+                )))
+                .mount(&srv)
+                .await;
+        }
+        let t = OnvifTarget {
+            endpoint: format!("{}/onvif/device_service", srv.uri()),
+            username: "admin".into(),
+            password: test_secret(),
+        };
+        /// The SetVideoEncoderConfiguration body the PUT sends, or its status.
+        async fn written(
+            t: &OnvifTarget,
+            srv: &MockServer,
+            req: VideoEncoderConfig,
+        ) -> Result<String, StatusCode> {
+            let config = preflight(t, req, PUT_READ_BUDGET)
+                .await
+                .map_err(|ApiError(s, _)| s)?;
+            set_config(t, &config, false).await.unwrap();
+            let reqs = srv.received_requests().await.unwrap();
+            let body = reqs.iter().rev().find_map(|r| {
+                let b = String::from_utf8_lossy(&r.body).into_owned();
+                b.contains("SetVideoEncoderConfiguration").then_some(b)
+            });
+            Ok(body.unwrap())
+        }
+        let put = |encoding: &str, gov_length, profile: Option<&str>| VideoEncoderConfig {
+            encoding: Some(encoding.into()),
+            gov_length,
+            profile: profile.map(str::to_string),
+            ..cfg("VE_sub")
+        };
+        for codec in ["JPEG", "MPEG4", "H265"] {
+            let body = written(&t, &srv, put(codec, None, None)).await.unwrap();
+            assert!(
+                body.contains(&format!("<tt:Encoding>{codec}</tt:Encoding>")),
+                "{body}"
+            );
+            assert!(!body.contains("GovLength"), "{codec}: {body}");
+            assert!(!body.contains("Profile>"), "{codec}: {body}");
+        }
+        let body = written(&t, &srv, put("H265", Some(15), Some("Main")))
+            .await
+            .unwrap();
+        assert!(body.contains("<tt:H265><tt:GovLength>15</tt:GovLength><tt:H265Profile>Main</tt:H265Profile></tt:H265>"), "{body}");
+        assert!(!body.contains("<tt:H264>"), "{body}");
+        // The old codec's values resent under H265 are judged by H265's options.
+        for bad in [
+            put("H265", Some(30), Some("Main")),
+            put("H265", Some(15), Some("High")),
+        ] {
+            let got = written(&t, &srv, bad.clone()).await.map(drop);
+            assert_eq!(got, Err(StatusCode::BAD_REQUEST), "{bad:?}");
+        }
+        let body = written(&t, &srv, put("H264", None, None)).await.unwrap();
+        assert!(body.contains("<tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>"), "{body}");
     }
 }

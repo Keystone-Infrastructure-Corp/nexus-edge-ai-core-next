@@ -215,18 +215,16 @@ fn set_config_body(c: &VideoEncoderConfig, force_persistence: bool) -> String {
     } else {
         String::new()
     };
-    // Codec-specific block keyed off the declared encoding.
-    let codec = if c.gov_length.is_some() || c.profile.is_some() {
-        let container = match c.encoding.as_deref() {
-            Some("H265") => "H265",
-            _ => "H264",
-        };
-        let profile_tag = if container == "H265" {
-            "H265Profile"
-        } else {
-            "H264Profile"
-        };
-        format!(
+    // Codec-specific block of the encoding written (JPEG has none); an
+    // unreported encoding keeps the H264 default.
+    let block = match c.encoding.as_deref() {
+        Some("H264") | None => Some(("H264", "H264Profile")),
+        Some("H265") => Some(("H265", "H265Profile")),
+        Some("MPEG4") => Some(("MPEG4", "Mpeg4Profile")),
+        Some(_) => None,
+    };
+    let codec = match block {
+        Some((container, profile_tag)) if c.gov_length.is_some() || c.profile.is_some() => format!(
             "<tt:{container}>{}{}</tt:{container}>",
             c.gov_length
                 .map(|v| format!("<tt:GovLength>{v}</tt:GovLength>"))
@@ -235,9 +233,8 @@ fn set_config_body(c: &VideoEncoderConfig, force_persistence: bool) -> String {
                 .as_ref()
                 .map(|p| format!("<tt:{profile_tag}>{}</tt:{profile_tag}>", xml_escape(p)))
                 .unwrap_or_default(),
-        )
-    } else {
-        String::new()
+        ),
+        _ => String::new(),
     };
     format!(
         "<trt:SetVideoEncoderConfiguration><trt:Configuration token=\"{}\">{}{}{}{}{}{}{}</trt:Configuration><trt:ForcePersistence>{}</trt:ForcePersistence></trt:SetVideoEncoderConfiguration>",
@@ -685,5 +682,27 @@ mod tests {
         };
         let body = set_config_body(&c, false);
         assert!(body.contains("<tt:H265><tt:GovLength>60</tt:GovLength><tt:H265Profile>Main</tt:H265Profile></tt:H265>"), "{body}");
+    }
+
+    /// The codec block follows the encoding written: JPEG has none and
+    /// MPEG4 its own, never an H264 block under another codec.
+    #[test]
+    fn set_config_body_writes_the_codec_block_of_its_encoding() {
+        let with = |encoding: &str| VideoEncoderConfig {
+            token: "T".into(),
+            encoding: Some(encoding.into()),
+            gov_length: Some(20),
+            profile: Some("SP".into()),
+            ..VideoEncoderConfig::default()
+        };
+        let jpeg = set_config_body(&with("JPEG"), false);
+        assert_well_formed(&wrap(&jpeg));
+        assert!(
+            !jpeg.contains("GovLength") && !jpeg.contains("Profile>"),
+            "{jpeg}"
+        );
+        let mpeg4 = set_config_body(&with("MPEG4"), false);
+        assert!(mpeg4.contains("<tt:MPEG4><tt:GovLength>20</tt:GovLength><tt:Mpeg4Profile>SP</tt:Mpeg4Profile></tt:MPEG4>"), "{mpeg4}");
+        assert!(!mpeg4.contains("<tt:H264>"), "{mpeg4}");
     }
 }
