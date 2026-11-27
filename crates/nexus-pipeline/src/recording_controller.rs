@@ -956,10 +956,13 @@ impl Controller {
         self.start_policy();
         if was_observed && !self.observed {
             // Rollback: legacy takes the open clip over, its post-roll from now;
-            // with none open, its first frame opens one for still-live motion.
+            // with none open, its first frame opens one for still-live motion,
+            // which links the alerts a failed observed open held.
             self.post_roll = PostRoll::new(self.cfg.post_roll_secs);
             self.pending_open = self.clip.is_none() && self.live;
-            self.pending_links.clear();
+            if !self.pending_open {
+                self.pending_links.clear();
+            }
             self.hold = None;
         }
         let (now, wall) = self.now();
