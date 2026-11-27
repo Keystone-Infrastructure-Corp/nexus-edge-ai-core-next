@@ -1,37 +1,35 @@
 ---
 name: implement-loop
-description: Edge extension of the shared Nexus implement-loop — edge worktree and target paths, pinned unit bases, the Nexus Edge Coding agent, cloud-owned engineering records, hardware evidence, E2E harness ownership, and the edge gates. Read the shared core first. Use to implement, finish, or harden an edge feature to spec without hand-holding.
+description: Edge extension of the Nexus implement-loop; use to implement, finish, or harden an edge feature to spec without hand-holding.
 ---
 
 # Implement Loop — Edge extension
 
-This extends the shared implement-loop core at
-`../nexus-home/.agents/skills/implement-loop-core/SKILL.md` (or
-`$NEXUS_HOME/.agents/skills/implement-loop-core/SKILL.md` when nexus-home is not beside
-this repo). Read the core first, then this file. With no nexus-home checkout, read the core
-from GitHub: `gh api repos/Keystone-Infrastructure-Corp/nexus-home/contents/.agents/skills/implement-loop-core/SKILL.md -H 'Accept: application/vnd.github.raw'`.
-Stop and ask for it only if that fails too.
-Where this file is stricter than the core, it wins for this repo.
-
-Read `AGENTS.md` and `.github/workflows/ci.yml` before planning. Their hardware,
-privacy, licence, wire, security, validation, accessibility, and error-handling rules
-remain binding. Do not ask again for an action the user already authorized.
+Entry point for edge work. Read `AGENTS.md` and `.github/workflows/ci.yml` before planning;
+their hardware, privacy, licence, wire, security, validation, accessibility, and
+error-handling rules bind, and you do not re-ask for an action the user already authorized.
+Then read the shared core at `../nexus-home/.agents/skills/implement-loop-core/SKILL.md` (or
+`$NEXUS_HOME/.agents/skills/implement-loop-core/SKILL.md`). With no nexus-home checkout, clone
+it and run its `bin/nexus-setup`; do not run the loop from memory. Run
+`nx-il check-core --config .agents/implement-loop.config` (`nx-il` is on PATH under the Claude
+plugin; elsewhere `$NEXUS_HOME/bin/nx-il`). Where this file is stricter than the core, it
+wins for this repo.
 
 ## Workspace
 
 ```bash
-TOP=/tmp/nx-$SLUG-edge
-TARGET=/tmp/nx-$SLUG-target-edge
+nx-il start nexus-edge-ai-core-next <slug>   # /tmp/nx-<slug>-edge, branch, ledger
 ```
 
-- Base: `origin/main`. Every Rust worktree has a distinct `CARGO_TARGET_DIR`; a unit's is
+- Base `origin/main`. Every Rust worktree has a distinct `CARGO_TARGET_DIR` (the `export`
+  line it prints, `/tmp/nx-<slug>-target-edge`); a unit's is
   `/tmp/nx-<slug>-target-u-edge-<unit>`. Never share compiled artifacts between trees.
-- Ledger: `/tmp/nx-$SLUG-ledger.md` for an edge-only task; a cross-repo task uses the cloud
-  ledger. Record canonical path, branch, base, target directory, and owned processes.
+- Ledger: `$TOP/.implement-loop/<slug>.md` (gitignored) for an edge-only task; a cross-repo
+  task uses the cloud ledger. Record canonical path, branch, base, target directory, and
+  owned processes.
 - Refresh/rebase the integration tree onto `origin/main` before dispatch and before every
   top-level commit, per `AGENTS.md`, preserving local work; resolve conflicts and rerun
-  affected gates if the base changes. A PR follow-up or `@claude` run never rebases,
-  per the core.
+  affected gates if the base changes.
 - Record each original dispatched base SHA in the ledger; it never changes for that unit
   even if origin/main or the integration tree advances. Units never rebase or merge;
   redispatch from a fresh pinned base when needed. When accepting a report, the ancestor
@@ -45,26 +43,16 @@ TARGET=/tmp/nx-$SLUG-target-edge
   (`.github/agents/nexus-edge-coding.agent.md`). It pins Claude Opus 5 in its frontmatter,
   so a per-dispatch `model` does not reach it — a cheap-tier unit goes to the default agent
   instead. Use strong judgment for design, security, wire/hardware work and review.
-- Top-level only, never in an allowlist: generated wire bindings, generated TS types
-  (`ui/src/api/types/`), lockfiles, and cloud vault records.
+- Top-level only, never in an allowlist (enforced by `nx-il verify-report` from
+  `top-level-only` in `.agents/implement-loop.config`): generated wire bindings, generated TS
+  types (`ui/src/api/types/`), lockfiles, and cloud vault records.
 
-## Unit prompt lines
+## Unit prompt
 
-Add these to the core's unit prompt:
-
-```text
-   TARGET=/tmp/nx-<slug>-target-u-edge-<unit>  # append -r<n> for a re-dispatch
-   Rust verifies run inside the worktree as `CARGO_TARGET_DIR="$TARGET" cargo <verify args>`.
-   Read AGENTS.md. Keep the supplied base fixed: never rebase or merge, per AGENTS.md's
-   unit exception. Cap terminal output.
-   A fresh worktree has no node_modules: run `(cd "$WT/ui" && npm ci)` (Node 22) before any
-   npm verify. Install Playwright browsers once per machine with
-   `npm --prefix "$WT/ui" run e2e:install` before its first E2E run.
-   Edge UI E2E: `E2E_PORT=<port> npm --prefix "$WT/ui" run e2e`, following the E2E
-   ownership rules in the edge extension (the top level serializes edge E2E).
-   Edge UI unit tests: `npm --prefix "$WT/ui" run test`.
-   Report also: skipped gates, assumptions, and open findings.
-```
+Render with `nx-il unit-prompt --short edge --extra .agents/implement-loop.unit-lines ...`;
+that file holds this repo's lines (target directory, base pinning, `npm ci`, E2E, report
+fields). When verifying a report, pass the ORIGINAL dispatched base from the ledger as
+`--base`, never one the agent reports.
 
 ## Criteria details
 
@@ -107,16 +95,4 @@ Edge UI: first `(cd "$TOP/ui" && npm ci)` (Node 22), then
 `npm --prefix "$TOP/ui" run lint` · `npm --prefix "$TOP/ui" run typecheck` ·
 `npm --prefix "$TOP/ui" run test` · `npm --prefix "$TOP/ui" run build` ·
 run `npm --prefix "$TOP/ui" run e2e:install` once per machine before first E2E, then
-`E2E_PORT=<private-port> npm --prefix "$TOP/ui" run e2e` under the ownership rules below.
-
-## E2E ownership
-
-For E2E build `ui/dist` and `cargo build --locked -p nexus-engine --features test-injection`
-from the same tree. The current harness hardcodes `$WT/target/debug/nexus-engine`; if
-`$WT/target` is absent, a run-owned symlink to that tree's private target is acceptable.
-Verify an existing path belongs to this tree before using it; never replace unknown
-contents or use another tree's binary. Use a unique `E2E_PORT=<port>` and confirm the
-test base URL and engine bind match. Edge E2E is a shared harness: serialize it across all
-worktrees, because the harness uses the shared `/tmp/nexus-e2e-sidecar.json` even with
-separate ports. Preserve this constraint until the harness itself supports isolated state.
-Stop owned engines after tests and verify their ports are no longer listening.
+`E2E_PORT=<private-port> npm --prefix "$TOP/ui" run e2e` under the ownership rules in `e2e-ownership.md` beside this file.
