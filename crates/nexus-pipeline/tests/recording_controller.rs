@@ -2534,6 +2534,52 @@ mod controller {
         c.analysing_until(5, "closed 3 ").await;
     }
 
+    /// PR #406, Codex P1: the pass that ends the window also records an
+    /// alert, sent as the supervisor sends a frame's alerts (its evidence
+    /// counting them, then the alert naming them). The alert is activity on
+    /// that frame, so the clip holding its instant stays open and the alert
+    /// links to it; no second clip, which without pre-roll would start
+    /// after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_alert_on_the_pass_that_ends_the_window_links_to_the_clip_holding_it() {
+        let mut c = observed_and_quiet(1, 0).await;
+        let t = c.elapsed_ms();
+        let active = c
+            .frame_within(t, AnalysisOutcome::Success, 1, quiet(), LONG)
+            .await
+            .unwrap();
+        assert_eq!(clip_id(&active), Some(2));
+        // Media past the minimum duration: no hold keeps clip 2 open.
+        tokio::time::sleep(Duration::from_millis(3_200)).await;
+        let ms = c.elapsed_ms();
+        let event = c.event(ms).await;
+        let alerted = Motion {
+            alerts: 1,
+            ..quiet()
+        };
+        let ended = c.frame(ms, alerted).await;
+        let linked = c.alert(ms, &event).await;
+        assert_eq!(
+            (clip_id(&ended), clip_id(&linked), c.linked(&event).await),
+            (Some(2), Some(2), Some(2)),
+            "{:#?}",
+            c.rec.calls()
+        );
+        c.analysing_until(5, "closed 2 ").await;
+        let calls = c.rec.calls();
+        assert_eq!(
+            calls.iter().filter(|c| c.starts_with("opened ")).count(),
+            2,
+            "{calls:#?}"
+        );
+        let clip = c.store.get_clip(2).await.unwrap().unwrap();
+        let at = c.clock(ms).1;
+        assert!(
+            clip.started_at <= at && clip.ended_at.is_some_and(|end| at <= end),
+            "{at} outside {clip:?}"
+        );
+    }
+
     /// A source lost before the minimum is reached ends the hold: the clip
     /// closes with the partial media it has rather than staying open.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

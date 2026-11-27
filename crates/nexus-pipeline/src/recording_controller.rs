@@ -722,7 +722,9 @@ impl Controller {
         let mut ending = None;
         // Arrival alone starts the policy: degraded coverage counts from healthy ingest.
         if let Some(shadow) = self.shadow.as_mut() {
-            let alert = !self.observed && self.cfg.record_motion_clip_on_alert && alerts > 0;
+            // The frame's alerts are activity at its capture, in observed too:
+            // its window cannot end before the Alert command links them.
+            let alert = self.cfg.record_motion_clip_on_alert && alerts > 0;
             let intent = shadow.evidence(
                 e.origin,
                 e.captured_mono,
