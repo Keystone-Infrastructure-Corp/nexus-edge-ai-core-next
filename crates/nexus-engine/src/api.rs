@@ -11557,15 +11557,42 @@ mod tests {
         assert_eq!(after["mode"], "tone");
     }
 
-    /// Every RTP payload the speaker received, the opening silent frame dropped.
-    fn rtp_frames(rtp: &tokio::net::UdpSocket) -> Vec<Vec<u8>> {
+    /// Every RTP payload the speaker has received since the last drain.
+    fn drain_rtp(rtp: &tokio::net::UdpSocket) -> Vec<Vec<u8>> {
         let mut buf = [0u8; 2048];
         let mut frames = Vec::new();
         while let Ok(n) = rtp.try_recv(&mut buf) {
             frames.push(buf[12..n].to_vec());
         }
+        frames
+    }
+
+    /// Every RTP payload the speaker received, the opening silent frame dropped.
+    fn rtp_frames(rtp: &tokio::net::UdpSocket) -> Vec<Vec<u8>> {
+        let mut frames = drain_rtp(rtp);
         frames.remove(0);
         frames
+    }
+
+    /// `before` is what the speaker had received (`rtp_frames`) when a mute
+    /// returned mid-chime: every frame received since is silent but one. The
+    /// handler sets the call's gain before it replies and `SipCall::send_frame`
+    /// reads it once per frame, just before sending, so only the frame the play
+    /// loop had already built can still carry the old level.
+    #[track_caller]
+    fn assert_silent_after(before: &[Vec<u8>], rtp: &tokio::net::UdpSocket) {
+        const IN_FLIGHT: usize = 1;
+        assert!(!is_silent(&before[0]), "audible before the change");
+        // The 2 s chime is 100 frames; its silent tail would prove nothing.
+        assert!(
+            before.len() + IN_FLIGHT < 100,
+            "the change landed mid-chime"
+        );
+        let after = drain_rtp(rtp);
+        assert!(
+            after.iter().skip(IN_FLIGHT).all(|f| is_silent(f)),
+            "silent after it"
+        );
     }
 
     fn is_silent(frame: &[u8]) -> bool {
@@ -12019,6 +12046,7 @@ mod tests {
             serde_json::json!({ "volume": 0, "boost": true, "auto_max_per_hour": 3 }),
         )
         .await;
+        let before = rtp_frames(&rtp);
         assert_eq!(status, StatusCode::OK, "{body}");
         let out = speaker_json(&body);
         assert_eq!(out["volume"], 0);
@@ -12037,9 +12065,7 @@ mod tests {
         assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
         assert!(started.elapsed() >= std::time::Duration::from_millis(1500));
         wait_idle(&app, std::time::Duration::from_secs(1)).await;
-        let frames = rtp_frames(&rtp);
-        assert!(!is_silent(&frames[0]), "audible before the change");
-        assert!(frames[20..].iter().all(|f| is_silent(f)), "silent after it");
+        assert_silent_after(&before, &rtp);
 
         let stored = store.speaker_output(speaker).await.unwrap();
         assert_eq!(
@@ -12123,6 +12149,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let (status, body) = volume(1, mute).await;
+        let before = rtp_frames(&rtp);
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(speaker_json(&body)["volume"], 0);
 
@@ -12131,9 +12158,7 @@ mod tests {
             .unwrap()
             .unwrap();
         wait_idle(&app, std::time::Duration::from_secs(1)).await;
-        let frames = rtp_frames(&rtp);
-        assert!(!is_silent(&frames[0]), "audible before the change");
-        assert!(frames[20..].iter().all(|f| is_silent(f)), "silent after it");
+        assert_silent_after(&before, &rtp);
 
         // Not persisted: the speaker keeps its own volume.
         assert_eq!(store.speaker_output(speaker).await.unwrap().volume, 100);
