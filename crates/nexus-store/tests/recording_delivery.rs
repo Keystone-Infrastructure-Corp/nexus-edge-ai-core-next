@@ -430,7 +430,8 @@ async fn recording_delivery_counts_delivery_once_across_duplicate_and_overwritte
 
 /// A crash between attempt and completion, and a restart after it, never
 /// double counts: the re-close and re-mark after reopening are no-ops,
-/// while the second transfer is a real second attempt.
+/// while the second transfer is a real second attempt, and a retry
+/// although the interrupted one recorded no failure.
 #[tokio::test]
 async fn recording_delivery_survives_restart_without_double_counting() {
     let dir = tempfile::tempdir().unwrap();
@@ -473,8 +474,34 @@ async fn recording_delivery_survives_restart_without_double_counting() {
     let ord = hour(&snap).core.ordinary;
     assert_eq!(ord.generated_bytes, 1_000, "re-close after restart");
     assert_eq!(ord.attempted_bytes, 2_000, "both transfers were attempted");
-    assert_eq!(ord.retry_count, 0, "no failure was recorded before either");
+    assert_eq!(
+        ord.retry_count, 1,
+        "the second follows an interrupted transfer"
+    );
     assert_eq!(ord.delivered_bytes, 1_000, "re-mark after restart");
+}
+
+/// A failure before any transfer started (the backend check or the hot
+/// read) still makes the next transfer a retry.
+#[tokio::test]
+async fn recording_delivery_counts_a_transfer_after_a_pre_transfer_failure_as_retry() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let id = closed_clip(&store, 1, at(10, 0, 0), 1_000, true).await;
+    store
+        .record_cold_upload_failure(id, at(10, 1, 0), "exists failed", None, false)
+        .await
+        .unwrap();
+    store
+        .record_upload_attempt(RecordingSource::Ordinary, id, at(10, 2, 0), 1_000)
+        .await
+        .unwrap();
+    let snap = store
+        .recording_delivery_stats(|| at(10, 30, 0), None)
+        .await
+        .unwrap();
+    let ord = hour(&snap).core.ordinary;
+    assert_eq!((ord.retry_count, ord.failure_count), (1, 1));
 }
 
 /// Attempted bytes count every transfer whatever its outcome; a transfer

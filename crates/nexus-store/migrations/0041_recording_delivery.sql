@@ -52,6 +52,12 @@ ALTER TABLE alert_clips ADD COLUMN acct_delivered INTEGER NOT NULL DEFAULT 0;
 -- can still complete; its delivery takes that loss back from the same
 -- bucket and clears this.
 ALTER TABLE alert_clips ADD COLUMN acct_evicted_at TEXT;
+-- Cold transfers started per clip, counted in the transaction that counts
+-- the attempt. `cold_attempts` grows only on a recorded failure, so a
+-- transfer cut short by a restart would leave no trace and the next one
+-- would not count as a retry.
+ALTER TABLE motion_clips ADD COLUMN acct_transfer_starts INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE alert_clips ADD COLUMN acct_transfer_starts INTEGER NOT NULL DEFAULT 0;
 
 -- One-time baseline: work that already happened is marked counted, so it
 -- never lands in a bucket. Open clips and the undelivered backlog stay

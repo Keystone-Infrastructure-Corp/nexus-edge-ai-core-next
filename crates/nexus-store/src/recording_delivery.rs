@@ -334,7 +334,7 @@ pub struct DeliveryCounters {
     pub delivered_bytes: i64,
     /// Bytes handed to a transfer, retries included, whatever the outcome.
     pub attempted_bytes: i64,
-    /// Transfers of a clip that had failed before.
+    /// Transfers of a clip that had started a transfer or failed before.
     pub retry_count: i64,
     /// Failed upload attempts.
     pub failure_count: i64,
@@ -628,7 +628,9 @@ impl Store {
 
     /// Count one transfer of `bytes` for clip `id` of `source`, as it
     /// starts: attempted bytes include retries and transfers that never
-    /// finish. A clip with an earlier failed attempt counts as a retry.
+    /// finish. A clip with an earlier transfer started (persisted, so one
+    /// cut short by a restart counts) or an earlier failed attempt counts
+    /// as a retry.
     pub async fn record_upload_attempt(
         &self,
         source: RecordingSource,
@@ -637,20 +639,23 @@ impl Store {
         bytes: i64,
     ) -> Result<(), StoreError> {
         let table = source.gates().table;
-        let mut conn = self.pool.acquire().await?;
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(&format!(
-            "SELECT camera_id, cold_attempts FROM {table} WHERE id = ?"
+            "UPDATE {table} SET acct_transfer_starts = acct_transfer_starts + 1
+              WHERE id = ? RETURNING camera_id, acct_transfer_starts, cold_attempts"
         ))
         .bind(id)
-        .fetch_optional(&mut *conn)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| StoreError::NotFound(format!("{table} id={id}")))?;
         let counters = DeliveryCounters {
             attempted_bytes: bytes.max(0),
-            retry_count: i64::from(row.get::<i64, _>(1) > 0),
+            retry_count: i64::from(row.get::<i64, _>(1) > 1 || row.get::<i64, _>(2) > 0),
             ..DeliveryCounters::default()
         };
-        add_to_bucket(self, &mut conn, row.get(0), source, at, &counters).await
+        add_to_bucket(self, &mut tx, row.get(0), source, at, &counters).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// The enrolled core's upload floor, for eviction accounting. A failed
