@@ -476,9 +476,10 @@ pub struct RecordingDeliverySnapshot {
 }
 
 /// Add `d` to the `(minute of at, camera, source)` bucket and prune buckets
-/// more than [`BUCKET_RETENTION_SECS`] older than it, or than the prune
-/// horizon of [`Store::check_clock`] if that is earlier. Callers run it in
-/// the transaction of the transition being counted.
+/// (and ordinary eviction records) more than [`BUCKET_RETENTION_SECS`]
+/// older than it, or than the prune horizon of [`Store::check_clock`] if
+/// that is earlier. Callers run it in the transaction of the transition
+/// being counted.
 pub(crate) async fn add_to_bucket(
     store: &Store,
     conn: &mut SqliteConnection,
@@ -524,8 +525,17 @@ pub(crate) async fn add_to_bucket(
     .bind(d.evicted_before_upload_count)
     .execute(&mut *conn)
     .await?;
+    let cutoff = minute.min(horizon.timestamp().div_euclid(60) * 60) - BUCKET_RETENTION_SECS;
     sqlx::query("DELETE FROM recording_minute_buckets WHERE minute_utc < ?")
-        .bind(minute.min(horizon.timestamp().div_euclid(60) * 60) - BUCKET_RETENTION_SECS)
+        .bind(cutoff)
+        .execute(&mut *conn)
+        .await?;
+    // An ordinary eviction's loss record goes with the bucket it counted in.
+    sqlx::query("DELETE FROM motion_clip_evictions WHERE evicted_at < ?")
+        .bind(
+            DateTime::<Utc>::from_timestamp(cutoff, 0)
+                .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true)),
+        )
         .execute(&mut *conn)
         .await?;
     Ok(())

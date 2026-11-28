@@ -52,6 +52,18 @@ ALTER TABLE alert_clips ADD COLUMN acct_delivered INTEGER NOT NULL DEFAULT 0;
 -- can still complete; its delivery takes that loss back from the same
 -- bucket and clears this.
 ALTER TABLE alert_clips ADD COLUMN acct_evicted_at TEXT;
+-- The evictor deletes an ordinary clip's row, so the loss it counted is
+-- kept here instead (`evicted_at` shaped as `acct_evicted_at`) for a PUT
+-- that read the file before the unlink: its delivery takes the loss back
+-- and removes the record. Pruned with the minute buckets.
+CREATE TABLE IF NOT EXISTS motion_clip_evictions (
+    clip_id    INTEGER PRIMARY KEY,
+    camera_id  INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    evicted_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS motion_clip_evictions_by_time
+    ON motion_clip_evictions (evicted_at);
 -- Cold transfers started per clip, counted in the transaction that counts
 -- the attempt. `cold_attempts` grows only on a recorded failure, so a
 -- transfer cut short by a restart would leave no trace and the next one

@@ -30,12 +30,14 @@
 //! same rule explicitly so the error surfaces as `DeleteBackendError`
 //! instead of a raw `sqlx::Error`.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use nexus_types::{BBox, CameraId, TrackId};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
-use crate::recording_delivery::{add_to_bucket, DeliveryCounters, RecordingSource, MOTION_GATES};
+use crate::recording_delivery::{
+    add_to_bucket, take_back_loss, DeliveryCounters, RecordingSource, MOTION_GATES,
+};
 use crate::{Store, StoreError};
 
 // ---------------------------------------------------------------------------
@@ -672,9 +674,12 @@ impl Store {
     /// SPEC-090 — every evictor deletes through here, so a clip deleted
     /// while still in the upload queue (finalized, undelivered, not before
     /// the enrollment floor) is counted as evicted before upload in the
-    /// same transaction.
+    /// same transaction, and that loss is recorded in
+    /// `motion_clip_evictions` so a PUT that already read the clip can
+    /// take it back (see [`Self::mark_cold_uploaded`]).
     pub async fn cascade_delete_clip_metadata(&self, clip_id: ClipId) -> Result<(), StoreError> {
         let floor = self.eviction_floor().await;
+        let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(&format!(
             "DELETE FROM motion_clips WHERE id = ?1
@@ -693,9 +698,19 @@ impl Store {
                 &mut tx,
                 row.get(0),
                 RecordingSource::Ordinary,
-                Utc::now(),
+                now,
                 &evicted,
             )
+            .await?;
+            sqlx::query(
+                "INSERT INTO motion_clip_evictions (clip_id, camera_id, size_bytes, evicted_at)
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(clip_id)
+            .bind(row.get::<CameraId, _>(0))
+            .bind(row.get::<i64, _>(1))
+            .bind(now.to_rfc3339_opts(SecondsFormat::Millis, true))
+            .execute(&mut *tx)
             .await?;
         }
         tx.commit().await?;
@@ -1208,6 +1223,8 @@ impl Store {
     /// [`Self::mark_cold_replicated`] after a transfer of `payload_bytes`:
     /// SPEC-090 counts those bytes as delivered, so a clip whose stored
     /// size is unknown is not delivered as 0. `None` counts the stored size.
+    /// A clip the evictor deleted and counted lost while this transfer was
+    /// in flight is counted delivered once and its loss taken back.
     pub async fn mark_cold_uploaded(
         &self,
         clip_id: ClipId,
@@ -1226,17 +1243,34 @@ impl Store {
         .bind(clip_id)
         .execute(&mut *tx)
         .await?;
-        if res.rows_affected() == 0 {
-            return Err(StoreError::NotFound(format!("motion_clip id={clip_id}")));
-        }
-        let counted = sqlx::query(
-            "UPDATE motion_clips SET acct_delivered = 1
-              WHERE id = ? AND acct_delivered = 0
-              RETURNING camera_id, size_bytes",
-        )
-        .bind(clip_id)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let counted = if res.rows_affected() > 0 {
+            sqlx::query(
+                "UPDATE motion_clips SET acct_delivered = 1
+                  WHERE id = ? AND acct_delivered = 0
+                  RETURNING camera_id, size_bytes",
+            )
+            .bind(clip_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            let lost = sqlx::query(
+                "DELETE FROM motion_clip_evictions WHERE clip_id = ?
+                 RETURNING camera_id, size_bytes, evicted_at",
+            )
+            .bind(clip_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| StoreError::NotFound(format!("motion_clip id={clip_id}")))?;
+            take_back_loss(
+                &mut tx,
+                lost.get(0),
+                RecordingSource::Ordinary,
+                &lost.get::<String, _>(2),
+                lost.get(1),
+            )
+            .await?;
+            Some(lost)
+        };
         if let Some(r) = counted {
             let delivered = DeliveryCounters {
                 delivered_bytes: payload_bytes.unwrap_or_else(|| r.get(1)).max(0),

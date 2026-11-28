@@ -779,6 +779,116 @@ async fn recording_delivery_reconciles_a_loss_when_the_upload_completes_after_ev
     );
 }
 
+/// PR #404 review: an upload reads an ordinary clip, the evictor deletes
+/// its row and counts it lost, then the PUT succeeds. The completion takes
+/// the loss back through the eviction's record, so eviction then
+/// completion counts what a plain completion does, and a duplicate
+/// completion changes nothing.
+#[tokio::test]
+async fn recording_delivery_reconciles_an_ordinary_loss_when_the_upload_completes_after_eviction() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let started = Utc::now() - Duration::minutes(5);
+    let late = closed_clip(&store, 1, started, 1_000, true).await;
+    let plain = closed_clip(&store, 2, started, 1_000, true).await;
+    // Both transfers start and read their clip.
+    let _in_flight = [late, plain].map(|id| store.begin_transfer(RecordingSource::Ordinary, id));
+    for id in [late, plain] {
+        store
+            .record_upload_attempt(RecordingSource::Ordinary, id, Utc::now(), 1_000)
+            .await
+            .unwrap();
+    }
+    // Mid-PUT, the evictor deletes `late`.
+    store.cascade_delete_clip_metadata(late).await.unwrap();
+    let minute: i64 = sqlx::query_scalar(
+        "SELECT minute_utc FROM recording_minute_buckets WHERE evicted_before_upload_count > 0",
+    )
+    .fetch_one(store.pool())
+    .await
+    .unwrap();
+    // Both PUTs land.
+    let done = cold_mark("a.mp4", Utc.timestamp_opt(minute + 30, 0).unwrap());
+    for id in [late, plain] {
+        store
+            .mark_cold_uploaded(id, &done, Some(1_000))
+            .await
+            .unwrap();
+    }
+
+    let sample =
+        |at: i64| store.recording_delivery_stats(move || Utc.timestamp_opt(at, 0).unwrap(), None);
+    let inside = sample(minute + 20).await.unwrap();
+    let after = sample(minute + 120).await.unwrap();
+    for (o, what) in [
+        (inside.since_window_end.ordinary, "since_window_end"),
+        (hour(&after).core.ordinary, "1 h window"),
+    ] {
+        assert_eq!(
+            (
+                o.delivered_bytes,
+                o.evicted_before_upload_bytes,
+                o.evicted_before_upload_count
+            ),
+            (2_000, 0, 0),
+            "{what}: both clips delivered, neither lost"
+        );
+    }
+    let cams = &hour(&after).cameras;
+    assert_eq!(
+        cams[0].counters.ordinary, cams[1].counters.ordinary,
+        "eviction then completion counts what a plain completion does"
+    );
+
+    assert!(
+        store
+            .mark_cold_uploaded(late, &done, Some(1_000))
+            .await
+            .is_err(),
+        "no row and no loss left to mark"
+    );
+    assert_eq!(
+        sample(minute + 120).await.unwrap(),
+        after,
+        "a duplicate completion changes nothing"
+    );
+}
+
+/// PR #404 review: an ordinary PUT that fails after the evictor counted its
+/// clip lost keeps the loss; only a completion takes it back.
+#[tokio::test]
+async fn recording_delivery_keeps_an_ordinary_loss_when_the_upload_fails_after_eviction() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let id = closed_clip(&store, 1, Utc::now() - Duration::minutes(5), 1_000, true).await;
+    let in_flight = store.begin_transfer(RecordingSource::Ordinary, id);
+    store
+        .record_upload_attempt(RecordingSource::Ordinary, id, Utc::now(), 1_000)
+        .await
+        .unwrap();
+    store.cascade_delete_clip_metadata(id).await.unwrap();
+    // The PUT fails; the replicator records it against a row that is gone.
+    assert!(store
+        .record_cold_upload_failure(id, Utc::now(), "put failed", None, false)
+        .await
+        .is_err());
+    drop(in_flight);
+
+    let snap = store
+        .recording_delivery_stats(|| Utc::now() + Duration::minutes(2), None)
+        .await
+        .unwrap();
+    let o = hour(&snap).core.ordinary;
+    assert_eq!(
+        (
+            o.delivered_bytes,
+            o.evicted_before_upload_bytes,
+            o.evicted_before_upload_count
+        ),
+        (0, 1_000, 1)
+    );
+}
+
 /// Codex review 10: the loss is taken back from the minute that counted the
 /// eviction, not the completion's. The eviction is moved three minutes
 /// back (the test clock cannot complete in the future), so the late
@@ -1186,6 +1296,21 @@ async fn recording_delivery_prunes_buckets_older_than_seven_days() {
         vec![t0.timestamp(), (t0 + Duration::days(7)).timestamp()],
         "exactly seven days old is kept"
     );
+    // An ordinary eviction's record goes with the bucket of its minute.
+    for (clip_id, at) in [
+        (901, t0 + Duration::seconds(30)),
+        (902, t0 + Duration::days(7)),
+    ] {
+        sqlx::query(
+            "INSERT INTO motion_clip_evictions (clip_id, camera_id, size_bytes, evicted_at)
+             VALUES (?, 1, 1, ?)",
+        )
+        .bind(clip_id)
+        .bind(at.to_rfc3339_opts(SecondsFormat::Millis, true))
+        .execute(store.pool())
+        .await
+        .unwrap();
+    }
     closed_clip(
         &store,
         1,
@@ -1201,6 +1326,11 @@ async fn recording_delivery_prunes_buckets_older_than_seven_days() {
             (t0 + Duration::days(7) + Duration::minutes(1)).timestamp()
         ]
     );
+    let kept: Vec<i64> = sqlx::query_scalar("SELECT clip_id FROM motion_clip_evictions")
+        .fetch_all(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(kept, vec![902]);
 }
 
 /// Rows that exist when migration 0041 runs are a baseline: no bucket is

@@ -1191,11 +1191,13 @@ async fn upload_one(
     let announce = match receipt.cold_url {
         Some(url) => {
             let env = motion_clip_envelope(clip, url.clone(), attached_history);
-            store
-                .stamp_clip_announce(clip.id, &url, &env.meta.id)
-                .await
-                .map_err(UploadError::Store)?;
-            Some(env)
+            match store.stamp_clip_announce(clip.id, &url, &env.meta.id).await {
+                Ok(()) => Some(env),
+                // SPEC-090 — evicted mid-PUT: no row to announce, but the
+                // mark below still counts the delivery against the loss.
+                Err(nexus_store::StoreError::NotFound(_)) => None,
+                Err(e) => return Err(UploadError::Store(e)),
+            }
         }
         None => None,
     };
@@ -2849,6 +2851,44 @@ mod tests {
             (0, 0),
             "delivered, so not lost"
         );
+    }
+
+    /// PR #404 review — the evictor deletes a motion clip's row (counting it
+    /// lost) while its PUT is in flight with the bytes already read. The PUT
+    /// still lands, with or without a blob URL to announce, so the clip
+    /// counts delivered and not lost.
+    #[tokio::test]
+    async fn recording_delivery_motion_clip_evicted_mid_upload_counts_delivered_not_lost() {
+        for with_url in [false, true] {
+            let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+            let backend = MockBackend::new("mock", HealthStatus::Ok);
+            *backend.with_url.lock() = with_url;
+            let evictor = store.clone();
+            *backend.first_put_hook.lock() = Some(Box::pin(async move {
+                evictor.cascade_delete_clip_metadata(clip_id).await.unwrap();
+            }));
+            let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+            let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+            upload_one(
+                &cfg,
+                &store,
+                &*backend,
+                &TokenBucket::new(0),
+                "mock",
+                &clip,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("with_url={with_url}: {e}"));
+
+            let c = hour_counters(&store).await.ordinary;
+            assert_eq!(c.delivered_bytes, 10, "with_url={with_url}");
+            assert_eq!(
+                (c.evicted_before_upload_bytes, c.evicted_before_upload_count),
+                (0, 0),
+                "with_url={with_url}: delivered, so not lost"
+            );
+        }
     }
 
     /// SPEC-090 — while its PUT is in flight a clip is marked in flight
