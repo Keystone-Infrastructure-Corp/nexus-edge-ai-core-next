@@ -326,6 +326,7 @@ impl Store {
         mark: &AlertClipColdMark,
         payload_bytes: Option<i64>,
     ) -> Result<(), StoreError> {
+        let _gate = self.delivery.snapshot_gate.read().await;
         let mut tx = self.pool.begin().await?;
         let updated: Option<Option<String>> = sqlx::query_scalar(
             "UPDATE alert_clips

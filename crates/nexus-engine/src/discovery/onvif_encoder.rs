@@ -360,9 +360,9 @@ fn apply_config_leaf(c: &mut VideoEncoderConfig, section: Option<&str>, leaf: &s
             "BitrateLimit" => c.bitrate_limit = v.parse().ok(),
             _ => {}
         },
-        Some("H264") | Some("H265") => match leaf {
+        Some("H264") | Some("H265") | Some("MPEG4") | Some("Mpeg4") => match leaf {
             "GovLength" => c.gov_length = v.parse().ok(),
-            "H264Profile" | "H265Profile" => c.profile = Some(v.to_string()),
+            "H264Profile" | "H265Profile" | "Mpeg4Profile" => c.profile = Some(v.to_string()),
             _ => {}
         },
         _ => {}
@@ -485,7 +485,10 @@ fn apply_option_leaf(
         ),
         _ => {
             // Top-level (no range section) profile lists.
-            if leaf == "H264ProfilesSupported" || leaf == "H265ProfilesSupported" {
+            if matches!(
+                leaf,
+                "H264ProfilesSupported" | "H265ProfilesSupported" | "Mpeg4ProfilesSupported"
+            ) {
                 out.profiles_supported.push(v.to_string());
             }
         }
@@ -715,5 +718,32 @@ mod tests {
         let mpeg4 = set_config_body(&with("MPEG4"), false);
         assert!(mpeg4.contains("<tt:MPEG4><tt:GovLength>20</tt:GovLength><tt:Mpeg4Profile>SP</tt:Mpeg4Profile></tt:MPEG4>"), "{mpeg4}");
         assert!(!mpeg4.contains("<tt:H264>"), "{mpeg4}");
+    }
+
+    /// An MPEG4 configuration keeps its GOP length and profile, so a
+    /// partial write re-sends them instead of dropping its MPEG4 block.
+    #[test]
+    fn parses_mpeg4_codec_fields_and_writes_them_back() {
+        let body = wrap(
+            r#"<trt:GetVideoEncoderConfigurationsResponse><trt:Configurations token="VE_m"><tt:Encoding>MPEG4</tt:Encoding><tt:MPEG4><tt:GovLength>25</tt:GovLength><tt:Mpeg4Profile>ASP</tt:Mpeg4Profile></tt:MPEG4></trt:Configurations></trt:GetVideoEncoderConfigurationsResponse>"#,
+        );
+        let c = &parse_configs(&body)[0];
+        assert_eq!(
+            (c.gov_length, c.profile.as_deref()),
+            (Some(25), Some("ASP"))
+        );
+        let out = set_config_body(c, false);
+        assert!(out.contains("<tt:MPEG4><tt:GovLength>25</tt:GovLength><tt:Mpeg4Profile>ASP</tt:Mpeg4Profile></tt:MPEG4>"), "{out}");
+    }
+
+    /// MPEG4's profile list is collected like H264's and H265's.
+    #[test]
+    fn parses_mpeg4_profiles_supported() {
+        let body = wrap(
+            r#"<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options><tt:MPEG4><tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>60</tt:Max></tt:GovLengthRange><tt:Mpeg4ProfilesSupported>SP</tt:Mpeg4ProfilesSupported><tt:Mpeg4ProfilesSupported>ASP</tt:Mpeg4ProfilesSupported></tt:MPEG4></trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>"#,
+        );
+        let o = parse_options(&body, Some("MPEG4"));
+        assert_eq!(o.profiles_supported, vec!["SP".to_string(), "ASP".into()]);
+        assert_eq!(o.gov_length_range, Some(IntRange { min: 1, max: 60 }));
     }
 }

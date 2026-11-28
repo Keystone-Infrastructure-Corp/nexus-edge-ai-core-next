@@ -1234,6 +1234,7 @@ impl Store {
         mark: &ClipColdMark,
         payload_bytes: Option<i64>,
     ) -> Result<(), StoreError> {
+        let _gate = self.delivery.snapshot_gate.read().await;
         let mut tx = self.pool.begin().await?;
         let res = sqlx::query(
             "UPDATE motion_clips

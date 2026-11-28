@@ -60,16 +60,28 @@ const WINDOW_SECONDS: [i64; 2] = [60 * 60, 24 * 60 * 60];
 pub(crate) struct DeliveryState {
     clock: Mutex<DeliveryClock>,
     transfers: Mutex<Transfers>,
+    /// A delivery commits under a read lock and the stats read pins its
+    /// snapshot and reads the transfers under the write lock: a completion
+    /// commits, and only then drops its guard, so it must not land between
+    /// the two (a failure drops the guard first and needs no lock).
+    pub(crate) snapshot_gate: tokio::sync::RwLock<()>,
     /// Test seam: the stats read signals the sender and waits on the
     /// receiver just before it opens its read transaction.
     #[cfg(test)]
-    test_before_pin: Mutex<
-        Option<(
-            tokio::sync::oneshot::Sender<()>,
-            tokio::sync::oneshot::Receiver<()>,
-        )>,
-    >,
+    test_before_pin: TestSeam,
+    /// Test seam: as `test_before_pin`, once the snapshot is pinned and
+    /// before the transfers are read.
+    #[cfg(test)]
+    test_after_pin: TestSeam,
 }
+
+#[cfg(test)]
+type TestSeam = Mutex<
+    Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+>;
 
 /// Clip ids an uploader is transferring now, per queue; `None` until that
 /// queue's uploader is tracked, so the snapshot cannot claim zero.
@@ -96,12 +108,8 @@ impl DeliveryState {
     }
 
     #[cfg(test)]
-    async fn test_pause_before_pin(&self) {
-        let seam = self
-            .test_before_pin
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+    async fn test_pause(seam: &TestSeam) {
+        let seam = seam.lock().unwrap_or_else(PoisonError::into_inner).take();
         if let Some((reached, resume)) = seam {
             let _ = reached.send(());
             let _ = resume.await;
@@ -838,13 +846,16 @@ impl Store {
         // checked outside the read transaction, which then never writes.
         self.check_clock(&mut *self.pool.acquire().await?).await?;
         #[cfg(test)]
-        self.delivery.test_pause_before_pin().await;
+        DeliveryState::test_pause(&self.delivery.test_before_pin).await;
+        let gate = self.delivery.snapshot_gate.write().await;
         let mut tx = self.pool.begin().await?;
         let since: String = sqlx::query_scalar(
             "SELECT accounting_since FROM recording_delivery_baseline WHERE id = 1",
         )
         .fetch_one(&mut *tx)
         .await?;
+        #[cfg(test)]
+        DeliveryState::test_pause(&self.delivery.test_after_pin).await;
         // WAL pins the read snapshot at the first read, just above. Read the
         // transfers after it: a transfer's guard drops before its failure
         // commits, so one the snapshot shows failed is never marked, and
@@ -853,6 +864,7 @@ impl Store {
             let t = self.delivery.transfers();
             (t.ordinary.clone(), t.alert.clone())
         };
+        drop(gate);
         let now = clock();
         let accounting_since = crate::motion::parse_ts(&since)?;
         let ordinary = queue_totals(
@@ -1439,6 +1451,56 @@ mod tests {
             snap.ordinary.in_flight.unwrap().count,
             0,
             "the failed clip is not also in flight"
+        );
+    }
+    /// An upload completes after the snapshot is pinned and before the
+    /// transfers are read. The snapshot still shows the clip queued, so it
+    /// must also show it in flight, not as a queued clip nobody sends.
+    #[tokio::test]
+    async fn recording_delivery_transfer_completed_after_the_pin_stays_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let t0 = Utc::now();
+        let store = store_since(dir.path(), t0).await;
+        set_wall(&store, t0);
+        let clip = closed(&store, t0 - Duration::minutes(30), 1_000).await;
+        store.track_transfers(RecordingSource::Ordinary);
+        let transfer = store.begin_transfer(RecordingSource::Ordinary, clip);
+        let (reached, at_seam) = tokio::sync::oneshot::channel();
+        let (resume, resumed) = tokio::sync::oneshot::channel();
+        *store.delivery.test_after_pin.lock().unwrap() = Some((reached, resumed));
+        let stats = tokio::spawn({
+            let store = store.clone();
+            async move { store.recording_delivery_stats(move || t0, None).await }
+        });
+
+        at_seam.await.unwrap();
+        // As in the replicator: the completion commits, then the guard drops.
+        let mut completion = tokio::spawn({
+            let store = store.clone();
+            async move {
+                let r = store.mark_cold_uploaded(clip, &cold_mark(t0), None).await;
+                drop(transfer);
+                r
+            }
+        });
+        // Let an uncoordinated completion run to the end before resuming.
+        let early = tokio::time::timeout(std::time::Duration::from_millis(300), &mut completion)
+            .await
+            .is_ok();
+        resume.send(()).unwrap();
+
+        let snap = stats.await.unwrap().unwrap();
+        if !early {
+            completion.await.unwrap().unwrap();
+        }
+        assert_eq!(
+            snap.ordinary.ready.count, 1,
+            "the pinned snapshot shows it queued"
+        );
+        assert_eq!(
+            snap.ordinary.in_flight.unwrap().count,
+            1,
+            "a queued clip whose upload is completing is in flight"
         );
     }
 }
