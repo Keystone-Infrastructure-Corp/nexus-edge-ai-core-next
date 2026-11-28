@@ -343,7 +343,10 @@ mod tests {
             .await
             .unwrap();
         Store::apply_schema(&pool).await.unwrap();
-        Store { pool }
+        Store {
+            pool,
+            delivery: Default::default(),
+        }
     }
 
     /// A live policy change mid-minute: the earlier revision's counters for
