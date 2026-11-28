@@ -163,6 +163,16 @@ pub trait ClipRecorder: Send + Sync {
         false
     }
 
+    /// Media written to the open clip so far, retained pre-roll included,
+    /// in milliseconds of its own timeline. SPEC-089's minimum-duration hold
+    /// reads it so a short clip is closed only once [`MIN_CLIP_DURATION_MS`]
+    /// of real footage exists. `None` (the default) means the recorder
+    /// cannot tell, and the controller counts time since the open instead.
+    #[allow(unused_variables)]
+    fn inflight_media_ms(&self, handle: ClipHandle) -> Option<u64> {
+        None
+    }
+
     /// Set or clear the panic flag. The watermark sampler calls
     /// `set_panic(true)` when free space is below
     /// `panic_watermark_pct` and `set_panic(false)` once eviction has

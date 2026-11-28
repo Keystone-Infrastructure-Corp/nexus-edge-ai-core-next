@@ -1275,6 +1275,12 @@ async fn pump_rpc_dispatch<H: TunnelHandle>(
 /// `camera_config_snapshot_v1` says this engine serves
 /// `GET /admin/cameras/{id}/config-snapshot` (SPEC-088) and maps it to a
 /// camera `settings.read`; both ship in every build, so it is unconditional.
+/// `recording_activity_v1` says this engine reports and compare-and-sets a
+/// camera's `recording_policy` with its `recording_policy_revision`, and
+/// reports the revision it runs in the camera's stats (SPEC-089); every build
+/// does, so it is unconditional too. `recording_policy_write_v1` says this
+/// engine serves `PUT /admin/cameras/{id}/recording-policy`, the policy-only
+/// write (SPEC-089); also unconditional.
 pub(crate) fn heartbeat_caps(
     hd_transport: Option<nexus_types::HdTransport>,
     talkdown_hw_volume: bool,
@@ -1286,6 +1292,8 @@ pub(crate) fn heartbeat_caps(
         "talkdown_stored".to_string(),
         "talkdown_rules".to_string(),
         "camera_config_snapshot_v1".to_string(),
+        "recording_activity_v1".to_string(),
+        "recording_policy_write_v1".to_string(),
     ];
     caps.extend(hd_transport.map(|t| t.cap_tag().to_string()));
     caps.extend(talkdown_hw_volume.then(|| "talkdown_hw_volume".to_string()));
@@ -2814,7 +2822,9 @@ mod health_tests {
                 "actor_perm_v1",
                 "talkdown_stored",
                 "talkdown_rules",
-                "camera_config_snapshot_v1"
+                "camera_config_snapshot_v1",
+                "recording_activity_v1",
+                "recording_policy_write_v1"
             ]
         );
         for t in nexus_types::HdTransport::all() {
@@ -2826,6 +2836,8 @@ mod health_tests {
                     "talkdown_stored",
                     "talkdown_rules",
                     "camera_config_snapshot_v1",
+                    "recording_activity_v1",
+                    "recording_policy_write_v1",
                     t.cap_tag()
                 ]
             );
@@ -2844,6 +2856,8 @@ mod health_tests {
                 "talkdown_stored",
                 "talkdown_rules",
                 "camera_config_snapshot_v1",
+                "recording_activity_v1",
+                "recording_policy_write_v1",
                 "talkdown_tts"
             ]
         );
@@ -4709,7 +4723,9 @@ mod heartbeat_ack_tests {
                     "actor_perm_v1",
                     "talkdown_stored",
                     "talkdown_rules",
-                    "camera_config_snapshot_v1"
+                    "camera_config_snapshot_v1",
+                    "recording_activity_v1",
+                    "recording_policy_write_v1"
                 ],
                 "{t}"
             );
@@ -4732,6 +4748,8 @@ mod heartbeat_ack_tests {
                 "talkdown_stored",
                 "talkdown_rules",
                 "camera_config_snapshot_v1",
+                "recording_activity_v1",
+                "recording_policy_write_v1",
                 "hd_sfu"
             ]
         );
@@ -4753,6 +4771,8 @@ mod heartbeat_ack_tests {
                 "talkdown_stored",
                 "talkdown_rules",
                 "camera_config_snapshot_v1",
+                "recording_activity_v1",
+                "recording_policy_write_v1",
                 "hd_moq",
             ]
         } else {
@@ -4762,6 +4782,8 @@ mod heartbeat_ack_tests {
                 "talkdown_stored",
                 "talkdown_rules",
                 "camera_config_snapshot_v1",
+                "recording_activity_v1",
+                "recording_policy_write_v1",
             ]
         };
         assert_eq!(

@@ -17,6 +17,7 @@ pub mod fleet;
 pub mod metrics;
 pub mod motion;
 pub mod outbox;
+pub mod recording_activity;
 pub mod recording_delivery;
 pub mod sessions;
 pub mod sinks;
@@ -34,6 +35,7 @@ pub use motion::{
     NewClip, NewMotionEvent, PerCameraClipStats, StorageBackendRow,
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
+pub use recording_activity::{RecordingActivityEpisode, RecordingActivityMinute};
 pub use recording_delivery::{
     CameraDelivery, DeliveryCounters, DeliveryQueue, DeliveryWindow, InFlight, PartitionTotals,
     QueuePartition, RecordingDeliverySnapshot, RecordingSource, SourceCounters, TransferGuard,
@@ -238,6 +240,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0041_recording_delivery",
         include_str!("../migrations/0041_recording_delivery.sql"),
     ),
+    (
+        "0042_recording_activity_diagnostics",
+        include_str!("../migrations/0042_recording_activity_diagnostics.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]
@@ -277,6 +283,13 @@ pub struct Store {
     delivery: Arc<recording_delivery::DeliveryState>,
 }
 
+/// SPEC-089 — a new opaque `recording_policy_revision`: 32 hex digits of a
+/// UUIDv7 (time-ordered, random below), unique per call and carrying nothing
+/// of the camera.
+pub fn new_recording_policy_revision() -> String {
+    uuid::Uuid::now_v7().simple().to_string()
+}
+
 impl Store {
     pub async fn open(cfg: &StoreConfig) -> Result<Self, StoreError> {
         // Strip leading `sqlite:` so SqliteConnectOptions::from_str-style parsing works.
@@ -305,11 +318,51 @@ impl Store {
         } else {
             pool
         };
+        Self::assign_recording_policy_revisions(&mut *pool.acquire().await?).await?;
 
         Ok(Self {
             pool,
             delivery: Arc::default(),
         })
+    }
+
+    /// SPEC-089 — persist a `recording_policy_revision` for every camera row
+    /// saved without one (by an older build, or the TOML seed), so reads
+    /// report one token until the policy changes instead of inventing one
+    /// per read. A row that is not a JSON object is left as it is: this build
+    /// cannot read it anyway ([`Store::list_readable_cameras`]).
+    async fn assign_recording_policy_revisions(
+        conn: &mut sqlx::SqliteConnection,
+    ) -> Result<(), StoreError> {
+        let rows = sqlx::query("SELECT id, config_json FROM cameras")
+            .fetch_all(&mut *conn)
+            .await?;
+        for row in rows {
+            let id: CameraId = row.try_get(0)?;
+            let missing = row
+                .try_get::<&str, _>(1)
+                .ok()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|camera| {
+                    camera.as_object().map(|camera| {
+                        camera
+                            .get("recording_policy_revision")
+                            .and_then(serde_json::Value::as_str)
+                            .is_none_or(str::is_empty)
+                    })
+                });
+            if missing == Some(true) {
+                sqlx::query(
+                    "UPDATE cameras SET config_json = \
+                     json_set(config_json, '$.recording_policy_revision', ?) WHERE id = ?",
+                )
+                .bind(new_recording_policy_revision())
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn build_pool(opts: SqliteConnectOptions) -> Result<SqlitePool, StoreError> {
@@ -464,6 +517,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
+        Self::assign_recording_policy_revisions(&mut tx).await?;
         for rule in &cfg.rules.inline {
             let json = serde_json::to_string(rule)?;
             sqlx::query(
@@ -580,6 +634,8 @@ impl Store {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         cam: &mut CameraConfig,
     ) -> Result<(), StoreError> {
+        // SPEC-089 — server-owned: a create keeps no revision it was sent.
+        cam.behavior.recording_policy_revision = new_recording_policy_revision();
         // Insert with NULL id to trigger rowid auto-assignment.
         // `config_json` is provisionally serialised with whatever
         // id the caller passed in (usually 0) — we rewrite it

@@ -25,6 +25,7 @@ use nexus_types::CameraId;
 use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 
+use crate::recording_diagnostics::RecordingActivityRegistry;
 use crate::zone_application::ZoneApplicationRegistry;
 
 /// Sliding window over which `fps_ema` is averaged. Two seconds is
@@ -235,6 +236,9 @@ pub struct FrameStatsRegistry {
     /// already share this registry. [`Self::clear`] leaves it alone, so a
     /// restart keeps the camera's last applied revision for comparison.
     zone_application: ZoneApplicationRegistry,
+    /// SPEC-089 — each shadow camera's recording-activity runtime, for the
+    /// same reason.
+    recording_activity: RecordingActivityRegistry,
 }
 
 impl FrameStatsRegistry {
@@ -245,6 +249,11 @@ impl FrameStatsRegistry {
     /// Which zone revision each camera's running supervisor applied.
     pub fn zone_application(&self) -> &ZoneApplicationRegistry {
         &self.zone_application
+    }
+
+    /// Which cameras run the fresh-evidence recording policy, and how.
+    pub fn recording_activity(&self) -> &RecordingActivityRegistry {
+        &self.recording_activity
     }
 
     fn slot(&self, camera_id: CameraId) -> Option<Arc<Mutex<Slot>>> {

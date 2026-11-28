@@ -89,6 +89,9 @@ pub struct RunningCameraEntry {
     /// SPEC-088 — the supervisor's zone generation, which [`stop_camera`]
     /// names when it stops it.
     zone_generation: u64,
+    /// SPEC-089 — the camera's recording controller, which takes a
+    /// `recording_policy` change without a restart ([`apply_recording_policy`]).
+    recording: nexus_pipeline::recording_controller::RecordingControl,
 }
 
 impl RunningCameraEntry {
@@ -282,6 +285,10 @@ fn changed_behavior_field(started: &CameraBehavior, want: &CameraBehavior) -> Op
         supervisor_width: _,
         detector_downscale_to_width: _,
         detector_downscale_to_height: _,
+        // SPEC-089: a mode change must not restart (gap) the camera; the recording controller applies it live.
+        recording_policy: _,
+        // SPEC-089: names the saved policy; applied live with it.
+        recording_policy_revision: _,
     } = want;
 
     if *parking_lot_mode != started.parking_lot_mode {
@@ -664,6 +671,7 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                 // edits today), and register again what the camera's
                 // start registered, which never restarts it.
                 retry_sessions(args, &cam, entry);
+                apply_recording_policy(args, &cam, entry).await;
                 continue;
             }
             Some(entry) => {
@@ -753,20 +761,22 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
 ///
 /// It sits well above the recorder's own worst-case close — up to 2 s for
 /// the live pump plus `EOS_DRAIN_TIMEOUT` (5 s) for the drain — so a normal
-/// close finishes inside it. An abort that lands inside an open or close no
-/// longer abandons the clip: `GstClipRecorder` runs both in tasks it owns and
-/// its shutdown drain waits for them (SPEC-088 Z-4). A clip an aborted
-/// supervisor merely held is finalized by [`stop_camera`]'s drain of the
-/// camera, also bounded by this; a camera not drained within it stays
-/// stopping.
+/// close finishes inside it. An abort abandons no clip: the camera's
+/// recording controller owns it, not the supervisor, and finalizes it through
+/// the recorder once the aborted supervisor is gone and the stop is requested
+/// (SPEC-089); the controller holds a stop receiver too, so `closed()` waits
+/// for that close as well. `GstClipRecorder` runs opens and closes in tasks
+/// it owns (SPEC-088 Z-4), and [`stop_camera`]'s drain of the camera, also
+/// bounded by this, waits for them and finalizes any clip still registered;
+/// a camera not drained within it stays stopping.
 const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Whether the camera's supervisor has ended, the recorder work it left is
 /// done and its camera was torn down. `false` means the camera is still
-/// stopping: its supervisor outlived its abort, or the recorder has not
-/// drained the camera. It stays in the map, nothing else is torn down, and
-/// the caller must not start a replacement; a later pass checks on it again
-/// without waiting.
+/// stopping: its supervisor (or the recording controller finalizing its
+/// clip) outlived its abort, or the recorder has not drained the camera. It
+/// stays in the map, nothing else is torn down, and the caller must not
+/// start a replacement; a later pass checks on it again without waiting.
 async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
     // The entry stays in the map until the supervisor has ended and the
     // recorder has drained the camera. Shutdown (`main.rs`) aborts the
@@ -790,15 +800,18 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
     if let Some((stop, task, zone_generation)) = stopping {
         recheck = *stop.borrow();
         let ended = if recheck {
-            task.is_finished()
+            // Every receiver gone, not just the supervisor's: its recording
+            // controller can outlive it inside the final close (SPEC-089).
+            stop.is_closed()
         } else {
             // From here on the generation's zones no longer count as applied.
             args.frame_stats
                 .zone_application()
                 .stop(cam_id, zone_generation);
-            // Stop, not abort: an aborted supervisor never reaches the close of
-            // its open motion clip, which is abandoned (BUG-285). The receiver
-            // drops when `run_camera` returns, which is what `closed` awaits.
+            // Stop, not abort: a stop lets the supervisor finish its frame, and
+            // its recording controller closes the open motion clip (BUG-285).
+            // The receivers drop when `run_camera` returns and the controller
+            // has finalized, which is what `closed` awaits.
             // Stored even with no receiver left, so the entry reads as stopping.
             stop.send_replace(true);
             if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
@@ -820,7 +833,8 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
                     timeout_secs = SUPERVISOR_STOP_TIMEOUT.as_secs(),
                     ended,
                     "camera reconciler: supervisor did not stop in time; aborted it, and any \
-                     clip it had open is finalized before the camera is torn down"
+                     clip it had open is finalized (by its recording controller, else the \
+                     camera's drain) before the camera is torn down"
                 );
                 ended
             }
@@ -830,8 +844,8 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
             // and start a second one for the camera beside it.
             warn!(
                 camera_id = cam_id,
-                "camera reconciler: aborted supervisor is still running; keeping it tracked \
-                 and not restarting the camera until it ends"
+                "camera reconciler: aborted supervisor or its recording controller is still \
+                 running; keeping it tracked and not restarting the camera until it ends"
             );
             return false;
         }
@@ -1052,6 +1066,53 @@ fn retry_sessions(args: &ReconcilerArgs, cam: &CameraConfig, entry: &RunningCame
         if let Some(live) = args.handles.lock().get_mut(&cam_id) {
             live.sessions = sessions;
         }
+    }
+}
+
+/// SPEC-089 — hand a changed `recording_policy` (or a new saved revision of
+/// it) to the running camera's recording controller, which switches mode
+/// without a restart: a restart would gap the recording it is meant to
+/// change, and a rollback to legacy keeps the open clip and its links. The
+/// key records the policy and revision only once the controller has applied
+/// them, so a refused or unanswered change is sent again on the next pass.
+async fn apply_recording_policy(
+    args: &ReconcilerArgs,
+    cam: &CameraConfig,
+    entry: &RunningCameraEntry,
+) {
+    let policy = cam.behavior.recording_policy;
+    let revision = &cam.behavior.recording_policy_revision;
+    if entry.key.behavior.recording_policy == policy
+        && entry.key.behavior.recording_policy_revision == *revision
+    {
+        return;
+    }
+    use nexus_pipeline::recording_controller::{RecordingCommand, COMMAND_TIMEOUT};
+    match entry
+        .recording
+        .request(
+            RecordingCommand::PolicyChanged(policy, revision.clone()),
+            COMMAND_TIMEOUT,
+        )
+        .await
+        // A receipt can refuse too: `Stopped` once the controller was cancelled.
+        .and_then(|receipt| receipt.error.map_or(Ok(()), Err))
+    {
+        Ok(()) => {
+            info!(
+                camera_id = cam.id,
+                "camera reconciler: recording policy applied without a restart"
+            );
+            if let Some(live) = args.handles.lock().get_mut(&cam.id) {
+                live.key.behavior.recording_policy = policy;
+                live.key.behavior.recording_policy_revision = revision.clone();
+            }
+        }
+        Err(e) => warn!(
+            camera_id = cam.id,
+            error = %e,
+            "camera reconciler: recording policy not applied; retrying next pass"
+        ),
     }
 }
 
@@ -1277,6 +1338,7 @@ pub(crate) fn spawn_supervisor(
         key: start.key,
         sessions: start.sessions,
         zone_generation: handle.zone_generation,
+        recording: handle.recording,
     }
 }
 
@@ -2328,9 +2390,11 @@ mod tests {
     /// SPEC-088 review 9 — the pass that finds an ended supervisor's
     /// generation no longer running can come while that supervisor's final
     /// close is still pending. It stops the camera the long way: it waits
-    /// out [`SUPERVISOR_STOP_TIMEOUT`], aborts the supervisor inside its
-    /// close and drains the camera. Until the drain succeeds no replacement
-    /// starts and A never reads applied.
+    /// out [`SUPERVISOR_STOP_TIMEOUT`], aborts the supervisor and waits out
+    /// the close, which the camera's recording controller still owns
+    /// (SPEC-089). Until that close completes and a drain succeeds no pass
+    /// starts a replacement, a later one that looks again included, and A
+    /// never reads applied.
     #[tokio::test]
     async fn a_pass_during_a_pending_final_close_aborts_and_drains_before_replacing() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2360,8 +2424,6 @@ mod tests {
             recorder.calls_of(7) == [ClipCall::Open(1), ClipCall::Close(1)]
         })
         .await;
-        // The first drain does not finish within its bound.
-        recorder.drains.lock().push_back(Drain::Stalls);
 
         // Both bounds elapse on the paused clock; every virtual second the
         // test records what the camera reads as. The clock pauses only once
@@ -2389,6 +2451,11 @@ mod tests {
             .expect("pass task")
             .expect("pass during the pending close");
         tokio::time::resume();
+        // Looks again without waiting, with the supervisor gone and its
+        // controller still inside the close.
+        reconcile(&args)
+            .await
+            .expect("pass while the close is still pending");
         let aborted_and_kept = original.task.is_finished() && is_original(&args.handles);
         let before_drain = recorder.calls_of(7);
         recorder
@@ -2396,6 +2463,10 @@ mod tests {
             .as_ref()
             .expect("closes are gated")
             .add_permits(1 << 16);
+        wait_until("the recording controller finished the close", || {
+            original.stop.is_closed()
+        })
+        .await;
         reconcile(&args).await.expect("pass whose drain succeeds");
         wait_until("the replacement applied A", || {
             let s = status(&args, &a);
@@ -2407,7 +2478,7 @@ mod tests {
 
         assert!(
             waited >= SUPERVISOR_STOP_TIMEOUT * 2,
-            "the pass did not wait out the stop and then the drain: {waited:?}"
+            "the pass did not wait out the stop and then the pending close: {waited:?}"
         );
         assert!(
             aborted_and_kept,
@@ -2749,6 +2820,249 @@ mod tests {
             ],
             "the releasing pass did not tear the camera down and start one replacement"
         );
+    }
+
+    /// SPEC-089 — a `recording_policy` edit goes to the running camera's
+    /// recording controller instead of restarting it: shadow starts measuring
+    /// on the same supervisor, its stats name the saved revision the pass
+    /// applied (a new revision of the same policy too), and the rollback to
+    /// legacy keeps that supervisor and the clip it has open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_recording_policy_change_applies_without_a_restart() {
+        use nexus_config::{RecordingPolicyConfig, RecordingPolicyMode};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: the supervisor opened a clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        let original = entry_of(&args.handles, 7);
+        let runtime = || {
+            args.frame_stats
+                .recording_activity()
+                .snapshot(7, std::time::Instant::now())
+        };
+        wait_until("legacy reports the clip it holds", || {
+            runtime().and_then(|r| r.active_clip_id) == Some(1)
+        })
+        .await;
+        let legacy = runtime().map(|r| (r.mode, r.generation, r.policy_revision));
+
+        let mut shadow = cam(None);
+        shadow.behavior.recording_policy = Some(RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 10_000,
+        });
+        shadow.behavior.recording_policy_revision = "rev-shadow".into();
+        args.store
+            .upsert_camera(&shadow)
+            .await
+            .expect("save shadow");
+        reconcile(&args).await.expect("pass after the edit");
+        let after_shadow = entry_of(&args.handles, 7);
+        let applied = runtime().map(|r| (r.mode, r.generation, r.policy_revision));
+        // The next frame traces the clip legacy holds.
+        wait_until("shadow traced the open clip", || {
+            runtime().and_then(|r| r.active_clip_id) == Some(1)
+        })
+        .await;
+
+        // An ABA saved between two passes leaves the policy as it was under a
+        // new revision, which the pass applies too.
+        shadow.behavior.recording_policy_revision = "rev-aba".into();
+        args.store
+            .upsert_camera(&shadow)
+            .await
+            .expect("save the ABA");
+        reconcile(&args).await.expect("pass after the ABA");
+        let after_aba = entry_of(&args.handles, 7);
+        let aba = runtime().map(|r| r.policy_revision);
+
+        args.store
+            .upsert_camera(&cam(None))
+            .await
+            .expect("roll back");
+        reconcile(&args).await.expect("pass after the rollback");
+        let after_rollback = entry_of(&args.handles, 7);
+        let rolled_back = runtime().map(|r| (r.mode, r.policy_revision, r.active_clip_id));
+        let calls = recorder.calls();
+
+        let mut disabled = cam(None);
+        disabled.ingest.enabled = false;
+        args.store.upsert_camera(&disabled).await.expect("disable");
+        reconcile(&args).await.expect("pass after the disable");
+        let disabled = runtime();
+        abort_all(&args.handles);
+
+        assert_eq!(
+            legacy,
+            Some((
+                RecordingPolicyMode::Legacy,
+                original.zone_generation,
+                String::new()
+            )),
+            "the running legacy generation and the revision it applied"
+        );
+        assert!(
+            Arc::ptr_eq(&after_shadow.task, &original.task)
+                && Arc::ptr_eq(&after_aba.task, &original.task)
+                && Arc::ptr_eq(&after_rollback.task, &original.task),
+            "a policy change must not restart the camera"
+        );
+        assert_eq!(
+            applied,
+            Some((
+                RecordingPolicyMode::Shadow,
+                original.zone_generation,
+                "rev-shadow".to_owned()
+            )),
+            "the pass applied shadow to the running generation"
+        );
+        assert_eq!(aba.as_deref(), Some("rev-aba"), "the pass applied the ABA");
+        assert_eq!(
+            rolled_back,
+            Some((RecordingPolicyMode::Legacy, String::new(), Some(1))),
+            "the rollback runs legacy on the clip it inherited"
+        );
+        assert!(disabled.is_none(), "nothing runs a disabled camera");
+        assert_eq!(
+            calls,
+            [ClipCall::Open(1)],
+            "the open clip carried on through both changes"
+        );
+    }
+
+    /// PR #406 review: a controller cancelled while a policy change waits
+    /// answers it with a `Stopped` receipt. That pass must not mark the
+    /// policy applied, so the next pass sends it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_change_racing_a_stop_is_sent_again() {
+        use nexus_config::{RecordingPolicyConfig, RecordingPolicyMode};
+        use nexus_pipeline::recording_controller::{
+            RecordingCommand, RecordingControl, RecordingError, RecordingReceipt, Request,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        reconcile(&args).await.expect("initial pass");
+        // Stands in for the controller: the first change races its stop, the next lands.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Request>(4);
+        let sent = Arc::new(AtomicUsize::new(0));
+        let seen = sent.clone();
+        tokio::spawn(async move {
+            for error in [Some(RecordingError::Stopped), None] {
+                let Some(request) = rx.recv().await else {
+                    return;
+                };
+                if matches!(request.command, RecordingCommand::PolicyChanged(..)) {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                let _ = request.reply.send(RecordingReceipt {
+                    generation: request.generation,
+                    clip: None,
+                    error,
+                });
+            }
+        });
+        {
+            let mut handles = args.handles.lock();
+            let live = handles.get_mut(&7).expect("camera running");
+            live.recording = RecordingControl {
+                tx,
+                generation: live.recording.generation,
+            };
+        }
+        let policy = Some(RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 10_000,
+        });
+        let mut shadow = cam(None);
+        shadow.behavior.recording_policy = policy;
+        shadow.behavior.recording_policy_revision = "rev-shadow".into();
+        args.store
+            .upsert_camera(&shadow)
+            .await
+            .expect("save shadow");
+        let applied = || {
+            let key = entry_of(&args.handles, 7).key;
+            (
+                key.behavior.recording_policy,
+                key.behavior.recording_policy_revision,
+            )
+        };
+
+        reconcile(&args).await.expect("pass the stop refuses");
+        let refused = (applied(), sent.load(Ordering::SeqCst));
+        reconcile(&args).await.expect("pass after the refusal");
+        let retried = (applied(), sent.load(Ordering::SeqCst));
+        abort_all(&args.handles);
+
+        assert_eq!(
+            refused,
+            ((None, String::new()), 1),
+            "a Stopped receipt left the policy marked applied"
+        );
+        assert_eq!(
+            retried,
+            ((policy, "rev-shadow".to_owned()), 2),
+            "the next pass sent the change again and recorded it"
+        );
+    }
+
+    /// SPEC-089 — a camera saved as `observed` records from its policy on
+    /// the supervisor the pass started, and the rollback to legacy, applied
+    /// live, keeps that supervisor and the clip it has open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_observed_policy_records_and_rolls_back_without_a_restart() {
+        use nexus_config::{RecordingPolicyConfig, RecordingPolicyMode};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let mut observed = cam(None);
+        observed.behavior.recording_policy = Some(RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Observed,
+            analysis_stale_after_ms: 10_000,
+        });
+        observed.behavior.recording_policy_revision = "rev-observed".into();
+        let args = reconciler_args(recorder.clone(), dir.path(), &[observed]).await;
+        reconcile(&args).await.expect("initial pass");
+        let runtime = || {
+            args.frame_stats
+                .recording_activity()
+                .snapshot(7, std::time::Instant::now())
+        };
+        wait_until("observed opened a clip", || recorder.opens() == 1).await;
+        let mode = runtime().map(|r| r.mode);
+        let original = entry_of(&args.handles, 7);
+
+        args.store
+            .upsert_camera(&cam(None))
+            .await
+            .expect("roll back");
+        reconcile(&args).await.expect("pass after the rollback");
+        let after_rollback = entry_of(&args.handles, 7);
+        let rolled_back = runtime().map(|r| r.mode);
+        // Legacy holds the clip on the person still in view.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let calls = recorder.calls();
+        abort_all(&args.handles);
+
+        assert_eq!(
+            mode,
+            Some(RecordingPolicyMode::Observed),
+            "the saved mode drives the controller"
+        );
+        assert!(
+            Arc::ptr_eq(&after_rollback.task, &original.task),
+            "a rollback must not restart the camera"
+        );
+        assert_eq!(
+            rolled_back,
+            Some(RecordingPolicyMode::Legacy),
+            "the rollback runs legacy"
+        );
+        assert_eq!(calls, [ClipCall::Open(1)], "the open clip carried on");
     }
 
     fn entry_of(handles: &HandleMap, camera_id: CameraId) -> RunningCameraEntry {
@@ -4008,6 +4322,10 @@ mod tests {
                 analysis: None,
             },
             zone_generation: 0,
+            recording: nexus_pipeline::recording_controller::RecordingControl {
+                tx: tokio::sync::mpsc::channel(1).0,
+                generation: 0,
+            },
         };
         args.handles.lock().insert(7, original.clone());
         let is_original = |h: &HandleMap| {
@@ -4138,10 +4456,11 @@ mod tests {
 
     /// The exclusions in [`changed_behavior_field`] are a decision, not an
     /// oversight, so they are pinned like any other behaviour. A restart
-    /// cannot apply these three; the two downscale targets would come back
+    /// cannot apply the first three; the two downscale targets would come back
     /// on the high-res detector, because the router builds its layer set
     /// once at boot. If a future change makes any of them restart-applicable,
-    /// delete its arm here in the same commit.
+    /// delete its arm here in the same commit. `recording_policy` must not
+    /// gap recording to change mode (SPEC-089).
     #[test]
     fn the_deliberately_excluded_behavior_fields_do_not_change_the_key() {
         let before = CameraBehavior {
@@ -4156,6 +4475,15 @@ mod tests {
             }),
             ("detector_downscale_to_height", |b| {
                 b.detector_downscale_to_height = Some(320)
+            }),
+            ("recording_policy", |b| {
+                b.recording_policy = Some(nexus_config::RecordingPolicyConfig {
+                    mode: nexus_config::RecordingPolicyMode::Shadow,
+                    analysis_stale_after_ms: 10_000,
+                })
+            }),
+            ("recording_policy_revision", |b| {
+                b.recording_policy_revision = "rev-2".into()
             }),
         ];
 
