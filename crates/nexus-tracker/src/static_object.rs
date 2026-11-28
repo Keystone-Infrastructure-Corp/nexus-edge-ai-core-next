@@ -195,6 +195,18 @@ struct V2Track {
     owner: bool,
 }
 
+impl V2Track {
+    /// End its window, verdict, ownership and any parked episode.
+    fn end_episode(&mut self) {
+        self.window.miss();
+        self.still = false;
+        self.owner = false;
+        if self.parked_at.take().is_some() {
+            self.alert_epoch += 1;
+        }
+    }
+}
+
 impl StaticObjectFilter {
     /// Build a filter and load any persisted anchors from `persistence_path`.
     /// Missing or unreadable registry files are logged + treated as an
@@ -648,6 +660,10 @@ impl StaticObjectFilter {
         if self.parking_v2.is_some() {
             self.classify_frame(frame, &mut [], true);
         }
+        // A frame the detector skips next must not repeat a stale verdict.
+        if let Some(v2) = self.parking_v2.as_mut() {
+            v2.tracks.values_mut().for_each(V2Track::end_episode);
+        }
     }
 
     /// SPEC-077 v2 classification. Each track's observed (detector-matched)
@@ -708,13 +724,8 @@ impl StaticObjectFilter {
             }
             // Pixels of the old geometry say nothing about the new one.
             for t in v2.tracks.values_mut() {
-                t.window.miss();
-                t.still = false;
+                t.end_episode();
                 t.last = None;
-                t.owner = false;
-                if t.parked_at.take().is_some() {
-                    t.alert_epoch += 1;
-                }
             }
         }
         if detector_ran {
@@ -748,11 +759,7 @@ impl StaticObjectFilter {
                 // object, which inherits no parked episode; its anchor is
                 // left to expire.
                 if t.seen_seq + 1 != v2.seq {
-                    t.window.miss();
-                    t.owner = false;
-                    if t.parked_at.take().is_some() {
-                        t.alert_epoch += 1;
-                    }
+                    t.end_episode();
                 }
                 (t.seen_seq, t.seen_ms) = (v2.seq, at_ms);
             }
@@ -767,11 +774,7 @@ impl StaticObjectFilter {
                     // motion bounds of a large box, and no parked episode.
                     if reset_px > 0.0 && t.last.is_some_and(|(p, _)| distance(p, center) > reset_px)
                     {
-                        t.window.miss();
-                        t.owner = false;
-                        if t.parked_at.take().is_some() {
-                            t.alert_epoch += 1;
-                        }
+                        t.end_episode();
                     }
                     t.owner &= t
                         .last
@@ -2388,6 +2391,29 @@ mod tests {
         f.detector_failed(&failed);
         let back = capture_ms(1.0, 4_000, 12_000);
         assert_eq!(first_static(&mut f, &back, |_| car()), Some(9_000));
+    }
+
+    /// A frame the detector skipped right after a failure repeats no stale
+    /// static verdict: the failure already ended the parked car's dwell.
+    #[test]
+    fn v2_a_skipped_frame_after_a_detector_failure_is_not_static() {
+        let mut f = v2_filter();
+        let car = || vehicle(1, 400.0, 500.0);
+        let parked = capture_ms(1.0, 0, 6_000);
+        assert_eq!(first_static(&mut f, &parked, |_| car()), Some(5_000));
+        let mut failed = frame(1, 0, 7_000);
+        (failed.width, failed.height) = HD;
+        f.detector_failed(&failed);
+        let mut skipped = frame(1, 0, 8_000);
+        (skipped.width, skipped.height) = HD;
+        let mut objs = skipped_predicted();
+        f.classify_frame(&skipped, &mut objs, false);
+        assert!(
+            !is_object_static(&objs[0]),
+            "stale verdict on a skipped frame"
+        );
+        let back = capture_ms(1.0, 9_000, 16_000);
+        assert_eq!(first_static(&mut f, &back, |_| car()), Some(14_000));
     }
 
     /// The same pixel center on a new frame geometry is a new candidate.
