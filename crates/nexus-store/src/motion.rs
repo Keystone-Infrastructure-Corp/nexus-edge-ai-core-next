@@ -425,7 +425,8 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
-        self.close_clip_on(&mut *tx, clip_id, close).await?;
+        self.close_clip_on(&mut tx, clip_id, close, Utc::now())
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -452,7 +453,8 @@ impl Store {
         finalized_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        self.close_clip_on(&mut *tx, clip_id, close).await?;
+        self.close_clip_on(&mut tx, clip_id, close, finalized_at)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -463,6 +465,7 @@ impl Store {
         conn: &mut sqlx::SqliteConnection,
         clip_id: ClipId,
         close: &ClipClose,
+        finalized_at: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         // The four bind parameters are always the same prefix
         // (ended_at, duration_ms, size_bytes, clip_id) regardless of
