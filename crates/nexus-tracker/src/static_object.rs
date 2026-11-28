@@ -641,6 +641,15 @@ impl StaticObjectFilter {
         self.sweep_anchors(frame_ms);
     }
 
+    /// A frame the detector failed on observed nothing: on a v2 camera every
+    /// track's dwell ends there, as on a detector frame it is missing from,
+    /// rather than carrying over as on a skipped frame. Legacy is untouched.
+    pub fn detector_failed(&mut self, frame: &Frame) {
+        if self.parking_v2.is_some() {
+            self.classify_frame(frame, &mut [], true);
+        }
+    }
+
     /// SPEC-077 v2 classification. Each track's observed (detector-matched)
     /// box feeds its [`StillnessWindow`] in analysis-frame pixels, the
     /// supervisor frame the detector already mapped its boxes back into,
@@ -2363,6 +2372,22 @@ mod tests {
                 "n = {n}"
             );
         }
+    }
+
+    /// A detector failure observed nothing: the car may have moved there, so
+    /// a fresh dwell starts at its next observation, within the gap or not.
+    #[test]
+    fn v2_a_detector_failure_ends_a_dwell() {
+        let mut f = v2_filter();
+        let car = || vehicle(1, 400.0, 500.0);
+        for ms in capture_ms(1.0, 0, 2_000) {
+            v2_step(&mut f, ms, HD, vec![car()]);
+        }
+        let mut failed = frame(1, 0, 3_000);
+        (failed.width, failed.height) = HD;
+        f.detector_failed(&failed);
+        let back = capture_ms(1.0, 4_000, 12_000);
+        assert_eq!(first_static(&mut f, &back, |_| car()), Some(9_000));
     }
 
     /// The same pixel center on a new frame geometry is a new candidate.

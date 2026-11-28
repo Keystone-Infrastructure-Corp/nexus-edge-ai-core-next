@@ -838,6 +838,9 @@ async fn run_camera(
                                 None,
                             );
                             record(&recording, cfg.id, RecordingCommand::Evidence(failed)).await;
+                            if let Some(sf) = static_filter.as_mut() {
+                                sf.detector_failed(&frame);
+                            }
                             return ControlFlow::Continue(());
                         }
                     }
