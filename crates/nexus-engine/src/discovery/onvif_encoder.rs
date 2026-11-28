@@ -81,8 +81,14 @@ pub struct VideoEncoderOptions {
     pub gov_length_range: Option<IntRange>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bitrate_range: Option<IntRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub encoding_interval_range: Option<IntRange>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub profiles_supported: Vec<String>,
+    /// Every codec with an option block, whichever `encoding` was asked:
+    /// the PUT's preflight only, so the GET's `options` shape is unchanged.
+    #[serde(skip)]
+    pub encodings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -107,13 +113,16 @@ pub async fn get_video_encoder_configurations(
     Ok(parse_configs(&resp))
 }
 
-/// Read the option ranges for an encoder configuration / profile.
+/// Read the option ranges for an encoder configuration / profile. A
+/// camera may answer with every codec's ranges; `encoding` keeps only that
+/// codec's, `None` merges them.
 pub async fn get_video_encoder_configuration_options(
     endpoint: &str,
     username: &str,
     password: &str,
     config_token: Option<&str>,
     profile_token: Option<&str>,
+    encoding: Option<&str>,
 ) -> Result<VideoEncoderOptions, String> {
     let mut body = String::from("<trt:GetVideoEncoderConfigurationOptions>");
     if let Some(t) = config_token {
@@ -138,7 +147,7 @@ pub async fn get_video_encoder_configuration_options(
             &body,
         )
         .await?;
-    Ok(parse_options(&resp))
+    Ok(parse_options(&resp, encoding))
 }
 
 /// Write a (read-modify-write) video-encoder configuration.
@@ -176,8 +185,9 @@ fn set_config_body(c: &VideoEncoderConfig, force_persistence: bool) -> String {
         .use_count
         .map(|u| format!("<tt:UseCount>{u}</tt:UseCount>"))
         .unwrap_or_default();
-    let encoding = c
-        .encoding
+    // ONVIF encodings are upper-case (`H264`, `JPEG`, …), whatever case was asked.
+    let enc = c.encoding.as_deref().map(str::to_ascii_uppercase);
+    let encoding = enc
         .as_ref()
         .map(|e| format!("<tt:Encoding>{}</tt:Encoding>", xml_escape(e)))
         .unwrap_or_default();
@@ -210,18 +220,16 @@ fn set_config_body(c: &VideoEncoderConfig, force_persistence: bool) -> String {
     } else {
         String::new()
     };
-    // Codec-specific block keyed off the declared encoding.
-    let codec = if c.gov_length.is_some() || c.profile.is_some() {
-        let container = match c.encoding.as_deref() {
-            Some("H265") => "H265",
-            _ => "H264",
-        };
-        let profile_tag = if container == "H265" {
-            "H265Profile"
-        } else {
-            "H264Profile"
-        };
-        format!(
+    // Codec-specific block of the encoding written (JPEG has none); an
+    // unreported encoding keeps the H264 default.
+    let block = match enc.as_deref() {
+        Some("H264") | None => Some(("H264", "H264Profile")),
+        Some("H265") => Some(("H265", "H265Profile")),
+        Some("MPEG4") => Some(("MPEG4", "Mpeg4Profile")),
+        Some(_) => None,
+    };
+    let codec = match block {
+        Some((container, profile_tag)) if c.gov_length.is_some() || c.profile.is_some() => format!(
             "<tt:{container}>{}{}</tt:{container}>",
             c.gov_length
                 .map(|v| format!("<tt:GovLength>{v}</tt:GovLength>"))
@@ -230,9 +238,8 @@ fn set_config_body(c: &VideoEncoderConfig, force_persistence: bool) -> String {
                 .as_ref()
                 .map(|p| format!("<tt:{profile_tag}>{}</tt:{profile_tag}>", xml_escape(p)))
                 .unwrap_or_default(),
-        )
-    } else {
-        String::new()
+        ),
+        _ => String::new(),
     };
     format!(
         "<trt:SetVideoEncoderConfiguration><trt:Configuration token=\"{}\">{}{}{}{}{}{}{}</trt:Configuration><trt:ForcePersistence>{}</trt:ForcePersistence></trt:SetVideoEncoderConfiguration>",
@@ -353,9 +360,9 @@ fn apply_config_leaf(c: &mut VideoEncoderConfig, section: Option<&str>, leaf: &s
             "BitrateLimit" => c.bitrate_limit = v.parse().ok(),
             _ => {}
         },
-        Some("H264") | Some("H265") => match leaf {
+        Some("H264") | Some("H265") | Some("MPEG4") | Some("Mpeg4") => match leaf {
             "GovLength" => c.gov_length = v.parse().ok(),
-            "H264Profile" | "H265Profile" => c.profile = Some(v.to_string()),
+            "H264Profile" | "H265Profile" | "Mpeg4Profile" => c.profile = Some(v.to_string()),
             _ => {}
         },
         _ => {}
@@ -371,7 +378,10 @@ const RANGE_SECTIONS: &[&str] = &[
     "ResolutionsAvailable",
 ];
 
-fn parse_options(body: &str) -> VideoEncoderOptions {
+/// The per-codec option blocks (`Options/<codec>`, `Extension/<codec>`).
+const CODEC_SECTIONS: &[&str] = &["JPEG", "MPEG4", "Mpeg4", "H264", "H265"];
+
+fn parse_options(body: &str, encoding: Option<&str>) -> VideoEncoderOptions {
     let mut reader = Reader::from_str(body);
     reader.config_mut().trim_text(true);
     let mut buf = Vec::new();
@@ -390,6 +400,9 @@ fn parse_options(body: &str) -> VideoEncoderOptions {
                     res_w = None;
                     res_h = None;
                 }
+                if CODEC_SECTIONS.contains(&n.as_str()) && !out.encodings.contains(&n) {
+                    out.encodings.push(n.clone());
+                }
                 stack.push(n.clone());
                 capture = Some(n);
                 acc.clear();
@@ -403,9 +416,13 @@ fn parse_options(body: &str) -> VideoEncoderOptions {
                 let n = local_name(&e.name());
                 if capture.as_deref() == Some(n.as_str()) {
                     let v = acc.trim().to_string();
-                    if !v.is_empty() {
-                        let section =
-                            nearest(&stack[..stack.len().saturating_sub(1)], RANGE_SECTIONS);
+                    let outer = &stack[..stack.len().saturating_sub(1)];
+                    let other_codec = matches!(
+                        (encoding, nearest(outer, CODEC_SECTIONS)),
+                        (Some(e), Some(c)) if !c.eq_ignore_ascii_case(e)
+                    );
+                    if !v.is_empty() && !other_codec {
+                        let section = nearest(outer, RANGE_SECTIONS);
                         apply_option_leaf(&mut out, section, &n, &v, &mut res_w, &mut res_h);
                     }
                 }
@@ -460,9 +477,18 @@ fn apply_option_leaf(
             leaf,
             v,
         ),
+        Some("EncodingIntervalRange") => apply_int(
+            out.encoding_interval_range
+                .get_or_insert_with(IntRange::default),
+            leaf,
+            v,
+        ),
         _ => {
             // Top-level (no range section) profile lists.
-            if leaf == "H264ProfilesSupported" || leaf == "H265ProfilesSupported" {
+            if matches!(
+                leaf,
+                "H264ProfilesSupported" | "H265ProfilesSupported" | "Mpeg4ProfilesSupported"
+            ) {
                 out.profiles_supported.push(v.to_string());
             }
         }
@@ -555,7 +581,7 @@ mod tests {
                 <tt:Extension><tt:H264><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>16384</tt:Max></tt:BitrateRange></tt:H264></tt:Extension>
             </trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>"#,
         );
-        let o = parse_options(&body);
+        let o = parse_options(&body, None);
         assert_eq!(o.quality_range, Some(FloatRange { min: 1.0, max: 6.0 }));
         assert_eq!(o.resolutions, vec![(1920, 1080), (1280, 720)]);
         assert_eq!(o.gov_length_range, Some(IntRange { min: 1, max: 400 }));
@@ -568,6 +594,64 @@ mod tests {
             })
         );
         assert_eq!(o.profiles_supported, vec!["Baseline", "High"]);
+        assert_eq!(o.encodings, vec!["H264"], "one entry per codec");
+    }
+
+    /// A mixed-codec answer keeps only the asked codec's ranges and
+    /// profiles; without one it merges them as before.
+    #[test]
+    fn parses_only_the_asked_codecs_options() {
+        let body = wrap(
+            r#"<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options>
+                <tt:QualityRange><tt:Min>1</tt:Min><tt:Max>6</tt:Max></tt:QualityRange>
+                <tt:JPEG>
+                    <tt:ResolutionsAvailable><tt:Width>2592</tt:Width><tt:Height>1520</tt:Height></tt:ResolutionsAvailable>
+                    <tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>30</tt:Max></tt:FrameRateRange>
+                </tt:JPEG>
+                <tt:H264>
+                    <tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable>
+                    <tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>200</tt:Max></tt:GovLengthRange>
+                    <tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>25</tt:Max></tt:FrameRateRange>
+                    <tt:H264ProfilesSupported>Main</tt:H264ProfilesSupported>
+                </tt:H264>
+                <tt:Extension>
+                    <tt:JPEG><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>16384</tt:Max></tt:BitrateRange></tt:JPEG>
+                    <tt:H264><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>4096</tt:Max></tt:BitrateRange></tt:H264>
+                </tt:Extension>
+            </trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>"#,
+        );
+        let quality = Some(FloatRange { min: 1.0, max: 6.0 });
+        let h264 = parse_options(&body, Some("H264"));
+        assert_eq!(
+            h264,
+            VideoEncoderOptions {
+                resolutions: vec![(1280, 720)],
+                quality_range: quality,
+                frame_rate_range: Some(IntRange { min: 1, max: 25 }),
+                gov_length_range: Some(IntRange { min: 1, max: 200 }),
+                bitrate_range: Some(IntRange { min: 32, max: 4096 }),
+                profiles_supported: vec!["Main".into()],
+                encoding_interval_range: None,
+                encodings: vec!["JPEG".into(), "H264".into()],
+            }
+        );
+        let jpeg = parse_options(&body, Some("JPEG"));
+        assert_eq!(
+            jpeg,
+            VideoEncoderOptions {
+                resolutions: vec![(2592, 1520)],
+                quality_range: quality,
+                frame_rate_range: Some(IntRange { min: 1, max: 30 }),
+                bitrate_range: Some(IntRange {
+                    min: 32,
+                    max: 16384
+                }),
+                encodings: vec!["JPEG".into(), "H264".into()],
+                ..VideoEncoderOptions::default()
+            }
+        );
+        let merged = parse_options(&body, None);
+        assert_eq!(merged.resolutions, vec![(2592, 1520), (1280, 720)]);
     }
 
     #[test]
@@ -612,5 +696,54 @@ mod tests {
         };
         let body = set_config_body(&c, false);
         assert!(body.contains("<tt:H265><tt:GovLength>60</tt:GovLength><tt:H265Profile>Main</tt:H265Profile></tt:H265>"), "{body}");
+    }
+
+    /// The codec block follows the encoding written: JPEG has none and
+    /// MPEG4 its own, never an H264 block under another codec.
+    #[test]
+    fn set_config_body_writes_the_codec_block_of_its_encoding() {
+        let with = |encoding: &str| VideoEncoderConfig {
+            token: "T".into(),
+            encoding: Some(encoding.into()),
+            gov_length: Some(20),
+            profile: Some("SP".into()),
+            ..VideoEncoderConfig::default()
+        };
+        let jpeg = set_config_body(&with("JPEG"), false);
+        assert_well_formed(&wrap(&jpeg));
+        assert!(
+            !jpeg.contains("GovLength") && !jpeg.contains("Profile>"),
+            "{jpeg}"
+        );
+        let mpeg4 = set_config_body(&with("MPEG4"), false);
+        assert!(mpeg4.contains("<tt:MPEG4><tt:GovLength>20</tt:GovLength><tt:Mpeg4Profile>SP</tt:Mpeg4Profile></tt:MPEG4>"), "{mpeg4}");
+        assert!(!mpeg4.contains("<tt:H264>"), "{mpeg4}");
+    }
+
+    /// An MPEG4 configuration keeps its GOP length and profile, so a
+    /// partial write re-sends them instead of dropping its MPEG4 block.
+    #[test]
+    fn parses_mpeg4_codec_fields_and_writes_them_back() {
+        let body = wrap(
+            r#"<trt:GetVideoEncoderConfigurationsResponse><trt:Configurations token="VE_m"><tt:Encoding>MPEG4</tt:Encoding><tt:MPEG4><tt:GovLength>25</tt:GovLength><tt:Mpeg4Profile>ASP</tt:Mpeg4Profile></tt:MPEG4></trt:Configurations></trt:GetVideoEncoderConfigurationsResponse>"#,
+        );
+        let c = &parse_configs(&body)[0];
+        assert_eq!(
+            (c.gov_length, c.profile.as_deref()),
+            (Some(25), Some("ASP"))
+        );
+        let out = set_config_body(c, false);
+        assert!(out.contains("<tt:MPEG4><tt:GovLength>25</tt:GovLength><tt:Mpeg4Profile>ASP</tt:Mpeg4Profile></tt:MPEG4>"), "{out}");
+    }
+
+    /// MPEG4's profile list is collected like H264's and H265's.
+    #[test]
+    fn parses_mpeg4_profiles_supported() {
+        let body = wrap(
+            r#"<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options><tt:MPEG4><tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>60</tt:Max></tt:GovLengthRange><tt:Mpeg4ProfilesSupported>SP</tt:Mpeg4ProfilesSupported><tt:Mpeg4ProfilesSupported>ASP</tt:Mpeg4ProfilesSupported></tt:MPEG4></trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>"#,
+        );
+        let o = parse_options(&body, Some("MPEG4"));
+        assert_eq!(o.profiles_supported, vec!["SP".to_string(), "ASP".into()]);
+        assert_eq!(o.gov_length_range, Some(IntRange { min: 1, max: 60 }));
     }
 }

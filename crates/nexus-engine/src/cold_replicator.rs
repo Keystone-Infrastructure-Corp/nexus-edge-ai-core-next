@@ -37,7 +37,7 @@ use nexus_cloud_client::{
 use nexus_cloud_protocol::v1::Envelope;
 use nexus_storage::{BackendError, HealthStatus, Registry};
 use nexus_store::cloud::CloudEnrollment;
-use nexus_store::{AlertClipColdMark, AlertClipRow, ClipColdMark, ClipRow, Store};
+use nexus_store::{AlertClipColdMark, AlertClipRow, ClipColdMark, ClipRow, RecordingSource, Store};
 use nexus_types::AlertEvent;
 use serde::Deserialize;
 use tokio::sync::Notify;
@@ -81,8 +81,9 @@ pub const ALERT_COLD_BATCH: i64 = 8;
 /// newer than `now - ALERT_COLD_RETRY` is held out of the pending set,
 /// so a persistently-unreachable backend is retried at ~1/min rather
 /// than every tick. The evictor's grace window is the ultimate
-/// backstop that reclaims a stuck alert clip from the hot tier.
-pub const ALERT_COLD_RETRY: Duration = Duration::from_secs(60);
+/// backstop that reclaims a stuck alert clip from the hot tier. Owned by
+/// the store so the SPEC-090 backoff partition uses the same value.
+pub const ALERT_COLD_RETRY: Duration = Duration::from_secs(nexus_store::ALERT_COLD_RETRY_SECS);
 
 /// #759 — max clips per table re-announced per polling backstop.
 pub const ANNOUNCE_BATCH: i64 = 32;
@@ -233,6 +234,7 @@ pub async fn run_cold_replicator(
         batch_size = BATCH_SIZE,
         "cold replicator starting"
     );
+    store.track_transfers(RecordingSource::Ordinary);
 
     // Subscribe BEFORE the first tick so we don't miss events that
     // fire while we're servicing the boot-time drain.
@@ -584,6 +586,7 @@ async fn tick(
                         error = %se,
                         "cold replicator: record_cold_upload_failure failed"
                     );
+                    store.record_accounting_gap(Utc::now()).await;
                 }
                 if quarantine {
                     quarantined += 1;
@@ -615,9 +618,24 @@ async fn tick(
 /// Phase 2 · Step 2.9 — the earliest `started_at` the current
 /// enrollment sends to the cloud: the `--keep-history` cutoff, else
 /// `enrolled_at`. `None` (not enrolled) means no floor. Applied to the
-/// upload drain and to re-announces alike.
-fn upload_floor(enrollment: Option<&CloudEnrollment>) -> Option<chrono::DateTime<Utc>> {
-    enrollment.map(|e| e.attach_replay_after.unwrap_or(e.enrolled_at))
+/// upload drain, to re-announces and to the SPEC-090 delivery snapshot.
+pub(crate) fn upload_floor(enrollment: Option<&CloudEnrollment>) -> Option<chrono::DateTime<Utc>> {
+    enrollment.map(CloudEnrollment::upload_floor)
+}
+
+/// SPEC-090 — count a transfer as it starts, so attempted bytes include
+/// retries and transfers that never finish. Accounting never blocks an
+/// upload: a failed write is logged and recorded as an accounting gap, so
+/// no window overlapping it reads complete.
+async fn record_attempt(store: &Store, source: RecordingSource, id: i64, bytes: usize) {
+    let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+    if let Err(e) = store
+        .record_upload_attempt(source, id, Utc::now(), bytes)
+        .await
+    {
+        warn!(id, ?source, error = %e, "cold replicator: record_upload_attempt failed");
+        store.record_accounting_gap(Utc::now()).await;
+    }
 }
 
 /// Phase 2 · Step 2.9 — `attached_history: true` iff (a) the operator
@@ -836,6 +854,7 @@ async fn drain_alert_clips(
                         error = %se,
                         "cold replicator: record_alert_clip_cold_failure failed"
                     );
+                    store.record_accounting_gap(Utc::now()).await;
                 }
                 warn!(
                     alert_clip_id = clip.id,
@@ -867,6 +886,7 @@ pub async fn run_alert_clip_uploader(
     shutdown: impl std::future::Future<Output = ()>,
 ) {
     info!("alert-clip uploader starting");
+    store.track_transfers(RecordingSource::Alert);
     // The first interval tick fires immediately, so clips left ready
     // across a restart ship at boot.
     let mut interval = tokio::time::interval(ALERT_COLD_RETRY);
@@ -965,6 +985,8 @@ async fn upload_alert_clip_one(
     backend_handle: &str,
     clip: &AlertClipRow,
 ) -> Result<(), UploadError> {
+    // SPEC-090 — in flight until this returns, after the completion commits.
+    let _transfer = store.begin_transfer(RecordingSource::Alert, clip.id);
     let sha256 = clip.sha256.as_deref().ok_or(UploadError::MissingSha256)?;
     let hot_path_rel = clip.path.as_str();
     let edge_clip_id = format!("alert-{}", clip.id);
@@ -984,13 +1006,13 @@ async fn upload_alert_clip_one(
     // blob URL, which only a put receipt carries, and `put` is
     // idempotent (#759: skipping it left a blob with no cloud row).
     let announces = cfg.outbox.is_some() && backend.yields_cloud_url();
-    let cold_url = match backend.exists(&cold_path, sha256).await {
+    let (cold_url, payload_bytes) = match backend.exists(&cold_path, sha256).await {
         Ok(true) if !announces => {
             debug!(
                 alert_clip_id = clip.id,
                 cold_path, "cold replicator: backend already has alert clip; stamping pointer only"
             );
-            None
+            (None, existing_copy_bytes(cfg, hot_path_rel).await)
         }
         Ok(_) => {
             let abs = cfg.clips_dir.join(hot_path_rel);
@@ -1003,11 +1025,12 @@ async fn upload_alert_clip_one(
             // No throttle: alert clips bypass it like the urgent lane
             // (small evidence), and sharing the bucket would clamp a big
             // motion upload's accumulated credit and stall it.
+            record_attempt(store, RecordingSource::Alert, clip.id, bytes.len()).await;
             let receipt = backend
                 .put(&cold_path, &bytes, sha256)
                 .await
                 .map_err(UploadError::Backend)?;
-            receipt.cold_url
+            (receipt.cold_url, i64::try_from(bytes.len()).ok())
         }
         Err(e) => return Err(UploadError::Backend(e)),
     };
@@ -1019,23 +1042,29 @@ async fn upload_alert_clip_one(
     let announce = match cold_url {
         Some(url) => {
             let env = alert_clip_envelope(clip, url.clone());
-            store
+            match store
                 .stamp_alert_clip_announce(clip.id, &url, &env.meta.id)
                 .await
-                .map_err(UploadError::Store)?;
-            Some(env)
+            {
+                Ok(()) => Some(env),
+                // SPEC-090 — camera deleted mid-PUT: no row to announce, but
+                // the mark below still counts the delivery against the loss.
+                Err(nexus_store::StoreError::NotFound(_)) => None,
+                Err(e) => return Err(UploadError::Store(e)),
+            }
         }
         None => None,
     };
 
     store
-        .mark_alert_clip_cold_replicated(
+        .mark_alert_clip_cold_uploaded(
             clip.id,
             &AlertClipColdMark {
                 cold_handle: backend_handle.to_string(),
                 cold_path,
                 cold_uploaded_at: Utc::now(),
             },
+            payload_bytes,
         )
         .await
         .map_err(UploadError::Store)?;
@@ -1070,6 +1099,8 @@ async fn upload_one(
     clip: &ClipRow,
     attached_history: Option<bool>,
 ) -> Result<(), UploadError> {
+    // SPEC-090 — in flight until this returns, after the completion commits.
+    let _transfer = store.begin_transfer(RecordingSource::Ordinary, clip.id);
     let hot_path_rel = clip
         .hot_path
         .as_deref()
@@ -1109,13 +1140,14 @@ async fn upload_one(
                 cold_path, "cold replicator: backend already has clip; stamping pointer only"
             );
             store
-                .mark_cold_replicated(
+                .mark_cold_uploaded(
                     clip.id,
                     &ClipColdMark {
                         cold_handle: backend_handle.to_string(),
                         cold_path,
                         cold_uploaded_at: Utc::now(),
                     },
+                    existing_copy_bytes(cfg, hot_path_rel).await,
                 )
                 .await
                 .map_err(UploadError::Store)?;
@@ -1149,6 +1181,7 @@ async fn upload_one(
         );
     }
 
+    record_attempt(store, RecordingSource::Ordinary, clip.id, bytes.len()).await;
     let receipt = backend
         .put(&cold_path, &bytes, sha256)
         .await
@@ -1163,23 +1196,26 @@ async fn upload_one(
     let announce = match receipt.cold_url {
         Some(url) => {
             let env = motion_clip_envelope(clip, url.clone(), attached_history);
-            store
-                .stamp_clip_announce(clip.id, &url, &env.meta.id)
-                .await
-                .map_err(UploadError::Store)?;
-            Some(env)
+            match store.stamp_clip_announce(clip.id, &url, &env.meta.id).await {
+                Ok(()) => Some(env),
+                // SPEC-090 — evicted mid-PUT: no row to announce, but the
+                // mark below still counts the delivery against the loss.
+                Err(nexus_store::StoreError::NotFound(_)) => None,
+                Err(e) => return Err(UploadError::Store(e)),
+            }
         }
         None => None,
     };
 
     store
-        .mark_cold_replicated(
+        .mark_cold_uploaded(
             clip.id,
             &ClipColdMark {
                 cold_handle: backend_handle.to_string(),
                 cold_path: receipt.cold_path,
                 cold_uploaded_at: receipt.uploaded_at,
             },
+            i64::try_from(bytes.len()).ok(),
         )
         .await
         .map_err(UploadError::Store)?;
@@ -1209,6 +1245,21 @@ async fn upload_one(
         "cold replicator: clip uploaded"
     );
     Ok(())
+}
+
+/// SPEC-090 — the payload size of a copy the backend already holds (an
+/// earlier PUT whose completion was never recorded): the hot file it was
+/// written from, which `exists` matched by hash. `None` counts the stored
+/// size instead, or an unknown-size delivery when that is unknown too.
+async fn existing_copy_bytes(cfg: &ColdReplicatorConfig, hot_path_rel: &str) -> Option<i64> {
+    let abs = cfg.clips_dir.join(hot_path_rel);
+    match tokio::fs::metadata(&abs).await {
+        Ok(m) => i64::try_from(m.len()).ok(),
+        Err(e) => {
+            warn!(path = %abs.display(), error = %e, "cold replicator: existing copy's size unknown; counting the stored size");
+            None
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2548,5 +2599,601 @@ mod tests {
             .await
             .expect("uploader must stop on shutdown")
             .unwrap();
+    }
+
+    /// One motion tick against `backend`, outside the task loop.
+    async fn run_tick(store: &Arc<Store>, clips_dir: &std::path::Path, backend: &Arc<MockBackend>) {
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let cfg = ColdReplicatorConfig {
+            clips_dir: clips_dir.to_path_buf(),
+            kick: None,
+            outbox: None,
+            max_cold_upload_bytes: 512 * 1024 * 1024,
+        };
+        let bus: Arc<dyn Bus> = Arc::new(BroadcastBus::new(8));
+        let mut healthy = true;
+        tick(
+            &cfg,
+            store,
+            &bus,
+            &registry,
+            &TokenBucket::new(0),
+            &mut healthy,
+        )
+        .await;
+    }
+
+    /// Core counters of the 1 h window just after the real clock.
+    async fn hour_counters(store: &Store) -> nexus_store::SourceCounters {
+        let snap = store
+            .recording_delivery_stats(|| Utc::now() + ChronoDuration::minutes(2), None)
+            .await
+            .unwrap();
+        snap.windows[0].core
+    }
+
+    /// SPEC-090 — a failed transfer counts its bytes and a failure; the
+    /// retry counts its bytes again as a retry, and delivery counts once.
+    #[tokio::test]
+    async fn recording_delivery_counts_attempts_failures_and_one_delivery() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        backend.set_fail(true);
+        run_tick(&store, &clips_dir, &backend).await;
+
+        let c = hour_counters(&store).await.ordinary;
+        assert_eq!(
+            (c.attempted_bytes, c.failure_count, c.retry_count),
+            (10, 1, 0)
+        );
+        assert_eq!(c.delivered_bytes, 0);
+        assert_eq!(c.generated_bytes, 10, "finalization was counted at close");
+
+        backend.set_fail(false);
+        sqlx::query("UPDATE motion_clips SET cold_next_attempt_at = NULL WHERE id = ?")
+            .bind(clip_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        run_tick(&store, &clips_dir, &backend).await;
+        run_tick(&store, &clips_dir, &backend).await;
+
+        let c = hour_counters(&store).await;
+        assert_eq!(backend.put_count(), 2);
+        assert_eq!(
+            c.ordinary.attempted_bytes, 20,
+            "the retry's bytes count too"
+        );
+        assert_eq!(c.ordinary.retry_count, 1);
+        assert_eq!(c.ordinary.failure_count, 1);
+        assert_eq!(c.ordinary.delivered_bytes, 10, "delivered once");
+        assert_eq!(c.alert, nexus_store::DeliveryCounters::default());
+    }
+
+    /// SPEC-090 — a transient write failure on the attempt counter, then a
+    /// successful delivery: every window overlapping the failure reads
+    /// incomplete, never complete with attempted 0 / delivered 10.
+    #[tokio::test]
+    async fn recording_delivery_failed_attempt_write_marks_windows_incomplete() {
+        let (store, _clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        // Accounting began long ago, so only a gap can make a window incomplete.
+        sqlx::query("UPDATE recording_delivery_baseline SET accounting_since = ?")
+            .bind((Utc::now() - ChronoDuration::days(1)).to_rfc3339())
+            .execute(store.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER fail_attempt BEFORE INSERT ON recording_minute_buckets
+             WHEN NEW.attempted_bytes > 0
+             BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+        )
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        run_tick(&store, &clips_dir, &backend).await;
+        assert_eq!(backend.put_count(), 1, "the upload went ahead");
+
+        let snap = store
+            .recording_delivery_stats(|| Utc::now() + ChronoDuration::minutes(2), None)
+            .await
+            .unwrap();
+        let c = snap.windows[0].core.ordinary;
+        assert_eq!((c.attempted_bytes, c.delivered_bytes), (0, 10));
+        for w in &snap.windows {
+            assert!(
+                !w.complete,
+                "the {} s window overlaps the gap",
+                w.window_seconds
+            );
+        }
+    }
+
+    /// Acknowledgement retries of one upload leave the counters unchanged.
+    #[tokio::test]
+    async fn recording_delivery_counters_hold_across_ack_retries() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        *backend.with_url.lock() = true;
+        let outbox = Arc::new(TunnelOutbox::new());
+        let tunnel = Arc::new(CapturingTunnel::default());
+        outbox.set_handle(Some(tunnel.clone()));
+        enroll(&store, CORE_A, Utc::now() - ChronoDuration::hours(1), None).await;
+        let cfg = announce_cfg(clips_dir, outbox);
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+        upload_one(
+            &cfg,
+            &store,
+            &*backend,
+            &TokenBucket::new(0),
+            "mock",
+            &clip,
+            None,
+        )
+        .await
+        .unwrap();
+        let once = hour_counters(&store).await;
+        assert_eq!(once.ordinary.delivered_bytes, 10);
+        for h in 1..=3 {
+            reannounce(&cfg, &store, Utc::now() + ChronoDuration::hours(h)).await;
+        }
+        assert_eq!(
+            tunnel.sent.lock().len(),
+            4,
+            "announced then re-sent unacked"
+        );
+        assert_eq!(hour_counters(&store).await, once);
+        let id = tunnel.sent.lock()[0].meta.id.clone();
+        store
+            .record_clip_announce_ack(&id, Utc::now(), None)
+            .await
+            .unwrap();
+        assert_eq!(hour_counters(&store).await, once);
+    }
+
+    /// A missing hot file is a failed attempt with no transfer: a failure,
+    /// no attempted bytes, and the clip moves to backoff.
+    #[tokio::test]
+    async fn recording_delivery_missing_hot_file_counts_failure_not_transfer() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        tokio::fs::remove_file(clips_dir.join("1/clip_0001.mp4"))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        run_tick(&store, &clips_dir, &backend).await;
+
+        assert_eq!(backend.put_count(), 0);
+        let c = hour_counters(&store).await.ordinary;
+        assert_eq!((c.failure_count, c.attempted_bytes), (1, 0));
+        let parts = store
+            .upload_queue_partitions(nexus_store::RecordingSource::Ordinary, Utc::now(), None)
+            .await
+            .unwrap();
+        assert_eq!(parts, vec![(clip_id, nexus_store::QueuePartition::Backoff)]);
+    }
+
+    /// The alert uploader counts its own transfer and delivery, apart
+    /// from the ordinary queue.
+    #[tokio::test]
+    async fn recording_delivery_counts_alert_upload_separately() {
+        let (store, _clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 11, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+
+        alert_upload_pass(&cfg, &store, &registry).await;
+
+        let c = hour_counters(&store).await;
+        assert_eq!(c.alert.attempted_bytes, 11);
+        assert_eq!(c.alert.delivered_bytes, 11);
+        assert_eq!(c.alert.generated_bytes, 11);
+        assert_eq!(c.ordinary.attempted_bytes, 0, "no motion tick ran");
+    }
+
+    /// Codex review 9 — the evictor unlinks an alert clip (cutoff `now`, as
+    /// the storage-pressure ladder passes) while its PUT is in flight with
+    /// the bytes already read. The PUT still lands, so the clip counts
+    /// delivered and not lost.
+    #[tokio::test]
+    async fn recording_delivery_alert_clip_evicted_mid_upload_counts_delivered_not_lost() {
+        let (store, _clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 11, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let release = Arc::new(Notify::new());
+        let hook_release = release.clone();
+        *backend.first_put_hook.lock() = Some(Box::pin(async move {
+            hook_release.notified().await;
+        }));
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let upload = {
+            let cfg = announce_cfg(clips_dir.clone(), Arc::new(TunnelOutbox::new()));
+            let store = store.clone();
+            tokio::spawn(async move { alert_upload_pass(&cfg, &store, &registry).await })
+        };
+        for _ in 0..200 {
+            if !backend.put_paths.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(backend.put_paths.lock().len(), 1, "alert put in flight");
+
+        let evicted = crate::alert_clip_evict::reclaim_evictable_alert_clips(
+            &store,
+            &clips_dir,
+            Utc::now(),
+            10,
+        )
+        .await;
+        assert_eq!(evicted, 1, "the hot file is reclaimed mid-upload");
+        release.notify_one();
+        upload.await.unwrap();
+
+        let c = hour_counters(&store).await.alert;
+        assert_eq!(c.delivered_bytes, 11);
+        assert_eq!(
+            (c.evicted_before_upload_bytes, c.evicted_before_upload_count),
+            (0, 0),
+            "delivered, so not lost"
+        );
+    }
+
+    /// PR #404 review — the evictor deletes a motion clip's row (counting it
+    /// lost) while its PUT is in flight with the bytes already read. The PUT
+    /// still lands, with or without a blob URL to announce, so the clip
+    /// counts delivered and not lost.
+    #[tokio::test]
+    async fn recording_delivery_motion_clip_evicted_mid_upload_counts_delivered_not_lost() {
+        for with_url in [false, true] {
+            let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+            let backend = MockBackend::new("mock", HealthStatus::Ok);
+            *backend.with_url.lock() = with_url;
+            let evictor = store.clone();
+            *backend.first_put_hook.lock() = Some(Box::pin(async move {
+                evictor.cascade_delete_clip_metadata(clip_id).await.unwrap();
+            }));
+            let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+            let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+            upload_one(
+                &cfg,
+                &store,
+                &*backend,
+                &TokenBucket::new(0),
+                "mock",
+                &clip,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("with_url={with_url}: {e}"));
+
+            let c = hour_counters(&store).await.ordinary;
+            assert_eq!(c.delivered_bytes, 10, "with_url={with_url}");
+            assert_eq!(
+                (c.evicted_before_upload_bytes, c.evicted_before_upload_count),
+                (0, 0),
+                "with_url={with_url}: delivered, so not lost"
+            );
+        }
+    }
+
+    /// PR #404 review — the camera is deleted (the cascade drops the clip
+    /// rows after counting them lost) while a motion and an alert PUT are in
+    /// flight with blob URLs to announce. Both PUTs land, so both clips
+    /// count delivered and not lost.
+    #[tokio::test]
+    async fn recording_delivery_camera_deleted_mid_upload_counts_delivered_not_lost() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 11, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+
+        // The alert PUT is held in flight...
+        let alert_backend = MockBackend::new("mock", HealthStatus::Ok);
+        *alert_backend.with_url.lock() = true;
+        let release = Arc::new(Notify::new());
+        let hook_release = release.clone();
+        *alert_backend.first_put_hook.lock() = Some(Box::pin(async move {
+            hook_release.notified().await;
+        }));
+        let registry = Registry::new();
+        registry.replace_all([alert_backend.clone() as Arc<dyn ColdBackend>]);
+        let alert_upload = {
+            let (cfg, store) = (cfg.clone(), store.clone());
+            tokio::spawn(async move { alert_upload_pass(&cfg, &store, &registry).await })
+        };
+        for _ in 0..200 {
+            if !alert_backend.put_paths.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            alert_backend.put_paths.lock().len(),
+            1,
+            "alert put in flight"
+        );
+
+        // ...and the camera is deleted during the motion PUT.
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        *backend.with_url.lock() = true;
+        let deleter = store.clone();
+        *backend.first_put_hook.lock() = Some(Box::pin(async move {
+            deleter.delete_camera(1).await.unwrap();
+        }));
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+        upload_one(
+            &cfg,
+            &store,
+            &*backend,
+            &TokenBucket::new(0),
+            "mock",
+            &clip,
+            None,
+        )
+        .await
+        .unwrap();
+        release.notify_one();
+        alert_upload.await.unwrap();
+
+        let c = hour_counters(&store).await;
+        for (c, delivered, what) in [(c.ordinary, 10, "ordinary"), (c.alert, 11, "alert")] {
+            assert_eq!(
+                (
+                    c.delivered_bytes,
+                    c.evicted_before_upload_bytes,
+                    c.evicted_before_upload_count
+                ),
+                (delivered, 0, 0),
+                "{what}: delivered, so not lost"
+            );
+        }
+    }
+
+    /// PR #404 review — the backend already holds the clip, but neither the
+    /// hot file's size nor the stored size is known: the delivery counts as
+    /// one of unknown size, never as a known 0 bytes.
+    #[tokio::test]
+    async fn recording_delivery_existing_copy_of_unknown_size_counts_unknown() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        sqlx::query("UPDATE motion_clips SET size_bytes = 0 WHERE id = ?")
+            .bind(clip_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        tokio::fs::remove_file(clips_dir.join("1/clip_0001.mp4"))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        backend.existing.lock().insert(format!("1/{clip_id}.mp4"));
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+        upload_one(
+            &cfg,
+            &store,
+            &*backend,
+            &TokenBucket::new(0),
+            "mock",
+            &clip,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let c = hour_counters(&store).await.ordinary;
+        assert_eq!((c.delivered_bytes, c.delivered_unknown_size_count), (0, 1));
+    }
+
+    /// SPEC-090 — while its PUT is in flight a clip is marked in flight
+    /// and still counted in `ready`; once its completion commits it is in
+    /// neither.
+    #[tokio::test]
+    async fn recording_delivery_marks_the_clip_in_transfer() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        let release = Arc::new(Notify::new());
+        let hook_release = release.clone();
+        *backend.first_put_hook.lock() = Some(Box::pin(async move {
+            hook_release.notified().await;
+        }));
+        let tick_task = {
+            let (store, backend) = (store.clone(), backend.clone());
+            tokio::spawn(async move { run_tick(&store, &clips_dir, &backend).await })
+        };
+        for _ in 0..200 {
+            if !backend.put_paths.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(backend.put_paths.lock().len(), 1, "motion put in flight");
+
+        let snap = store
+            .recording_delivery_stats(Utc::now, None)
+            .await
+            .unwrap();
+        let f = snap
+            .ordinary
+            .in_flight
+            .expect("the uploader tracks transfers");
+        assert_eq!((f.count, f.known_bytes), (1, 10));
+        assert_eq!(snap.ordinary.ready.count, 1, "still where it was selected");
+
+        release.notify_one();
+        tick_task.await.unwrap();
+        let snap = store
+            .recording_delivery_stats(Utc::now, None)
+            .await
+            .unwrap();
+        assert_eq!(snap.ordinary.in_flight.unwrap().count, 0);
+        assert_eq!(snap.ordinary.ready.count, 0);
+        assert!(store
+            .get_clip(clip_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .cold_handle
+            .is_some());
+    }
+
+    /// SPEC-090 — a successful upload counts the bytes it sent as
+    /// delivered, even when the stored size is unknown (0), and only once.
+    #[tokio::test]
+    async fn recording_delivery_counts_uploaded_payload_when_size_unknown() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        tokio::fs::write(clips_dir.join("1/clip_0001.mp4"), vec![7u8; 1 << 20])
+            .await
+            .unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 0, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE motion_clips SET size_bytes = 0 WHERE id = ?")
+            .bind(clip_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        run_tick(&store, &clips_dir, &backend).await;
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+        alert_upload_pass(&cfg, &store, &registry).await;
+
+        let c = hour_counters(&store).await;
+        assert_eq!(c.ordinary.attempted_bytes, 1 << 20);
+        assert_eq!(c.ordinary.delivered_bytes, 1 << 20, "not the stored 0");
+        assert_eq!(c.alert.delivered_bytes, 11, "alert-bytes, not the stored 0");
+
+        // A duplicate completion leaves the count where it was.
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+        store
+            .mark_cold_replicated(
+                clip_id,
+                &ClipColdMark {
+                    cold_handle: "mock".into(),
+                    cold_path: clip.cold_path.unwrap(),
+                    cold_uploaded_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        let marked: i64 =
+            sqlx::query_scalar("SELECT acct_delivered FROM motion_clips WHERE id = ?")
+                .bind(clip_id)
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(marked, 1);
+        assert_eq!(
+            hour_counters(&store).await.ordinary.delivered_bytes,
+            1 << 20
+        );
+    }
+
+    /// SPEC-090 — a copy the backend already holds (its PUT succeeded, then
+    /// the engine restarted before the completion was recorded) delivers
+    /// that copy's size, not the unknown stored size (0), on both queues.
+    #[tokio::test]
+    async fn recording_delivery_counts_an_existing_copy_when_size_unknown() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        tokio::fs::write(clips_dir.join("1/clip_0001.mp4"), vec![7u8; 1 << 20])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE motion_clips SET size_bytes = 0 WHERE id = ?")
+            .bind(clip_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 0, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        backend.existing.lock().extend([
+            format!("1/{clip_id}.mp4"),
+            format!("alert/1/2026-07-17/alert-{alert_id}.mp4"),
+        ]);
+        run_tick(&store, &clips_dir, &backend).await;
+        let registry = Registry::new();
+        registry.replace_all([backend.clone() as Arc<dyn ColdBackend>]);
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+        alert_upload_pass(&cfg, &store, &registry).await;
+
+        assert_eq!(backend.put_count(), 0, "both copies were already there");
+        let c = hour_counters(&store).await;
+        assert_eq!(c.ordinary.delivered_bytes, 1 << 20, "not the stored 0");
+        assert_eq!(c.alert.delivered_bytes, 11, "alert-bytes, not the stored 0");
+        assert_eq!(c.ordinary.attempted_bytes + c.alert.attempted_bytes, 0);
+    }
+
+    /// SPEC-090 — an uploader stopped mid-transfer (its task dropped, as on
+    /// a restart) leaves nothing marked in flight: the clip is back to
+    /// plain `ready`, and the restarted uploader's set holds only its own
+    /// transfers.
+    #[tokio::test]
+    async fn recording_delivery_in_flight_clears_across_an_uploader_restart() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        *backend.first_put_hook.lock() = Some(Box::pin(std::future::pending()));
+        let tick_task = {
+            let (store, backend, clips_dir) = (store.clone(), backend.clone(), clips_dir.clone());
+            tokio::spawn(async move { run_tick(&store, &clips_dir, &backend).await })
+        };
+        for _ in 0..200 {
+            if !backend.put_paths.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let snap = || async {
+            store
+                .recording_delivery_stats(Utc::now, None)
+                .await
+                .unwrap()
+        };
+        assert_eq!(snap().await.ordinary.in_flight.unwrap().count, 1);
+
+        tick_task.abort();
+        assert!(tick_task.await.unwrap_err().is_cancelled());
+        let stopped = snap().await;
+        assert_eq!(stopped.ordinary.in_flight.unwrap().count, 0, "not stale");
+        assert_eq!(stopped.ordinary.ready.count, 1, "still queued");
+
+        run_tick(&store, &clips_dir, &backend).await;
+        let restarted = snap().await;
+        assert_eq!(restarted.ordinary.in_flight.unwrap().count, 0);
+        assert_eq!(restarted.ordinary.ready.count, 0);
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+        assert!(
+            clip.cold_handle.is_some(),
+            "the restarted uploader delivered it"
+        );
     }
 }

@@ -1,28 +1,58 @@
 //! ONVIF device-control HTTP handlers: encoder.
 
 use std::net::SocketAddr;
+use std::time::Duration;
 
-use axum::extract::{ConnectInfo, Path, State};
-use axum::http::HeaderMap;
+use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Json;
+use nexus_store::audit::AuditOutcome;
 use nexus_types::{CameraId, Role};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use url::Url;
 
-use super::{finish_void, gateway_err, onvif_target, rbac};
+use super::{audit, finish_void, gateway_err, onvif_target, rbac, OnvifTarget};
 use crate::api::{ApiError, ApiState};
 use crate::auth::require_role::SessionContext;
-use crate::discovery::onvif_encoder;
+use crate::discovery::onvif_encoder::{self, VideoEncoderConfig, VideoEncoderOptions};
+use crate::discovery::onvif_media::{self, ProfileStream};
+
+/// Max length of encoder error text that leaves the edge.
+const ERR_CAP: usize = 200;
 
 // ---------------------------------------------------------------------------
 // Encoder
 // ---------------------------------------------------------------------------
 
-/// `GET /v1/admin/cameras/{id}/encoder` — encoder configs + the
-/// generic option ranges (best-effort).
+/// Total budget for the profile-binding read (GetProfiles + one
+/// GetStreamUri per profile). The GET already spends up to two 5 s
+/// `REQ_TIMEOUT`s on configs + options and edge-gateway answers the
+/// cloud's RPC after 15 s, so 4 s keeps the worst case at 14 s; a
+/// healthy camera answers the whole lookup in well under a second.
+const BINDING_BUDGET: Duration = Duration::from_secs(4);
+
+/// Budget for the PUT's pre-write reads (configs + selected options).
+/// With the 5 s write after it the PUT stays inside edge-gateway's 15 s
+/// RPC window, so a slow camera fails clean (nothing written) instead
+/// of leaving the cloud an ambiguous write outcome.
+const PUT_READ_BUDGET: Duration = Duration::from_secs(6);
+
+#[derive(Deserialize)]
+pub struct EncoderQuery {
+    /// Whose option ranges to return; absent keeps the generic read.
+    configuration_token: Option<String>,
+}
+
+/// `GET /v1/admin/cameras/{id}/encoder` — encoder configs, the
+/// option ranges of the selected configuration (generic when none
+/// is selected; best-effort), and which configuration feeds the
+/// recording stream (`bindings`, best-effort, `null` with a
+/// `bindings_reason` when the lookup could not run).
 pub async fn encoder_get(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
+    Query(q): Query<EncoderQuery>,
     ctx: SessionContext,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     rbac(&ctx, Role::Admin)?;
@@ -30,29 +60,48 @@ pub async fn encoder_get(
     let configs =
         onvif_encoder::get_video_encoder_configurations(&t.endpoint, &t.username, &t.password)
             .await
-            .map_err(gateway_err)?;
+            .map_err(enc_err)?;
+    let selected = q.configuration_token.as_deref();
+    if selected.is_some_and(|tok| !configs.iter().any(|c| c.token == tok)) {
+        return Err(unknown_token());
+    }
+    let encoding = selected
+        .and_then(|tok| configs.iter().find(|c| c.token == tok))
+        .and_then(|c| c.encoding.as_deref());
     let options = onvif_encoder::get_video_encoder_configuration_options(
         &t.endpoint,
         &t.username,
         &t.password,
+        selected,
         None,
-        None,
+        encoding,
     )
     .await
     .ok();
-    Ok(Json(
-        serde_json::json!({ "configs": configs, "options": options }),
-    ))
+    let recording = recording_url(&s, id).await?;
+    let (bindings, bindings_reason) =
+        recording_bindings(&t, &configs, &recording, BINDING_BUDGET).await;
+    Ok(Json(serde_json::json!({
+        "configs": configs,
+        "options": options,
+        "bindings": bindings,
+        "bindings_reason": bindings_reason,
+    })))
 }
 
 #[derive(Deserialize)]
 pub struct EncoderPut {
-    config: onvif_encoder::VideoEncoderConfig,
+    config: VideoEncoderConfig,
     #[serde(default)]
     force_persistence: bool,
 }
 
-/// `PUT /v1/admin/cameras/{id}/encoder` — write an encoder config.
+/// `PUT /v1/admin/cameras/{id}/encoder` — write one encoder config.
+/// The token must be one the camera lists and every changed value must
+/// fit *that* configuration's options (on a codec switch: an offered codec,
+/// and every value by its options); otherwise nothing is written.
+/// Fields the request omits keep the camera's current values, except the
+/// old codec's GOP length and profile when the request changes `encoding`.
 pub async fn encoder_put(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
@@ -62,23 +111,1308 @@ pub async fn encoder_put(
     Json(req): Json<EncoderPut>,
 ) -> Result<Response, ApiError> {
     rbac(&ctx, Role::Admin)?;
+    const ACTION: &str = "camera.onvif.encoder.set";
     let t = onvif_target(&s, id).await?;
-    let res = onvif_encoder::set_video_encoder_configuration(
+    let config = match preflight(&t, req.config, PUT_READ_BUDGET).await {
+        Ok(config) => config,
+        Err(ApiError(status, e)) => {
+            audit(
+                &s,
+                &ctx,
+                &headers,
+                peer.ip(),
+                ACTION,
+                id,
+                AuditOutcome::Failure,
+                Some(&e),
+            )
+            .await;
+            return Err(ApiError(status, e));
+        }
+    };
+    let res = set_config(&t, &config, req.force_persistence).await;
+    finish_void(&s, &ctx, &headers, peer.ip(), ACTION, id, res).await
+}
+
+async fn set_config(t: &OnvifTarget, c: &VideoEncoderConfig, force: bool) -> Result<(), String> {
+    onvif_encoder::set_video_encoder_configuration(&t.endpoint, &t.username, &t.password, c, force)
+        .await
+        .map_err(|e| sanitize_err(&e))
+}
+
+/// Camera error text reaches the HTTP response and the audit log, so no
+/// URL (a fault can echo a credential-bearing stream URI, R5b) and at most
+/// [`ERR_CAP`] chars leave the edge.
+fn sanitize_err(e: &str) -> String {
+    let words: Vec<&str> = e
+        .split_whitespace()
+        .map(|w| {
+            if w.contains("://") || w.contains('@') {
+                "[redacted]"
+            } else {
+                w
+            }
+        })
+        .collect();
+    words.join(" ").chars().take(ERR_CAP).collect()
+}
+
+fn enc_err(e: String) -> ApiError {
+    gateway_err(sanitize_err(&e))
+}
+
+fn unknown_token() -> ApiError {
+    ApiError(
+        StatusCode::BAD_REQUEST,
+        "unknown encoder configuration token".into(),
+    )
+}
+
+/// [`check_selected`] within `budget`: a slow camera fails before the
+/// write, so nothing is written.
+async fn preflight(
+    t: &OnvifTarget,
+    new: VideoEncoderConfig,
+    budget: Duration,
+) -> Result<VideoEncoderConfig, ApiError> {
+    tokio::time::timeout(budget, check_selected(t, new))
+        .await
+        .unwrap_or_else(|_| Err(enc_err("encoder read timed out; nothing written".into())))
+}
+
+/// Read the camera's current config for `new.token` and that
+/// configuration's options, [`merge`] `new` onto it and [`check_write`]
+/// the result, which is the configuration to write.
+async fn check_selected(
+    t: &OnvifTarget,
+    new: VideoEncoderConfig,
+) -> Result<VideoEncoderConfig, ApiError> {
+    let configs =
+        onvif_encoder::get_video_encoder_configurations(&t.endpoint, &t.username, &t.password)
+            .await
+            .map_err(enc_err)?;
+    let mut current = configs
+        .into_iter()
+        .find(|c| c.token == new.token)
+        .ok_or_else(unknown_token)?;
+    // A codec switch drops the old codec's GOP length and profile: only the
+    // request's own are written, and they are judged as changes.
+    if new.encoding.is_some() && !same_codec(&new, &current) {
+        current.gov_length = None;
+        current.profile = None;
+    }
+    let merged = merge(new, &current);
+    // Judged by the codec being written: a camera may list every codec's.
+    let options = onvif_encoder::get_video_encoder_configuration_options(
         &t.endpoint,
         &t.username,
         &t.password,
-        &req.config,
-        req.force_persistence,
-    )
-    .await;
-    finish_void(
-        &s,
-        &ctx,
-        &headers,
-        peer.ip(),
-        "camera.onvif.encoder.set",
-        id,
-        res,
+        Some(&merged.token),
+        None,
+        merged.encoding.as_deref(),
     )
     .await
+    .map_err(enc_err)?;
+    check_write(&merged, &current, &options).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
+    Ok(merged)
+}
+
+/// Whether `a` and `b` carry the same encoding: ONVIF's are `H264`,
+/// `JPEG`, …, so letter case is not significant.
+fn same_codec(a: &VideoEncoderConfig, b: &VideoEncoderConfig) -> bool {
+    match (&a.encoding, &b.encoding) {
+        (Some(x), Some(y)) => x.eq_ignore_ascii_case(y),
+        (x, y) => x == y,
+    }
+}
+
+/// `new`'s set fields over the camera's `current` values. The write sends
+/// a whole configuration, so a field the request omits keeps the camera's
+/// value (SPEC-090 D-6) instead of dropping out of the SOAP body.
+fn merge(new: VideoEncoderConfig, current: &VideoEncoderConfig) -> VideoEncoderConfig {
+    let cur = current.clone();
+    VideoEncoderConfig {
+        token: new.token,
+        name: new.name.or(cur.name),
+        use_count: new.use_count.or(cur.use_count),
+        encoding: new.encoding.or(cur.encoding),
+        width: new.width.or(cur.width),
+        height: new.height.or(cur.height),
+        quality: new.quality.or(cur.quality),
+        frame_rate_limit: new.frame_rate_limit.or(cur.frame_rate_limit),
+        encoding_interval: new.encoding_interval.or(cur.encoding_interval),
+        bitrate_limit: new.bitrate_limit.or(cur.bitrate_limit),
+        gov_length: new.gov_length.or(cur.gov_length),
+        profile: new.profile.or(cur.profile),
+    }
+}
+
+/// Every field the write changes must fit the selected configuration's
+/// options. Unchanged fields are the camera's own values and are not
+/// re-judged, except on a codec switch: the new encoding must be one the
+/// configuration offers, and every value, inherited ones too, is judged by
+/// that codec's options. A range the camera does not report is left to it.
+fn check_write(
+    new: &VideoEncoderConfig,
+    current: &VideoEncoderConfig,
+    options: &VideoEncoderOptions,
+) -> Result<(), String> {
+    fn int(
+        name: &str,
+        new: Option<u32>,
+        cur: Option<u32>,
+        r: Option<onvif_encoder::IntRange>,
+    ) -> Result<(), String> {
+        match (new, r) {
+            (Some(v), Some(r))
+                if new != cur && !(r.min as i64..=r.max as i64).contains(&(v as i64)) =>
+            {
+                Err(format!(
+                    "{name} {v} outside {}..={} for this configuration",
+                    r.min, r.max
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+    let blank = VideoEncoderConfig::default();
+    let current = if !same_codec(new, current) {
+        if let Some(e) = &new.encoding {
+            if !options.encodings.iter().any(|c| c.eq_ignore_ascii_case(e)) {
+                return Err(format!("encoding {e} not offered for this configuration"));
+            }
+        }
+        // The old codec's values were never judged by this codec's options.
+        &blank
+    } else {
+        current
+    };
+    int(
+        "bitrate_limit",
+        new.bitrate_limit,
+        current.bitrate_limit,
+        options.bitrate_range,
+    )?;
+    int(
+        "frame_rate_limit",
+        new.frame_rate_limit,
+        current.frame_rate_limit,
+        options.frame_rate_range,
+    )?;
+    int(
+        "gov_length",
+        new.gov_length,
+        current.gov_length,
+        options.gov_length_range,
+    )?;
+    int(
+        "encoding_interval",
+        new.encoding_interval,
+        current.encoding_interval,
+        options.encoding_interval_range,
+    )?;
+    if let (Some(q), Some(r)) = (new.quality, options.quality_range) {
+        if new.quality != current.quality && !(r.min..=r.max).contains(&q) {
+            return Err(format!(
+                "quality {q} outside {}..={} for this configuration",
+                r.min, r.max
+            ));
+        }
+    }
+    if let (Some(w), Some(h)) = (new.width, new.height) {
+        let changed = (new.width, new.height) != (current.width, current.height);
+        if changed && !options.resolutions.is_empty() && !options.resolutions.contains(&(w, h)) {
+            return Err(format!(
+                "resolution {w}x{h} not offered for this configuration"
+            ));
+        }
+    }
+    if let Some(p) = &new.profile {
+        if new.profile != current.profile
+            && !options.profiles_supported.is_empty()
+            && !options.profiles_supported.contains(p)
+        {
+            return Err(format!("profile {p} not offered for this configuration"));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Recording binding (SPEC-090)
+// ---------------------------------------------------------------------------
+
+/// One encoder configuration, the media profiles that stream it, and
+/// whether it verifiably produces the camera's recording stream
+/// (`None` = unverified, never a guess).
+#[derive(Debug, PartialEq, Serialize)]
+struct Binding {
+    configuration_token: String,
+    profile_tokens: Vec<String>,
+    used_for_recording: Option<bool>,
+}
+
+/// The camera's recording stream: its main ingest URL, never the
+/// analysis substream.
+async fn recording_url(s: &ApiState, id: CameraId) -> Result<Url, ApiError> {
+    s.store
+        .list_cameras()
+        .await?
+        .into_iter()
+        .find(|c| c.id == id)
+        .map(|c| c.ingest.url)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "camera not found".into()))
+}
+
+/// Resolve the camera's profiles within `budget` and bind them. On
+/// budget exhaustion or a failed GetProfiles, `bindings` is `None`
+/// with a reason code; the caller still returns configs/options.
+async fn recording_bindings(
+    t: &OnvifTarget,
+    configs: &[VideoEncoderConfig],
+    recording: &Url,
+    budget: Duration,
+) -> (Option<Vec<Binding>>, Option<&'static str>) {
+    let lookup = onvif_media::query_profile_streams(&t.endpoint, &t.username, &t.password);
+    match tokio::time::timeout(budget, lookup).await {
+        Err(_) => (None, Some("binding_lookup_timeout")),
+        Ok(Err(_)) => (None, Some("profiles_unavailable")),
+        Ok(Ok(profiles)) => {
+            let (bindings, reason) = bind_recording(configs, &profiles, recording);
+            (Some(bindings), reason)
+        }
+    }
+}
+
+/// How one camera-reported stream URI relates to the recording URL.
+#[derive(PartialEq)]
+enum UriVerdict {
+    Same,
+    Different,
+    /// Same path+query under another authority (a vendor host/port
+    /// alias we cannot prove equal), or a URI that does not parse.
+    Unverified,
+}
+
+/// Comparison key: (scheme, lower-cased host, port with RTSP's 554
+/// filled in) and (path without trailing slash, non-empty query).
+/// Userinfo is dropped; path and query compare exactly.
+type UriKey<'a> = ((&'a str, String, Option<u16>), (&'a str, Option<&'a str>));
+
+fn uri_key(u: &Url) -> UriKey<'_> {
+    let port = u.port().or((u.scheme() == "rtsp").then_some(554));
+    let host = u.host_str().unwrap_or_default().to_ascii_lowercase();
+    let query = u.query().filter(|q| !q.is_empty());
+    (
+        (u.scheme(), host, port),
+        (u.path().trim_end_matches('/'), query),
+    )
+}
+
+fn compare_uri(reported: &str, recording: &Url) -> UriVerdict {
+    let Ok(reported) = Url::parse(reported) else {
+        return UriVerdict::Unverified;
+    };
+    let (a, b) = (uri_key(&reported), uri_key(recording));
+    if a == b {
+        UriVerdict::Same
+    } else if a.1 == b.1 {
+        UriVerdict::Unverified
+    } else {
+        UriVerdict::Different
+    }
+}
+
+/// Bind each configuration to its profiles and decide which one feeds
+/// recording. One configuration is `true` only when every profile's
+/// stream URI resolved and all exact matches belong to that one listed
+/// configuration; the rest are then `false`. Anything else leaves every
+/// configuration `null` with the reason, because an unresolved profile
+/// could be a second match. No match at all is `null` too: the stored
+/// URL may be a vendor path alias, so "none of these" is unproven.
+fn bind_recording(
+    configs: &[VideoEncoderConfig],
+    profiles: &[ProfileStream],
+    recording: &Url,
+) -> (Vec<Binding>, Option<&'static str>) {
+    let verdicts: Vec<Option<UriVerdict>> = profiles
+        .iter()
+        .map(|p| p.uri.as_deref().map(|u| compare_uri(u, recording)))
+        .collect();
+    let mut matched: Vec<Option<&str>> = profiles
+        .iter()
+        .zip(&verdicts)
+        .filter(|(_, v)| **v == Some(UriVerdict::Same))
+        .map(|(p, _)| p.encoder_token.as_deref())
+        .collect();
+    matched.sort_unstable();
+    matched.dedup();
+    let reason = if verdicts.iter().any(Option::is_none) {
+        Some("stream_uri_unavailable")
+    } else if verdicts.contains(&Some(UriVerdict::Unverified)) {
+        Some("stream_uri_unverified")
+    } else if matched.is_empty() {
+        Some("no_recording_match")
+    } else if matched.len() > 1 {
+        Some("multiple_configs_match")
+    } else if !configs.iter().any(|c| Some(c.token.as_str()) == matched[0]) {
+        Some("recording_profile_unbound")
+    } else {
+        None
+    };
+    let bindings = configs
+        .iter()
+        .map(|c| Binding {
+            configuration_token: c.token.clone(),
+            profile_tokens: profiles
+                .iter()
+                .filter(|p| p.encoder_token.as_deref() == Some(c.token.as_str()))
+                .map(|p| p.profile_token.clone())
+                .collect(),
+            used_for_recording: reason
+                .is_none()
+                .then(|| matched[0] == Some(c.token.as_str())),
+        })
+        .collect();
+    (bindings, reason)
+}
+
+#[cfg(test)]
+mod tests {
+    /// Random per-call credential: no literal reaches a password sink.
+    fn test_secret() -> String {
+        uuid::Uuid::now_v7().to_string()
+    }
+    use super::*;
+    use crate::discovery::onvif_encoder::IntRange;
+
+    fn cfg(token: &str) -> VideoEncoderConfig {
+        VideoEncoderConfig {
+            token: token.into(),
+            ..VideoEncoderConfig::default()
+        }
+    }
+
+    fn prof(token: &str, encoder: Option<&str>, uri: Option<&str>) -> ProfileStream {
+        ProfileStream {
+            profile_token: token.into(),
+            encoder_token: encoder.map(str::to_string),
+            uri: uri.map(str::to_string),
+        }
+    }
+
+    fn rec(u: &str) -> url::Url {
+        u.parse().unwrap()
+    }
+
+    fn b(token: &str, profiles: &[&str], used: Option<bool>) -> Binding {
+        Binding {
+            configuration_token: token.into(),
+            profile_tokens: profiles.iter().map(|p| p.to_string()).collect(),
+            used_for_recording: used,
+        }
+    }
+
+    const MAIN: &str = "rtsp://192.168.1.64:554/Streaming/Channels/101";
+    const SUB: &str = "rtsp://192.168.1.64:554/Streaming/Channels/102";
+
+    #[test]
+    fn shared_config_across_two_profiles_is_the_verified_recording_encoder() {
+        let configs = [cfg("VE_main"), cfg("VE_sub"), cfg("VE_unused")];
+        let profiles = [
+            prof("P1", Some("VE_main"), Some(MAIN)),
+            prof("P2", Some("VE_sub"), Some(SUB)),
+            prof("P3", Some("VE_sub"), Some(SUB)),
+        ];
+        let (bindings, reason) = bind_recording(
+            &configs,
+            &profiles,
+            &rec("rtsp://192.168.1.64:554/Streaming/Channels/102"),
+        );
+        assert_eq!(reason, None);
+        assert_eq!(
+            bindings,
+            vec![
+                b("VE_main", &["P1"], Some(false)),
+                b("VE_sub", &["P2", "P3"], Some(true)),
+                b("VE_unused", &[], Some(false)),
+            ]
+        );
+    }
+
+    #[test]
+    fn implicit_port_credentials_case_and_trailing_slash_normalise_away() {
+        let configs = [cfg("VE_main"), cfg("VE_sub")];
+        let profiles = [
+            prof("P1", Some("VE_main"), Some(MAIN)),
+            prof(
+                "P2",
+                Some("VE_sub"),
+                Some("RTSP://User:Pw@192.168.1.64/Streaming/Channels/102/"),
+            ),
+        ];
+        let (bindings, reason) = bind_recording(
+            &configs,
+            &profiles,
+            &rec("rtsp://admin:secret@192.168.1.64/Streaming/Channels/102"),
+        );
+        assert_eq!(reason, None);
+        assert_eq!(bindings[1].used_for_recording, Some(true));
+        assert_eq!(bindings[0].used_for_recording, Some(false));
+        // An explicit non-default port is a different authority, not a match.
+        let (bindings, reason) = bind_recording(
+            &configs,
+            &profiles,
+            &rec("rtsp://192.168.1.64:8554/Streaming/Channels/102"),
+        );
+        assert_eq!(reason, Some("stream_uri_unverified"));
+        assert!(bindings.iter().all(|b| b.used_for_recording.is_none()));
+    }
+
+    #[test]
+    fn path_and_query_compare_exactly() {
+        let configs = [cfg("VE_main")];
+        let profiles = [prof(
+            "P1",
+            Some("VE_main"),
+            Some("rtsp://cam/Streaming/Channels/101?transportmode=unicast"),
+        )];
+        let (bindings, reason) = bind_recording(
+            &configs,
+            &profiles,
+            &rec("rtsp://cam/streaming/channels/101"),
+        );
+        assert_eq!(reason, Some("no_recording_match"));
+        assert_eq!(bindings[0].used_for_recording, None);
+    }
+
+    #[test]
+    fn vendor_alias_host_is_unverified_not_guessed() {
+        let configs = [cfg("VE_main"), cfg("VE_sub")];
+        let profiles = [
+            prof("P1", Some("VE_main"), Some(MAIN)),
+            prof(
+                "P2",
+                Some("VE_sub"),
+                Some("rtsp://cam-front.local:554/Streaming/Channels/102"),
+            ),
+        ];
+        let (bindings, reason) = bind_recording(&configs, &profiles, &rec(SUB));
+        assert_eq!(reason, Some("stream_uri_unverified"));
+        assert!(bindings.iter().all(|b| b.used_for_recording.is_none()));
+    }
+
+    #[test]
+    fn two_configs_matching_is_ambiguous() {
+        let configs = [cfg("VE_main"), cfg("VE_sub")];
+        let profiles = [
+            prof("P1", Some("VE_main"), Some(SUB)),
+            prof("P2", Some("VE_sub"), Some(SUB)),
+        ];
+        let (bindings, reason) = bind_recording(&configs, &profiles, &rec(SUB));
+        assert_eq!(reason, Some("multiple_configs_match"));
+        assert!(bindings.iter().all(|b| b.used_for_recording.is_none()));
+    }
+
+    #[test]
+    fn a_failed_stream_uri_leaves_every_config_unverified() {
+        let configs = [cfg("VE_main"), cfg("VE_sub")];
+        let profiles = [
+            prof("P1", Some("VE_main"), None),
+            prof("P2", Some("VE_sub"), Some(SUB)),
+        ];
+        let (bindings, reason) = bind_recording(&configs, &profiles, &rec(SUB));
+        assert_eq!(reason, Some("stream_uri_unavailable"));
+        assert_eq!(
+            bindings,
+            vec![b("VE_main", &["P1"], None), b("VE_sub", &["P2"], None)]
+        );
+    }
+
+    #[test]
+    fn no_match_anywhere_is_unverified_not_false() {
+        let configs = [cfg("VE_main"), cfg("VE_sub")];
+        let profiles = [
+            prof("P1", Some("VE_main"), Some(MAIN)),
+            prof("P2", Some("VE_sub"), Some(SUB)),
+        ];
+        let (bindings, reason) = bind_recording(
+            &configs,
+            &profiles,
+            &rec("rtsp://192.168.1.64/h264/ch1/main/av_stream"),
+        );
+        assert_eq!(reason, Some("no_recording_match"));
+        assert!(bindings.iter().all(|b| b.used_for_recording.is_none()));
+    }
+
+    #[test]
+    fn a_matching_profile_without_an_encoder_config_is_unverified() {
+        let configs = [cfg("VE_main")];
+        let profiles = [
+            prof("P1", Some("VE_main"), Some(MAIN)),
+            prof("P2", None, Some(SUB)),
+        ];
+        let (bindings, reason) = bind_recording(&configs, &profiles, &rec(SUB));
+        assert_eq!(reason, Some("recording_profile_unbound"));
+        assert_eq!(bindings, vec![b("VE_main", &["P1"], None)]);
+    }
+
+    const LEAK: &str = "rtsp://user:pass@10.0.0.9:554/s?token=abc http://user:pass@cam/x";
+
+    /// Camera stub: valid configs, SOAP faults (echoing credential-bearing
+    /// URIs) for options, profiles and set.
+    async fn fault_camera() -> OnvifTarget {
+        async fn h(body: String) -> (StatusCode, String) {
+            if body.contains("GetVideoEncoderConfigurations") {
+                return (
+                    StatusCode::OK,
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body><trt:GetVideoEncoderConfigurationsResponse><trt:Configurations token="VE"><tt:Name>m</tt:Name></trt:Configurations></trt:GetVideoEncoderConfigurationsResponse></s:Body></s:Envelope>"#.into(),
+                );
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope"><s:Body><s:Fault><s:Code><s:Value>s:Receiver</s:Value></s:Code><s:Reason><s:Text xml:lang="en">bad {LEAK} {}</s:Text></s:Reason></s:Fault></s:Body></s:Envelope>"#,
+                    "x".repeat(500)
+                ),
+            )
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, axum::Router::new().fallback(h)).await;
+        });
+        OnvifTarget {
+            endpoint: format!("http://{addr}/onvif/device_service"),
+            username: "admin".into(),
+            password: test_secret(),
+        }
+    }
+
+    fn assert_clean(text: &str) {
+        assert!(!text.contains("user:pass@"), "{text}");
+        assert!(!text.contains("://"), "{text}");
+        assert!(!text.contains("token=abc"), "{text}");
+        assert!(text.chars().count() <= ERR_CAP, "{text}");
+        assert!(text.contains("soap fault"), "keeps a stable reason: {text}");
+    }
+
+    #[tokio::test]
+    async fn options_fault_with_credential_uri_is_sanitized() {
+        let t = fault_camera().await;
+        let ApiError(_, e) = check_selected(&t, cfg("VE")).await.unwrap_err();
+        assert_clean(&e);
+    }
+
+    #[tokio::test]
+    async fn set_fault_with_credential_uri_is_sanitized() {
+        let t = fault_camera().await;
+        let e = set_config(&t, &cfg("VE"), false).await.unwrap_err();
+        assert_clean(&e);
+    }
+
+    #[tokio::test]
+    async fn binding_read_fault_surfaces_only_a_reason_code() {
+        let t = fault_camera().await;
+        let (b, reason) =
+            recording_bindings(&t, &[cfg("VE")], &rec(MAIN), Duration::from_secs(4)).await;
+        assert!(b.is_none());
+        assert_eq!(reason, Some("profiles_unavailable"));
+    }
+
+    #[tokio::test]
+    async fn binding_lookup_past_its_budget_returns_null_with_a_reason() {
+        async fn slow(_body: String) -> &'static str {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            "<late/>"
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, axum::Router::new().fallback(slow)).await;
+        });
+        let t = OnvifTarget {
+            endpoint: format!("http://{addr}/onvif/device_service"),
+            username: "admin".into(),
+            password: test_secret(),
+        };
+        let started = std::time::Instant::now();
+        let got = recording_bindings(
+            &t,
+            &[cfg("VE_main")],
+            &rec(MAIN),
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(got, (None, Some("binding_lookup_timeout")));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let dead = OnvifTarget {
+            endpoint: "http://127.0.0.1:9/onvif/device_service".into(),
+            username: "admin".into(),
+            password: test_secret(),
+        };
+        let got =
+            recording_bindings(&dead, &[cfg("VE_main")], &rec(MAIN), Duration::from_secs(4)).await;
+        assert_eq!(got, (None, Some("profiles_unavailable")));
+    }
+
+    fn sub_options() -> VideoEncoderOptions {
+        VideoEncoderOptions {
+            resolutions: vec![(1280, 720), (640, 360)],
+            bitrate_range: Some(IntRange { min: 32, max: 4096 }),
+            frame_rate_range: Some(IntRange { min: 1, max: 25 }),
+            gov_length_range: Some(IntRange { min: 1, max: 200 }),
+            ..VideoEncoderOptions::default()
+        }
+    }
+
+    fn sub_config() -> VideoEncoderConfig {
+        VideoEncoderConfig {
+            token: "VE_sub".into(),
+            encoding: Some("H264".into()),
+            width: Some(1280),
+            height: Some(720),
+            frame_rate_limit: Some(15),
+            bitrate_limit: Some(2048),
+            gov_length: Some(30),
+            // A value the camera's own options do not list.
+            quality: Some(9.0),
+            ..VideoEncoderConfig::default()
+        }
+    }
+
+    #[test]
+    fn write_check_validates_changed_fields_against_the_selected_options() {
+        let current = sub_config();
+        let opts = sub_options();
+        let ok = VideoEncoderConfig {
+            bitrate_limit: Some(1536),
+            ..current.clone()
+        };
+        assert_eq!(check_write(&ok, &current, &opts), Ok(()));
+        for bad in [
+            VideoEncoderConfig {
+                bitrate_limit: Some(8000),
+                ..current.clone()
+            },
+            VideoEncoderConfig {
+                width: Some(2592),
+                height: Some(1520),
+                ..current.clone()
+            },
+            VideoEncoderConfig {
+                frame_rate_limit: Some(30),
+                ..current.clone()
+            },
+            VideoEncoderConfig {
+                gov_length: Some(400),
+                ..current.clone()
+            },
+        ] {
+            assert!(check_write(&bad, &current, &opts).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn write_check_rejects_quality_and_profile_outside_the_options() {
+        use crate::discovery::onvif_encoder::FloatRange;
+        let opts = VideoEncoderOptions {
+            quality_range: Some(FloatRange { min: 1.0, max: 6.0 }),
+            profiles_supported: vec!["Main".into(), "High".into()],
+            ..sub_options()
+        };
+        let current = VideoEncoderConfig {
+            profile: Some("Baseline".into()),
+            ..sub_config()
+        };
+        let with = |quality, profile: &str| VideoEncoderConfig {
+            quality,
+            profile: Some(profile.into()),
+            ..current.clone()
+        };
+        for bad in [with(Some(7.0), "Baseline"), with(Some(9.0), "Extended")] {
+            assert!(check_write(&bad, &current, &opts).is_err(), "{bad:?}");
+        }
+        // In range, or unchanged although the camera's own value is outside.
+        assert_eq!(
+            check_write(&with(Some(3.0), "High"), &current, &opts),
+            Ok(())
+        );
+        assert_eq!(
+            check_write(&with(Some(9.0), "Baseline"), &current, &opts),
+            Ok(())
+        );
+    }
+
+    /// A codec switch judges each value it carries over from the old codec
+    /// by the new codec's options; without a switch it is left to the camera.
+    #[test]
+    fn a_codec_switch_rejudges_every_inherited_value() {
+        use crate::discovery::onvif_encoder::FloatRange;
+        let opts = VideoEncoderOptions {
+            quality_range: Some(FloatRange { min: 1.0, max: 6.0 }),
+            encoding_interval_range: Some(IntRange { min: 1, max: 3 }),
+            encodings: vec!["H264".into(), "H265".into()],
+            ..sub_options()
+        };
+        let h264 = VideoEncoderConfig {
+            quality: Some(4.0),
+            encoding_interval: Some(1),
+            ..sub_config()
+        };
+        let h265 = |c: &VideoEncoderConfig| VideoEncoderConfig {
+            encoding: Some("H265".into()),
+            ..c.clone()
+        };
+        assert_eq!(check_write(&h265(&h264), &h264, &opts), Ok(()));
+        for (field, current) in [
+            (
+                "bitrate_limit",
+                VideoEncoderConfig {
+                    bitrate_limit: Some(8000),
+                    ..h264.clone()
+                },
+            ),
+            (
+                "resolution",
+                VideoEncoderConfig {
+                    width: Some(2592),
+                    height: Some(1520),
+                    ..h264.clone()
+                },
+            ),
+            (
+                "frame_rate_limit",
+                VideoEncoderConfig {
+                    frame_rate_limit: Some(30),
+                    ..h264.clone()
+                },
+            ),
+            (
+                "encoding_interval",
+                VideoEncoderConfig {
+                    encoding_interval: Some(9),
+                    ..h264.clone()
+                },
+            ),
+            (
+                "quality",
+                VideoEncoderConfig {
+                    quality: Some(9.0),
+                    ..h264.clone()
+                },
+            ),
+        ] {
+            let got = check_write(&h265(&current), &current, &opts);
+            assert!(got.as_ref().is_err_and(|e| e.starts_with(field)), "{got:?}");
+            assert_eq!(check_write(&current, &current, &opts), Ok(()), "{field}");
+            // The camera's own codec in another letter case is no switch.
+            let lower = VideoEncoderConfig {
+                encoding: Some("h264".into()),
+                ..current.clone()
+            };
+            assert_eq!(check_write(&lower, &current, &opts), Ok(()), "{field}");
+        }
+    }
+
+    /// An H264 and a JPEG configuration, as a mixed-codec camera lists them.
+    const MIXED_CONFIGS: &str = concat!(
+        r#"<trt:Configurations token="VE_sub"><tt:Name>sub</tt:Name><tt:Encoding>H264</tt:Encoding>"#,
+        r#"<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>"#,
+        r#"<tt:RateControl><tt:FrameRateLimit>15</tt:FrameRateLimit><tt:BitrateLimit>2048</tt:BitrateLimit></tt:RateControl>"#,
+        r#"<tt:H264><tt:GovLength>30</tt:GovLength></tt:H264></trt:Configurations>"#,
+        r#"<trt:Configurations token="VE_jpeg"><tt:Name>snap</tt:Name><tt:Encoding>JPEG</tt:Encoding>"#,
+        r#"<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>"#,
+        r#"<tt:RateControl><tt:FrameRateLimit>10</tt:FrameRateLimit><tt:BitrateLimit>2048</tt:BitrateLimit></tt:RateControl>"#,
+        r#"</trt:Configurations>"#,
+    );
+
+    /// Per-codec options: (codec block, its `Extension` bitrate block).
+    const JPEG_OPTS: (&str, &str) = (
+        concat!(
+            "<tt:JPEG><tt:ResolutionsAvailable><tt:Width>2592</tt:Width><tt:Height>1520</tt:Height></tt:ResolutionsAvailable>",
+            "<tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable>",
+            "<tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>30</tt:Max></tt:FrameRateRange></tt:JPEG>",
+        ),
+        "<tt:JPEG><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>16384</tt:Max></tt:BitrateRange></tt:JPEG>",
+    );
+    const H264_OPTS: (&str, &str) = (
+        concat!(
+            "<tt:H264><tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable>",
+            "<tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>200</tt:Max></tt:GovLengthRange>",
+            "<tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>25</tt:Max></tt:FrameRateRange></tt:H264>",
+        ),
+        "<tt:H264><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>4096</tt:Max></tt:BitrateRange></tt:H264>",
+    );
+
+    /// Camera stub: [`MIXED_CONFIGS`] and the options of `codecs` in that
+    /// order, each answer after `delay`.
+    async fn camera(codecs: &[(&str, &str)], delay: Duration) -> OnvifTarget {
+        let blocks: String = codecs.iter().map(|c| c.0).collect();
+        let bitrates: String = codecs.iter().map(|c| c.1).collect();
+        let options = format!("{blocks}<tt:Extension>{bitrates}</tt:Extension>");
+        let h = move |body: String| async move {
+            tokio::time::sleep(delay).await;
+            let inner = if body.contains("GetVideoEncoderConfigurations") {
+                format!("<trt:GetVideoEncoderConfigurationsResponse>{MIXED_CONFIGS}</trt:GetVideoEncoderConfigurationsResponse>")
+            } else {
+                format!("<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options>{options}</trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>")
+            };
+            format!(
+                r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body>{inner}</s:Body></s:Envelope>"#
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, axum::Router::new().fallback(h)).await;
+        });
+        OnvifTarget {
+            endpoint: format!("http://{addr}/onvif/device_service"),
+            username: "admin".into(),
+            password: test_secret(),
+        }
+    }
+
+    /// A camera offering JPEG and H264 options in one answer: each write
+    /// is judged by its own configuration's codec, never another codec's
+    /// resolution, frame rate or bitrate, in either listing order.
+    #[tokio::test]
+    async fn write_check_judges_a_mixed_codec_camera_by_the_configurations_codec() {
+        for order in [[JPEG_OPTS, H264_OPTS], [H264_OPTS, JPEG_OPTS]] {
+            let t = camera(&order, Duration::ZERO).await;
+            let configs = onvif_encoder::get_video_encoder_configurations(
+                &t.endpoint,
+                &t.username,
+                &t.password,
+            )
+            .await
+            .unwrap();
+            let (sub, jpeg) = (configs[0].clone(), configs[1].clone());
+            for bad in [
+                VideoEncoderConfig {
+                    width: Some(2592),
+                    height: Some(1520),
+                    ..sub.clone()
+                },
+                VideoEncoderConfig {
+                    frame_rate_limit: Some(30),
+                    ..sub.clone()
+                },
+                VideoEncoderConfig {
+                    bitrate_limit: Some(8000),
+                    ..sub.clone()
+                },
+            ] {
+                let got = check_selected(&t, bad.clone())
+                    .await
+                    .map_err(|ApiError(s, _)| s);
+                assert_eq!(got, Err(StatusCode::BAD_REQUEST), "{bad:?}");
+            }
+            for ok in [
+                VideoEncoderConfig {
+                    frame_rate_limit: Some(25),
+                    bitrate_limit: Some(4096),
+                    ..sub.clone()
+                },
+                VideoEncoderConfig {
+                    width: Some(2592),
+                    height: Some(1520),
+                    frame_rate_limit: Some(30),
+                    bitrate_limit: Some(8000),
+                    ..jpeg.clone()
+                },
+            ] {
+                let got = check_selected(&t, ok.clone())
+                    .await
+                    .map_err(|ApiError(_, e)| e);
+                assert_eq!(got, Ok(ok.clone()), "a full config is written as sent");
+            }
+        }
+    }
+
+    /// The PUT's pre-write reads share one budget, 6 s in production so
+    /// the 5 s write after it stays inside edge-gateway's 15 s RPC window:
+    /// a camera slower than the budget fails with a 502 before any write.
+    #[tokio::test]
+    async fn preflight_past_its_budget_fails_before_the_write() {
+        assert_eq!(PUT_READ_BUDGET, Duration::from_secs(6));
+        assert!(
+            PUT_READ_BUDGET + crate::discovery::onvif_soap::REQ_TIMEOUT < Duration::from_secs(15)
+        );
+        // Two reads of 300 ms each: past a 450 ms budget, inside a 3 s one.
+        let t = camera(&[H264_OPTS], Duration::from_millis(300)).await;
+        let started = std::time::Instant::now();
+        let ApiError(status, e) = preflight(&t, cfg("VE_sub"), Duration::from_millis(450))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (status, e.as_str()),
+            (
+                StatusCode::BAD_GATEWAY,
+                "encoder read timed out; nothing written"
+            )
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let got = preflight(&t, cfg("VE_sub"), Duration::from_secs(3))
+            .await
+            .map(drop)
+            .map_err(|ApiError(_, e)| e);
+        assert_eq!(got, Ok(()));
+    }
+
+    /// An H265 configuration reporting every field the write carries.
+    const FULL_H265: &str = concat!(
+        r#"<trt:Configurations token="VE_sub"><tt:Name>sub</tt:Name><tt:UseCount>2</tt:UseCount><tt:Encoding>H265</tt:Encoding>"#,
+        r#"<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution><tt:Quality>4</tt:Quality>"#,
+        r#"<tt:RateControl><tt:FrameRateLimit>15</tt:FrameRateLimit><tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>2048</tt:BitrateLimit></tt:RateControl>"#,
+        r#"<tt:H265><tt:GovLength>30</tt:GovLength><tt:H265Profile>Main</tt:H265Profile></tt:H265></trt:Configurations>"#,
+    );
+
+    /// SPEC-090 D-6: a PUT carrying only the changed field writes the
+    /// camera's configuration with just that field changed, and the change
+    /// is still judged by that configuration's options.
+    #[tokio::test]
+    async fn a_partial_write_keeps_every_untouched_field() {
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let srv = MockServer::start().await;
+        for (action, inner) in [
+            (
+                "GetVideoEncoderConfigurations",
+                format!("<trt:GetVideoEncoderConfigurationsResponse>{FULL_H265}</trt:GetVideoEncoderConfigurationsResponse>"),
+            ),
+            (
+                "GetVideoEncoderConfigurationOptions",
+                "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options><tt:Extension><tt:H265><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>4096</tt:Max></tt:BitrateRange></tt:H265></tt:Extension></trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>".into(),
+            ),
+            (
+                "SetVideoEncoderConfiguration",
+                "<trt:SetVideoEncoderConfigurationResponse/>".into(),
+            ),
+        ] {
+            Mock::given(body_string_contains(action))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body>{inner}</s:Body></s:Envelope>"#
+                )))
+                .mount(&srv)
+                .await;
+        }
+        let t = OnvifTarget {
+            endpoint: format!("{}/onvif/device_service", srv.uri()),
+            username: "admin".into(),
+            password: test_secret(),
+        };
+        let partial = |bitrate| VideoEncoderConfig {
+            bitrate_limit: Some(bitrate),
+            ..cfg("VE_sub")
+        };
+        let got = preflight(&t, partial(8000), PUT_READ_BUDGET)
+            .await
+            .map_err(|ApiError(s, _)| s);
+        assert_eq!(got, Err(StatusCode::BAD_REQUEST));
+        let config = preflight(&t, partial(1536), PUT_READ_BUDGET).await.unwrap();
+        set_config(&t, &config, false).await.unwrap();
+        let sets: Vec<String> = srv
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("SetVideoEncoderConfiguration"))
+            .collect();
+        assert_eq!(sets.len(), 1, "only the valid write is sent: {sets:?}");
+        for field in [
+            r#"token="VE_sub""#,
+            "<tt:Name>sub</tt:Name>",
+            "<tt:UseCount>2</tt:UseCount>",
+            "<tt:Encoding>H265</tt:Encoding>",
+            "<tt:Width>1280</tt:Width><tt:Height>720</tt:Height>",
+            "<tt:Quality>4</tt:Quality>",
+            "<tt:FrameRateLimit>15</tt:FrameRateLimit>",
+            "<tt:EncodingInterval>1</tt:EncodingInterval>",
+            "<tt:BitrateLimit>1536</tt:BitrateLimit>",
+            "<tt:H265><tt:GovLength>30</tt:GovLength><tt:H265Profile>Main</tt:H265Profile></tt:H265>",
+        ] {
+            assert!(sets[0].contains(field), "{field} missing: {}", sets[0]);
+        }
+    }
+
+    /// A PUT changing `encoding_interval` is judged by the camera's
+    /// `EncodingIntervalRange`: out of range is a 400 with no write.
+    #[tokio::test]
+    async fn an_out_of_range_encoding_interval_is_refused_before_the_write() {
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let srv = MockServer::start().await;
+        for (action, inner) in [
+            (
+                "GetVideoEncoderConfigurations",
+                format!("<trt:GetVideoEncoderConfigurationsResponse>{FULL_H265}</trt:GetVideoEncoderConfigurationsResponse>"),
+            ),
+            (
+                "GetVideoEncoderConfigurationOptions",
+                "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options><tt:H265><tt:EncodingIntervalRange><tt:Min>1</tt:Min><tt:Max>3</tt:Max></tt:EncodingIntervalRange></tt:H265></trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>".into(),
+            ),
+            (
+                "SetVideoEncoderConfiguration",
+                "<trt:SetVideoEncoderConfigurationResponse/>".into(),
+            ),
+        ] {
+            Mock::given(body_string_contains(action))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body>{inner}</s:Body></s:Envelope>"#
+                )))
+                .mount(&srv)
+                .await;
+        }
+        let t = OnvifTarget {
+            endpoint: format!("{}/onvif/device_service", srv.uri()),
+            username: "admin".into(),
+            password: test_secret(),
+        };
+        let interval = |n| VideoEncoderConfig {
+            encoding_interval: Some(n),
+            ..cfg("VE_sub")
+        };
+        let got = preflight(&t, interval(9), PUT_READ_BUDGET)
+            .await
+            .map_err(|ApiError(s, _)| s);
+        assert_eq!(got, Err(StatusCode::BAD_REQUEST));
+        let config = preflight(&t, interval(2), PUT_READ_BUDGET).await.unwrap();
+        set_config(&t, &config, false).await.unwrap();
+        let sets: Vec<String> = srv
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("SetVideoEncoderConfiguration"))
+            .collect();
+        assert_eq!(sets.len(), 1, "only the in-range write is sent: {sets:?}");
+        assert!(sets[0].contains("<tt:EncodingInterval>2</tt:EncodingInterval>"));
+    }
+
+    /// A PUT that switches the encoding writes no GOP length or profile
+    /// left over from the old codec, judges the ones it sends by the new
+    /// codec's options, and an unchanged encoding, in any letter case,
+    /// keeps the camera's.
+    #[tokio::test]
+    async fn an_encoding_switch_drops_the_old_codecs_gop_length_and_profile() {
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let srv = MockServer::start().await;
+        for (action, inner) in [
+            (
+                "GetVideoEncoderConfigurations",
+                concat!(
+                    r#"<trt:GetVideoEncoderConfigurationsResponse><trt:Configurations token="VE_sub"><tt:Name>sub</tt:Name><tt:Encoding>H264</tt:Encoding>"#,
+                    r#"<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>"#,
+                    r#"<tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>"#,
+                    r#"</trt:Configurations></trt:GetVideoEncoderConfigurationsResponse>"#,
+                ),
+            ),
+            (
+                "GetVideoEncoderConfigurationOptions",
+                concat!(
+                    "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options>",
+                    "<tt:H264><tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>200</tt:Max></tt:GovLengthRange><tt:H264ProfilesSupported>High</tt:H264ProfilesSupported></tt:H264>",
+                    "<tt:H265><tt:GovLengthRange><tt:Min>1</tt:Min><tt:Max>20</tt:Max></tt:GovLengthRange><tt:H265ProfilesSupported>Main</tt:H265ProfilesSupported></tt:H265>",
+                    "<tt:JPEG><tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable></tt:JPEG>",
+                    "<tt:MPEG4><tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable></tt:MPEG4>",
+                    "</trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>",
+                ),
+            ),
+            (
+                "SetVideoEncoderConfiguration",
+                "<trt:SetVideoEncoderConfigurationResponse/>",
+            ),
+        ] {
+            Mock::given(body_string_contains(action))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body>{inner}</s:Body></s:Envelope>"#
+                )))
+                .mount(&srv)
+                .await;
+        }
+        let t = OnvifTarget {
+            endpoint: format!("{}/onvif/device_service", srv.uri()),
+            username: "admin".into(),
+            password: test_secret(),
+        };
+        /// The SetVideoEncoderConfiguration body the PUT sends, or its status.
+        async fn written(
+            t: &OnvifTarget,
+            srv: &MockServer,
+            req: VideoEncoderConfig,
+        ) -> Result<String, StatusCode> {
+            let config = preflight(t, req, PUT_READ_BUDGET)
+                .await
+                .map_err(|ApiError(s, _)| s)?;
+            set_config(t, &config, false).await.unwrap();
+            let reqs = srv.received_requests().await.unwrap();
+            let body = reqs.iter().rev().find_map(|r| {
+                let b = String::from_utf8_lossy(&r.body).into_owned();
+                b.contains("SetVideoEncoderConfiguration").then_some(b)
+            });
+            Ok(body.unwrap())
+        }
+        let put = |encoding: &str, gov_length, profile: Option<&str>| VideoEncoderConfig {
+            encoding: Some(encoding.into()),
+            gov_length,
+            profile: profile.map(str::to_string),
+            ..cfg("VE_sub")
+        };
+        for codec in ["JPEG", "MPEG4", "H265"] {
+            let body = written(&t, &srv, put(codec, None, None)).await.unwrap();
+            assert!(
+                body.contains(&format!("<tt:Encoding>{codec}</tt:Encoding>")),
+                "{body}"
+            );
+            assert!(!body.contains("GovLength"), "{codec}: {body}");
+            assert!(!body.contains("Profile>"), "{codec}: {body}");
+        }
+        let body = written(&t, &srv, put("H265", Some(15), Some("Main")))
+            .await
+            .unwrap();
+        assert!(body.contains("<tt:H265><tt:GovLength>15</tt:GovLength><tt:H265Profile>Main</tt:H265Profile></tt:H265>"), "{body}");
+        assert!(!body.contains("<tt:H264>"), "{body}");
+        // The old codec's values resent under H265 are judged by H265's options.
+        for bad in [
+            put("H265", Some(30), Some("Main")),
+            put("H265", Some(15), Some("High")),
+        ] {
+            let got = written(&t, &srv, bad.clone()).await.map(drop);
+            assert_eq!(got, Err(StatusCode::BAD_REQUEST), "{bad:?}");
+        }
+        let body = written(&t, &srv, put("H264", None, None)).await.unwrap();
+        assert!(body.contains("<tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>"), "{body}");
+        // An encoding matches in any letter case and is written upper-case.
+        let body = written(&t, &srv, put("h264", None, None)).await.unwrap();
+        assert!(body.contains("<tt:Encoding>H264</tt:Encoding>"), "{body}");
+        assert!(body.contains("<tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>"), "{body}");
+        let body = written(&t, &srv, put("h265", None, None)).await.unwrap();
+        assert!(body.contains("<tt:Encoding>H265</tt:Encoding>"), "{body}");
+        assert!(!body.contains("GovLength"), "{body}");
+        let body = written(&t, &srv, put("h265", Some(15), Some("Main")))
+            .await
+            .unwrap();
+        assert!(body.contains("<tt:Encoding>H265</tt:Encoding>"), "{body}");
+        assert!(body.contains("<tt:H265><tt:GovLength>15</tt:GovLength><tt:H265Profile>Main</tt:H265Profile></tt:H265>"), "{body}");
+    }
+
+    /// `VE_low` (512 kbps) and `VE_ok` (2048 kbps), both H264 1280x720 at
+    /// 15 fps, interval 1 and quality 4, on a camera offering H264 and H265
+    /// but no JPEG; H265's 1024 kbps bitrate floor sits between the two.
+    async fn switch_camera() -> (wiremock::MockServer, OnvifTarget) {
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let config = |token: &str, kbps: u32| {
+            format!(
+                r#"<trt:Configurations token="{token}"><tt:Name>{token}</tt:Name><tt:Encoding>H264</tt:Encoding><tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution><tt:Quality>4</tt:Quality><tt:RateControl><tt:FrameRateLimit>15</tt:FrameRateLimit><tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>{kbps}</tt:BitrateLimit></tt:RateControl><tt:H264><tt:GovLength>30</tt:GovLength></tt:H264></trt:Configurations>"#
+            )
+        };
+        let codec = |name: &str| {
+            format!(
+                "<tt:{name}><tt:ResolutionsAvailable><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:ResolutionsAvailable><tt:FrameRateRange><tt:Min>1</tt:Min><tt:Max>25</tt:Max></tt:FrameRateRange><tt:EncodingIntervalRange><tt:Min>1</tt:Min><tt:Max>3</tt:Max></tt:EncodingIntervalRange></tt:{name}>"
+            )
+        };
+        let srv = MockServer::start().await;
+        for (action, inner) in [
+            (
+                "GetVideoEncoderConfigurations",
+                format!(
+                    "<trt:GetVideoEncoderConfigurationsResponse>{}{}</trt:GetVideoEncoderConfigurationsResponse>",
+                    config("VE_low", 512),
+                    config("VE_ok", 2048)
+                ),
+            ),
+            (
+                "GetVideoEncoderConfigurationOptions",
+                format!(
+                    "<trt:GetVideoEncoderConfigurationOptionsResponse><trt:Options><tt:QualityRange><tt:Min>1</tt:Min><tt:Max>6</tt:Max></tt:QualityRange>{}{}<tt:Extension><tt:H264><tt:BitrateRange><tt:Min>32</tt:Min><tt:Max>4096</tt:Max></tt:BitrateRange></tt:H264><tt:H265><tt:BitrateRange><tt:Min>1024</tt:Min><tt:Max>8192</tt:Max></tt:BitrateRange></tt:H265></tt:Extension></trt:Options></trt:GetVideoEncoderConfigurationOptionsResponse>",
+                    codec("H264"),
+                    codec("H265")
+                ),
+            ),
+            (
+                "SetVideoEncoderConfiguration",
+                "<trt:SetVideoEncoderConfigurationResponse/>".into(),
+            ),
+        ] {
+            Mock::given(body_string_contains(action))
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema" xmlns:trt="http://www.onvif.org/ver10/media/wsdl"><s:Body>{inner}</s:Body></s:Envelope>"#
+                )))
+                .mount(&srv)
+                .await;
+        }
+        let t = OnvifTarget {
+            endpoint: format!("{}/onvif/device_service", srv.uri()),
+            username: "admin".into(),
+            password: test_secret(),
+        };
+        (srv, t)
+    }
+
+    /// [`encoder_put`]'s preflight, then its write only when that passed.
+    async fn put(t: &OnvifTarget, req: VideoEncoderConfig) -> Result<(), StatusCode> {
+        let config = preflight(t, req, PUT_READ_BUDGET)
+            .await
+            .map_err(|ApiError(s, _)| s)?;
+        set_config(t, &config, false).await.unwrap();
+        Ok(())
+    }
+
+    /// The SetVideoEncoderConfiguration bodies `srv` received.
+    async fn sets(srv: &wiremock::MockServer) -> Vec<String> {
+        srv.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+            .filter(|b| b.contains("SetVideoEncoderConfiguration"))
+            .collect()
+    }
+
+    /// A PUT switching H264 to H265 writes the camera's other values
+    /// unchanged, so each must fit H265's options: a bitrate under H265's
+    /// floor is a 400 with no write; a set that fits is written as is.
+    #[tokio::test]
+    async fn a_codec_switch_judges_the_inherited_values_by_the_new_codec() {
+        let (srv, t) = switch_camera().await;
+        let h265 = |token: &str| VideoEncoderConfig {
+            encoding: Some("H265".into()),
+            ..cfg(token)
+        };
+        assert_eq!(put(&t, h265("VE_low")).await, Err(StatusCode::BAD_REQUEST));
+        assert_eq!(put(&t, h265("VE_ok")).await, Ok(()));
+        let sets = sets(&srv).await;
+        assert_eq!(sets.len(), 1, "only the valid switch is written: {sets:?}");
+        for field in [
+            r#"token="VE_ok""#,
+            "<tt:Encoding>H265</tt:Encoding>",
+            "<tt:Width>1280</tt:Width><tt:Height>720</tt:Height>",
+            "<tt:Quality>4</tt:Quality>",
+            "<tt:FrameRateLimit>15</tt:FrameRateLimit><tt:EncodingInterval>1</tt:EncodingInterval><tt:BitrateLimit>2048</tt:BitrateLimit>",
+        ] {
+            assert!(sets[0].contains(field), "{field} missing: {}", sets[0]);
+        }
+    }
+
+    /// An encoding the configuration does not offer, unknown (AV1) or a
+    /// known codec without an option block (JPEG), is a 400 with no write.
+    #[tokio::test]
+    async fn an_encoding_the_configuration_does_not_offer_is_refused_before_the_write() {
+        let (srv, t) = switch_camera().await;
+        for codec in ["AV1", "JPEG"] {
+            let req = VideoEncoderConfig {
+                encoding: Some(codec.into()),
+                ..cfg("VE_ok")
+            };
+            assert_eq!(put(&t, req).await, Err(StatusCode::BAD_REQUEST), "{codec}");
+        }
+        assert_eq!(sets(&srv).await, Vec::<String>::new());
+    }
 }

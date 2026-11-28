@@ -17,6 +17,7 @@ pub mod fleet;
 pub mod metrics;
 pub mod motion;
 pub mod outbox;
+pub mod recording_delivery;
 pub mod sessions;
 pub mod sinks;
 pub mod speakers;
@@ -33,6 +34,11 @@ pub use motion::{
     NewClip, NewMotionEvent, PerCameraClipStats, StorageBackendRow,
 };
 pub use outbox::{OutboxRow, OutboxSinkCounts, OutboxStatus, SuppressionReason};
+pub use recording_delivery::{
+    CameraDelivery, DeliveryCounters, DeliveryQueue, DeliveryWindow, InFlight, PartitionTotals,
+    QueuePartition, RecordingDeliverySnapshot, RecordingSource, SourceCounters, TransferGuard,
+    ALERT_COLD_RETRY_SECS,
+};
 pub use sessions::{NewRefreshToken, RefreshToken, RefreshTokenId, SessionsError};
 pub use speakers::SpeakerOutput;
 pub use talkdown::{
@@ -228,6 +234,10 @@ const MIGRATIONS: &[(&str, &str)] = &[
         "0040_talkdown_library",
         include_str!("../migrations/0040_talkdown_library.sql"),
     ),
+    (
+        "0041_recording_delivery",
+        include_str!("../migrations/0041_recording_delivery.sql"),
+    ),
 ];
 
 #[derive(Debug, Error)]
@@ -263,6 +273,8 @@ pub trait EventStore: Send + Sync {
 #[derive(Clone)]
 pub struct Store {
     pool: SqlitePool,
+    /// SPEC-090 accounting state that lives only in this process.
+    delivery: Arc<recording_delivery::DeliveryState>,
 }
 
 impl Store {
@@ -294,7 +306,10 @@ impl Store {
             pool
         };
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            delivery: Arc::default(),
+        })
     }
 
     async fn build_pool(opts: SqliteConnectOptions) -> Result<SqlitePool, StoreError> {
@@ -593,7 +608,8 @@ impl Store {
     }
 
     pub async fn delete_camera(&self, id: CameraId) -> Result<(), StoreError> {
-        let mut tx = self.pool.begin().await?;
+        // IMMEDIATE: the SPEC-090 loss count reads before the first write.
+        let mut tx = self.begin_tx().await?;
         self.delete_camera_tx(&mut tx, id).await?;
         tx.commit().await?;
         Ok(())
@@ -606,6 +622,8 @@ impl Store {
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         id: CameraId,
     ) -> Result<(), StoreError> {
+        // SPEC-090 — the cascade below drops the camera's upload queue.
+        self.record_camera_loss(tx, id).await?;
         sqlx::query("DELETE FROM cameras WHERE id = ?")
             .bind(id)
             .execute(&mut **tx)

@@ -142,14 +142,14 @@ pub async fn query_streams(
     match get_profiles(&client, url, username, password, MediaVer::V2).await {
         Ok(profiles) if !profiles.is_empty() => {
             debug!(
-                xaddr = %url, ver = "Media2", count = profiles.len(),
+                xaddr = %log_endpoint(url), ver = "Media2", count = profiles.len(),
                 "onvif media: GetProfiles ok"
             );
             collect_stream_uris(&client, url, username, password, MediaVer::V2, &profiles).await
         }
         Ok(_) => {
             debug!(
-                xaddr = %url, ver = "Media2",
+                xaddr = %log_endpoint(url), ver = "Media2",
                 "onvif media: Media2 returned zero profiles, falling back to Media1"
             );
             let profiles = get_profiles(&client, url, username, password, MediaVer::V1).await?;
@@ -157,7 +157,7 @@ pub async fn query_streams(
         }
         Err(err) if err.contains("ActionNotSupported") || err.contains("OperationProhibited") => {
             debug!(
-                xaddr = %url, ver = "Media2", %err,
+                xaddr = %log_endpoint(url), ver = "Media2", err = %log_text(&err),
                 "onvif media: Media2 unsupported, falling back to Media1"
             );
             let profiles = get_profiles(&client, url, username, password, MediaVer::V1).await?;
@@ -283,6 +283,82 @@ struct ProfileSummary {
     /// `@token` of the profile's video-source configuration (the
     /// OSD `ConfigurationToken`).
     video_source_config_token: Option<String>,
+    /// `@token` of the profile's video-encoder configuration (the
+    /// token `GetVideoEncoderConfigurations` lists).
+    video_encoder_config_token: Option<String>,
+}
+
+/// One Media1 profile's encoder binding: the video-encoder
+/// configuration it streams and its `GetStreamUri` answer (`None`
+/// when that call failed or carried no URI). Edge-internal: the URI
+/// may embed credentials (R5b), so it is neither serialised nor logged.
+pub struct ProfileStream {
+    pub profile_token: String,
+    pub encoder_token: Option<String>,
+    pub uri: Option<String>,
+}
+
+/// Media1 `GetProfiles` plus one RTP-Unicast/RTSP `GetStreamUri` per
+/// profile, keeping each profile's video-encoder configuration token.
+/// Media1 only: its tokens are the ones the encoder routes read and
+/// write. A failed `GetStreamUri` leaves that profile's `uri` `None`
+/// instead of dropping the profile, so the caller can tell
+/// "unresolved" from "no match".
+pub async fn query_profile_streams(
+    xaddr: &str,
+    username: &str,
+    password: &str,
+) -> Result<Vec<ProfileStream>, String> {
+    let url = xaddr
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "empty xaddr".to_string())?;
+    let client = build_client()?;
+    let profiles = get_profiles(&client, url, username, password, MediaVer::V1).await?;
+    let mut out = Vec::with_capacity(profiles.len());
+    // Serial, like `collect_stream_uris`: cheap firmware 503s parallel SOAP.
+    for p in profiles {
+        let body = build_get_stream_uri_envelope(username, password, MediaVer::V1, &p.token);
+        let uri = post_soap(&client, url, &MediaVer::V1.action("GetStreamUri"), &body)
+            .await
+            .ok()
+            .and_then(|text| parse_stream_uri_response(&text));
+        out.push(ProfileStream {
+            profile_token: p.token,
+            encoder_token: p.video_encoder_config_token,
+            uri,
+        });
+    }
+    Ok(out)
+}
+
+/// Endpoint for logs: userinfo and query dropped (R5b). Unparseable input is
+/// not echoed.
+fn log_endpoint(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut u) => {
+            let _ = u.set_username("");
+            let _ = u.set_password(None);
+            u.set_query(None);
+            u.to_string()
+        }
+        Err(_) => "[unparseable endpoint]".to_string(),
+    }
+}
+
+/// Camera/transport error text for logs: words holding a URL or userinfo
+/// (a fault or reqwest error can echo a credential-bearing URI) are dropped.
+fn log_text(e: &str) -> String {
+    e.split_whitespace()
+        .map(|w| {
+            if w.contains("://") || w.contains('@') {
+                "[redacted]"
+            } else {
+                w
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn get_profiles(
@@ -294,11 +370,11 @@ async fn get_profiles(
 ) -> Result<Vec<ProfileSummary>, String> {
     let body = build_get_profiles_envelope(username, password, ver);
     let text = post_soap(client, url, &ver.action("GetProfiles"), &body).await?;
-    trace!(xaddr = %url, ver = ?ver, body = %text, "onvif media: GetProfiles raw response");
+    trace!(xaddr = %log_endpoint(url), ver = ?ver, "onvif media: GetProfiles raw response");
     let profiles = parse_profiles_response(&text)?;
     for p in &profiles {
         debug!(
-            xaddr = %url, ver = ?ver, profile_token = %p.token, name = %p.name,
+            xaddr = %log_endpoint(url), ver = ?ver, profile_token = %p.token, name = %p.name,
             codec = ?p.codec, resolution = ?p.resolution,
             "onvif media: parsed profile",
         );
@@ -327,7 +403,7 @@ async fn collect_stream_uris(
                 // One profile failing shouldn't abort the whole
                 // probe — surface the partial list so the
                 // operator can still pick an answering stream.
-                debug!(profile = %p.token, error = %e, "onvif media: GetStreamUri failed for profile");
+                debug!(profile = %p.token, error = %log_text(&e), "onvif media: GetStreamUri failed for profile");
                 continue;
             }
         };
@@ -451,6 +527,7 @@ fn parse_profiles_response(body: &str) -> Result<Vec<ProfileSummary>, String> {
                         resolution: None,
                         video_source_token: None,
                         video_source_config_token: None,
+                        video_encoder_config_token: None,
                     });
                     vec_seen_for_profile = false;
                 }
@@ -471,6 +548,21 @@ fn parse_profiles_response(body: &str) -> Result<Vec<ProfileSummary>, String> {
                                 }
                             }
                         }
+                    }
+                }
+                // Same for the (first) video-encoder configuration:
+                // Media1 `<tt:VideoEncoderConfiguration>`, Media2
+                // `<tr2:VideoEncoder>`.
+                if (name == "VideoEncoderConfiguration" || name == "VideoEncoder")
+                    && !vec_seen_for_profile
+                {
+                    if let Some(prof) = current.as_mut() {
+                        prof.video_encoder_config_token = e
+                            .attributes()
+                            .flatten()
+                            .find(|a| local_name(&a.key) == "token")
+                            .map(|a| a.unescape_value().unwrap_or_default().to_string())
+                            .filter(|v| !v.is_empty());
                     }
                 }
                 stack.push(name);
@@ -618,11 +710,11 @@ pub async fn query_audio_outputs(
     let body = build_get_audio_outputs_envelope(username, password);
     match post_soap(&client, url, &MediaVer::V1.action("GetAudioOutputs"), &body).await {
         Ok(text) => {
-            trace!(xaddr = %url, body = %text, "onvif media: GetAudioOutputs raw response");
+            trace!(xaddr = %log_endpoint(url), body = %text, "onvif media: GetAudioOutputs raw response");
             parse_audio_outputs_response(&text)
         }
         Err(e) if e.contains("ActionNotSupported") || e.contains("OperationProhibited") => {
-            debug!(xaddr = %url, "onvif media: GetAudioOutputs unsupported → no speaker");
+            debug!(xaddr = %log_endpoint(url), "onvif media: GetAudioOutputs unsupported → no speaker");
             Ok(Vec::new())
         }
         Err(e) => Err(e),
@@ -910,6 +1002,10 @@ fn parse_output_level_range(body: &str) -> Result<(i32, i32), String> {
 
 #[cfg(test)]
 mod tests {
+    /// Random per-call credential: no literal reaches a password sink.
+    fn test_secret() -> String {
+        uuid::Uuid::now_v7().to_string()
+    }
     use super::*;
 
     #[test]
@@ -968,6 +1064,15 @@ mod tests {
         );
         assert_eq!(profiles[1].token, "Profile_2");
         assert_eq!(profiles[1].resolution.as_deref(), Some("640x480"));
+        // SPEC-090: each profile names the encoder configuration it streams.
+        assert_eq!(
+            profiles[0].video_encoder_config_token.as_deref(),
+            Some("VideoEncoder_1")
+        );
+        assert_eq!(
+            profiles[1].video_encoder_config_token.as_deref(),
+            Some("VideoEncoder_2")
+        );
     }
 
     #[test]
@@ -1250,5 +1355,83 @@ mod tests {
         assert_eq!(cfg(10, 90).level_for(70), 66);
         assert_eq!(cfg(0, 7).level_for(50), 4, "rounded");
         assert_eq!(cfg(0, 100).level_for(250), 100, "clamped");
+    }
+
+    /// Captures every tracing event (all levels) as `field=value` text.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<String>>);
+    struct Rec<'a>(&'a mut String);
+    impl tracing::field::Visit for Rec<'_> {
+        fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, "{}={:?} ", f.name(), v);
+        }
+    }
+    impl tracing::Subscriber for Capture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, e: &tracing::Event<'_>) {
+            let mut g = self.0.lock().unwrap();
+            e.record(&mut Rec(&mut g));
+            g.push('\n');
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    // SPEC-090: the encoder binding read must not log userinfo or a stream URI.
+    #[tokio::test]
+    async fn binding_read_logs_no_credentials_or_stream_uri() {
+        use wiremock::matchers::body_string_contains;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let srv = MockServer::start().await;
+        let (user, secret) = (test_secret(), test_secret());
+        let profiles = r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema"><e:Body><trt:GetProfilesResponse><trt:Profiles token="P1"><tt:Name>main</tt:Name><tt:VideoEncoderConfiguration token="E1"><tt:Encoding>H264</tt:Encoding></tt:VideoEncoderConfiguration></trt:Profiles></trt:GetProfilesResponse></e:Body></e:Envelope>"#;
+        let uri = format!(
+            r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:tt="http://www.onvif.org/ver10/schema"><e:Body><GetStreamUriResponse><MediaUri><tt:Uri>rtsp://{user}:{secret}@cam/stream1</tt:Uri></MediaUri></GetStreamUriResponse></e:Body></e:Envelope>"#
+        );
+        let fault = format!(
+            r#"<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope"><e:Body><e:Fault><e:Code><e:Value>e:Receiver</e:Value><e:Subcode><e:Value>ter:ActionNotSupported</e:Value></e:Subcode></e:Code><e:Reason><e:Text>ActionNotSupported rtsp://{user}:{secret}@cam/x</e:Text></e:Reason></e:Fault></e:Body></e:Envelope>"#
+        );
+        Mock::given(body_string_contains("tr2:GetProfiles"))
+            .respond_with(ResponseTemplate::new(500).set_body_string(fault.clone()))
+            .mount(&srv)
+            .await;
+        Mock::given(body_string_contains("trt:GetProfiles"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(profiles))
+            .mount(&srv)
+            .await;
+        Mock::given(body_string_contains("GetStreamUri"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(uri.clone()))
+            .mount(&srv)
+            .await;
+        let endpoint = format!(
+            "http://{user}:{secret}@{}/onvif/device_service?k=v",
+            srv.address()
+        );
+        let cap = Capture::default();
+        let _g = tracing::subscriber::set_default(cap.clone());
+        let bound = query_profile_streams(&endpoint, &test_secret(), &test_secret())
+            .await
+            .unwrap();
+        assert_eq!(
+            bound[0].uri.as_deref(),
+            Some(format!("rtsp://{user}:{secret}@cam/stream1").as_str())
+        );
+        query_streams(&endpoint, &test_secret(), &test_secret())
+            .await
+            .unwrap();
+        let logs = cap.0.lock().unwrap().clone();
+        assert!(logs.contains("GetProfiles"), "capture saw nothing: {logs}");
+        let user_info = format!("{user}:");
+        for bad in [secret.as_str(), user_info.as_str(), "rtsp://", "k=v"] {
+            assert!(!logs.contains(bad), "{bad} leaked into logs:\n{logs}");
+        }
     }
 }

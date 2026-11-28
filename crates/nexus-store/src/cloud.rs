@@ -69,6 +69,17 @@ pub struct CloudEnrollment {
     pub ssh_ca_public_key: Option<String>,
 }
 
+impl CloudEnrollment {
+    /// Phase 2 · Step 2.9 — the earliest `started_at` this enrollment
+    /// sends to the cloud: the `--keep-history` cutoff, else
+    /// `enrolled_at`. The uploaders, re-announces and the SPEC-090
+    /// delivery accounting all use this one rule.
+    #[must_use]
+    pub fn upload_floor(&self) -> DateTime<Utc> {
+        self.attach_replay_after.unwrap_or(self.enrolled_at)
+    }
+}
+
 impl Store {
     /// Persist (or overwrite) the cloud enrollment row.
     ///
