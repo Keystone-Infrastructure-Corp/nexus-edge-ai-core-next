@@ -12,15 +12,21 @@
 //! constants. It was captured before the attribute key type changed, so a
 //! change to that type that alters one byte fails here.
 //!
+//! Separate fixtures hold the same scene under SPEC-077's `parking_policy_v2`
+//! at 30 fps (the moving `vehicle_speed` truck is never static) and at 2 fps
+//! (the car dwells, is hidden, then leaves and loses its anchor).
+//!
 //! `NEXUS_BLESS_GOLDEN=1 cargo test -p nexus-tracker --test attributes_golden`
-//! rewrites the fixture. Only do that for a change that is meant to alter the
+//! rewrites the fixtures. Only do that for a change that is meant to alter the
 //! output, and say so in the commit.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
-use nexus_config::{AnnotatorConfig, ByteTrackConfig, StaticObjectConfig, ZoneConfig, ZoneKind};
+use nexus_config::{
+    AnnotatorConfig, ByteTrackConfig, ParkingPolicyV2, StaticObjectConfig, ZoneConfig, ZoneKind,
+};
 use nexus_tracker::{
     is_object_static, ByteTrackTracker, MotionEventEmitter, StaticObjectFilter, TrackAnnotator,
     Tracker,
@@ -36,18 +42,28 @@ const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/attributes_golden.txt"
 );
+const V2_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/attributes_golden_parking_v2.txt"
+);
+const V2_2FPS_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/attributes_golden_parking_v2_2fps.txt"
+);
+/// The legacy scene's frame interval: 30 fps.
+const MS_30FPS: u64 = 33;
 
 static MONO0: std::sync::LazyLock<std::time::Instant> =
     std::sync::LazyLock::new(std::time::Instant::now);
 
-fn frame(i: u64) -> Frame {
+fn frame(i: u64, interval_ms: u64) -> Frame {
     Frame {
         camera_id: 1,
         frame_id: i,
         captured_at: Utc
-            .timestamp_millis_opt(1_700_000_000_000 + i as i64 * 33)
+            .timestamp_millis_opt(1_700_000_000_000 + (i * interval_ms) as i64)
             .unwrap(),
-        captured_mono: *MONO0 + std::time::Duration::from_millis(i * 33),
+        captured_mono: *MONO0 + std::time::Duration::from_millis(i * interval_ms),
         width: W,
         height: H,
         format: PixelFormat::Rgb24,
@@ -125,9 +141,39 @@ fn zones() -> Vec<ZoneConfig> {
     ]
 }
 
-/// One `FrameMetadata` per frame, and the motion emitter's decisions, as the
-/// supervisor would publish and store them.
+/// SPEC-077 plan test values, not customer defaults.
+fn parking_policy() -> ParkingPolicyV2 {
+    ParkingPolicyV2 {
+        dwell_secs: 5.0,
+        max_speed_box_diagonals_per_sec: 0.05,
+        max_displacement_box_diagonals: 0.10,
+        max_observation_gap_secs: 3.0,
+    }
+}
+
+/// The legacy scene's zones plus a parking zone over the lower lot, where
+/// the car parks and the truck drives.
+fn parking_zones() -> Vec<ZoneConfig> {
+    let mut zones = zones();
+    zones.push(ZoneConfig {
+        id: "stalls".into(),
+        name: "Stalls".into(),
+        polygon: vec![(0.0, 0.6), (1.0, 0.6), (1.0, 1.0), (0.0, 1.0)],
+        kind: ZoneKind::Parking,
+        min_bbox_area_px_override: None,
+    });
+    zones
+}
+
+/// The legacy scene at 30 fps.
 fn scene() -> (Vec<FrameMetadata>, Vec<String>) {
+    scene_at(MS_30FPS, false)
+}
+
+/// One `FrameMetadata` per frame, and the motion emitter's decisions, as the
+/// supervisor would publish and store them, with frames `interval_ms`
+/// apart, under `parking_policy_v2` if `v2`.
+fn scene_at(interval_ms: u64, v2: bool) -> (Vec<FrameMetadata>, Vec<String>) {
     let tracker = ByteTrackTracker::new(ByteTrackConfig {
         max_lost_frames: 3,
         ..Default::default()
@@ -145,12 +191,15 @@ fn scene() -> (Vec<FrameMetadata>, Vec<String>) {
         1,
         None,
     );
+    let zones = if v2 { parking_zones() } else { zones() };
+    if v2 {
+        sf = sf.with_parking_policy(&parking_policy(), &zones).unwrap();
+    }
     let mut emitter = MotionEventEmitter::new(1.0);
-    let zones = zones();
     let mut metas = Vec::new();
     let mut motion = Vec::new();
     for i in 0..FRAMES {
-        let f = frame(i);
+        let f = frame(i, interval_ms);
         let mut tracked = tracker.update(detections(i), f.captured_mono);
         let anchors = sf.anchors().to_vec();
         annotator.annotate(&f, &zones, &anchors, &mut tracked);
@@ -239,12 +288,54 @@ fn the_scene_stamps_every_attribute_key() {
 #[test]
 fn serialized_attributes_match_the_golden_bytes() {
     let (metas, motion) = scene();
-    let got = render(&metas, &motion);
-    if std::env::var_os("NEXUS_BLESS_GOLDEN").is_some() {
-        std::fs::create_dir_all(std::path::Path::new(FIXTURE).parent().unwrap()).unwrap();
-        std::fs::write(FIXTURE, &got).unwrap();
+    assert_golden(FIXTURE, &render(&metas, &motion));
+}
+
+/// SPEC-077: the same 30 fps scene under `parking_policy_v2`. Nothing has
+/// dwelled 5 observed seconds, so nothing is static, the moving
+/// `vehicle_speed` truck included.
+#[test]
+fn parking_policy_v2_attributes_match_their_golden_bytes() {
+    let (metas, motion) = scene_at(MS_30FPS, true);
+    assert_golden(V2_FIXTURE, &render(&metas, &motion));
+}
+
+/// SPEC-077: the scene's frames 500 ms apart under `parking_policy_v2`: the
+/// car is static once it has dwelled 5 s and loses its anchor leaving; the
+/// truck, 0.11 box diagonals a second, never is.
+#[test]
+fn parking_policy_v2_at_2_fps_matches_its_golden_bytes() {
+    let (metas, motion) = scene_at(500, true);
+    assert_golden(V2_2FPS_FIXTURE, &render(&metas, &motion));
+}
+
+#[test]
+fn under_parking_policy_v2_the_vehicle_speed_truck_is_never_static() {
+    for (interval_ms, speed) in [(MS_30FPS, Some("vehicle_speed")), (500, None)] {
+        let (metas, _) = scene_at(interval_ms, true);
+        let trucks: Vec<&TrackedObject> = metas
+            .iter()
+            .flat_map(|m| m.objects.iter())
+            .filter(|o| o.label == "vehicle.truck")
+            .collect();
+        assert!(trucks.iter().all(|o| !is_object_static(o)));
+        if let Some(speed) = speed {
+            assert!(trucks
+                .iter()
+                .any(|o| o.attributes.get("motion.speed_class") == Some(&json!(speed))));
+        }
+        let cars = metas.iter().flat_map(|m| m.objects.iter());
+        let hidden = cars.filter(|o| o.label == "vehicle.car" && is_object_static(o));
+        assert_eq!(hidden.count() > 0, interval_ms == 500, "{interval_ms} ms");
     }
-    let want = std::fs::read_to_string(FIXTURE).expect("fixture");
+}
+
+fn assert_golden(fixture: &str, got: &str) {
+    if std::env::var_os("NEXUS_BLESS_GOLDEN").is_some() {
+        std::fs::create_dir_all(std::path::Path::new(fixture).parent().unwrap()).unwrap();
+        std::fs::write(fixture, got).unwrap();
+    }
+    let want = std::fs::read_to_string(fixture).expect("fixture");
     for (n, (g, w)) in got.lines().zip(want.lines()).enumerate() {
         assert_eq!(g, w, "line {} differs from the golden bytes", n + 1);
     }

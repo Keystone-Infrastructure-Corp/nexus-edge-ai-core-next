@@ -10,6 +10,12 @@
 // acceptance epoch. A request begun earlier cannot decide, however late it
 // finishes. The UI never computes a revision and a successful PUT is never
 // an applied signal.
+//
+// SPEC-077 — an engine with parking adds the parking-lot mode and v2 policy
+// to the snapshot, with `parking_revision` over them and the zones, and a
+// `parking_runtime` receipt of the same shape. While it does, Applied also
+// needs that receipt to apply the shown parking revision under the same
+// rules: a zone success never certifies parking settings.
 
 import { z } from "zod";
 
@@ -26,23 +32,45 @@ const zoneSchema = z
     id: z.string(),
     name: z.string(),
     polygon: z.array(z.tuple([z.number(), z.number()])),
-    kind: z.enum(["inclusion", "exclusion", "dwell"]),
+    kind: z.enum(["inclusion", "exclusion", "dwell", "parking"]),
   })
   .passthrough();
 
-const snapshotSchema = z.object({
-  schema_version: z.literal(1),
-  camera_id: z.number().int(),
-  settings: z.object({ zones: z.array(zoneSchema) }),
-  zones_revision: revision,
+const positive = z.number().positive();
+const parkingSchema = z.object({
+  parking_lot_mode: z.boolean(),
+  parking_policy_v2: z
+    .object({
+      dwell_secs: positive,
+      max_speed_box_diagonals_per_sec: positive,
+      max_displacement_box_diagonals: positive,
+      max_observation_gap_secs: positive,
+    })
+    .strict()
+    .nullable(),
 });
+
+// `parking` and `parking_revision` come together or not at all (an engine
+// without parking).
+const snapshotSchema = z
+  .object({
+    schema_version: z.literal(1),
+    camera_id: z.number().int(),
+    settings: z.object({ zones: z.array(zoneSchema), parking: parkingSchema.optional() }),
+    zones_revision: revision,
+    parking_revision: revision.optional(),
+  })
+  .refine((s) => (s.settings.parking === undefined) === (s.parking_revision === undefined));
 
 /** Keeps only the allowlisted keys; a body that does not parse throws (a contract error). */
 export function parseConfigSnapshot(raw: unknown): CameraConfigSnapshot {
   return snapshotSchema.parse(raw);
 }
 
-/** The engine sends all eight keys, nulls explicit; anything else is a contract error. */
+/**
+ * The engine sends all eight keys, nulls explicit; anything else is a
+ * contract error. `parking_runtime` has the same shape.
+ */
 const zonesRuntimeSchema = z
   .object({
     schema_version: z.literal(1),
@@ -66,7 +94,7 @@ const zonesRuntimeSchema = z
         : r.error_code === null,
   );
 
-/** The engine could not read the saved zones: every key but the state null. */
+/** The engine could not read the saved settings: every key but the state null. */
 const readErrorSchema = z.object({
   schema_version: z.literal(1),
   desired_revision: z.null(),
@@ -101,7 +129,7 @@ export const zoneSaveSeq = (cameraId: number) => zoneSaveSeqs.get(cameraId) ?? 0
 export type Tagged<T> = { seq: number; body: T };
 
 /** The part of a camera-stats read this module looks at. */
-export type StatsBody = { camera_id: number; zones_runtime?: unknown };
+export type StatsBody = { camera_id: number; zones_runtime?: unknown; parking_runtime?: unknown };
 
 /** A stats query's state: a `useQuery` result or `query.state`. */
 export type ReceiptRead = {
@@ -122,6 +150,8 @@ export type SavedSnapshot = { snapshot: CameraConfigSnapshot | null; error: unkn
 export type ZoneDraftState = {
   phase: "clean" | "dirty" | "saving" | "saved";
   base: string | null;
+  /** The snapshot's `parking_revision` a dirty edit began from, where it has one. */
+  parkingBase?: string | null;
   /**
    * A save went through and its snapshot is not installed yet, as `saved`
    * says; a dirty edit (a sketch holds the snapshot) can be over one too.
@@ -132,9 +162,13 @@ export type ZoneDraftState = {
 /**
  * `seq` is the later of the latest save start/end and the snapshot
  * installation; `generation` the newest supervisor generation read in
- * this editor, below which a receipt is stale.
+ * this editor, below which a receipt is stale; `parkingGeneration` the
+ * same for the parking receipt, whose generations are its own.
  */
-export type AcceptanceEpoch = { seq: number; generation: number };
+export type AcceptanceEpoch = { seq: number; generation: number; parkingGeneration?: number };
+
+/** What a receipt answers for. */
+type Subject = "zones" | "parking settings";
 
 type Shown = { title: string; detail: string; readAt: number | null };
 export type ZoneApplication =
@@ -145,9 +179,9 @@ export type ZoneApplication =
         | "inactive"
         | "applying"
         | "failed"
-        | "disconnected"
-        | "changed_elsewhere";
+        | "disconnected";
     })
+  | (Shown & { kind: "changed_elsewhere"; what: Subject })
   | (Shown & { kind: "applied"; appliedAt: string | null })
   /** `receipt` is what the engine reports for the saved zones behind the edit. */
   | (Shown & { kind: "unsaved"; receipt: ZoneApplication });
@@ -155,15 +189,24 @@ export type ZoneApplication =
 export const isDenied = (error: unknown) =>
   error instanceof ApiError && (error.status === 401 || error.status === 403);
 
-/** The engine refused a save: its stored zones were no longer the revision the save expected. Nothing was written. */
-export const isZonesRevisionConflict = (error: unknown) =>
-  error instanceof ApiError &&
-  error.status === 409 &&
-  (error.body as { error?: unknown } | undefined)?.error === "zones_revision_conflict";
+/**
+ * What the engine refused a save over: its stored zones, or (SPEC-077) its
+ * parking settings, were no longer the revision the save expected. Nothing
+ * was written. Undefined for any other error.
+ */
+export function revisionConflict(error: unknown): Subject | undefined {
+  if (!(error instanceof ApiError) || error.status !== 409) return undefined;
+  const code = (error.body as { error?: unknown } | undefined)?.error;
+  if (code === "zones_revision_conflict") return "zones";
+  if (code === "parking_revision_conflict") return "parking settings";
+  return undefined;
+}
 
-/** The supervisor generation a stats read reports, when its receipt parses. */
-export const receiptGeneration = (body: StatsBody | undefined) =>
-  zonesRuntimeSchema.safeParse(body?.zones_runtime).data?.generation;
+/** The supervisor generation a stats read's receipt reports, when it parses. */
+export const receiptGeneration = (
+  body: StatsBody | undefined,
+  receipt: "zones_runtime" | "parking_runtime" = "zones_runtime",
+) => zonesRuntimeSchema.safeParse(body?.[receipt]).data?.generation;
 
 /**
  * Unresolved application is read every 2 s for 30 s after a save, then
@@ -196,19 +239,24 @@ export function deriveZoneApplication(
   // as an edit to save or a save in flight, which the denial dropped.
   if (isDenied(saved.error) || isDenied(read.error)) return receipt;
   if (draft.phase === "dirty") {
-    const elsewhere =
-      receipt.kind === "changed_elsewhere" ||
-      (draft.base !== null &&
-        saved.snapshot !== null &&
-        draft.base !== saved.snapshot.zones_revision);
+    const s = saved.snapshot;
+    const moved = (base: string | null | undefined, now: string | undefined) =>
+      base != null && now !== undefined && base !== now;
+    const elsewhere: Subject | null =
+      s && moved(draft.base, s.zones_revision)
+        ? "zones"
+        : s && moved(draft.parkingBase, s.parking_revision)
+          ? "parking settings"
+          : receipt.kind === "changed_elsewhere"
+            ? receipt.what
+            : null;
     return elsewhere
       ? {
           kind: "unsaved",
           receipt,
           readAt: receipt.readAt,
-          title: "Unsaved changes; zones changed elsewhere",
-          detail:
-            "Someone saved different zones on this camera since you started editing. Saving replaces them with the zones shown here.",
+          title: `Unsaved changes; ${elsewhere} changed elsewhere`,
+          detail: `Someone saved different ${elsewhere} on this camera since you started editing. Saving replaces them with the ${elsewhere} shown here.`,
         }
       : {
           kind: "unsaved",
@@ -295,79 +343,109 @@ function deriveReceipt(
   // Nothing installed yet, or the read began before the installation or the
   // latest save: it cannot answer for what is shown.
   if (!read.data || !saved.snapshot || read.data.seq <= epoch.seq) return unread;
-  const contract: ZoneApplication = {
+  const contract = (what: Subject): ZoneApplication => ({
     kind: "failed",
     readAt,
-    title: "Cannot verify: unrecognized zone status from engine",
-    detail:
-      "The engine's zone status did not match the expected format, so no application verdict is shown.",
-  };
+    title: `Cannot verify: unrecognized ${what === "zones" ? "zone" : "parking"} status from engine`,
+    detail: `The engine's ${what === "zones" ? "zone" : "parking"} status did not match the expected format, so no application verdict is shown.`,
+  });
   const body = read.data.body;
-  if (body.camera_id !== saved.snapshot.camera_id) return contract;
-  if (body.zones_runtime === undefined || body.zones_runtime === null) return unsupported;
-  if (readErrorSchema.safeParse(body.zones_runtime).success) {
+  const snapshot = saved.snapshot;
+  if (body.camera_id !== snapshot.camera_id) return contract("zones");
+
+  /** One receipt's verdict on the shown `revision` of `what`, from generation `floor` up. */
+  const verdict = (raw: unknown, revision: string, floor: number, what: Subject): ZoneApplication => {
+    if (raw === undefined || raw === null) {
+      // An engine that reports parking settings owes their receipt: its
+      // absence is an unknown, never a zone-only Applied.
+      return what === "zones"
+        ? unsupported
+        : {
+            kind: "disconnected",
+            readAt,
+            title: "Cannot confirm: engine did not report parking status",
+            detail:
+              "The engine reports parking settings but not whether the camera runs them, so that is unknown. It is asked again.",
+          };
+    }
+    if (readErrorSchema.safeParse(raw).success) {
+      return {
+        kind: "disconnected",
+        readAt,
+        title: `Cannot confirm: engine could not read the saved ${what}`,
+        detail: `The engine failed to read this camera's saved ${what}, so whether the camera is running them is unknown. It is asked again.`,
+      };
+    }
+    const parsed = zonesRuntimeSchema.safeParse(raw);
+    if (!parsed.success) return contract(what);
+    const zr = parsed.data;
+    if (zr.applied_generation === undefined) return what === "zones" ? unsupported : contract(what);
+    // An answer from a generation older than one already read.
+    if (zr.generation < floor) return pending;
+    if (zr.desired_revision !== revision) {
+      return what === "zones"
+        ? {
+            kind: "changed_elsewhere",
+            what,
+            readAt,
+            title: "Zones changed elsewhere; loading them",
+            detail:
+              "The engine has a newer zone save than the one shown. It is loaded here before checking which zones the camera is running.",
+          }
+        : {
+            kind: "changed_elsewhere",
+            what,
+            readAt,
+            title: "Parking settings changed elsewhere; loading them",
+            detail:
+              "The engine has newer parking settings than the ones shown. They are loaded here before checking which settings the camera is running.",
+          };
+    }
+    if (zr.state === "inactive") {
+      return {
+        kind: "inactive",
+        readAt,
+        title: "Saved; applies when enabled",
+        detail: `The camera is disabled. The saved ${what} apply when it is enabled; this is not a failure.`,
+      };
+    }
+    if (zr.state === "failed") {
+      return zr.error_code === "application_timeout"
+        ? {
+            kind: "failed",
+            readAt,
+            title: "Not applied: camera did not process a frame within 30 s",
+            detail: `The saved ${what} stay on the engine and apply once the camera processes a frame. Check that the camera is streaming.`,
+          }
+        : {
+            kind: "failed",
+            readAt,
+            title: `Not applied: ${zr.error_code?.slice(0, 64) ?? "no reason reported"}`,
+            detail: `The engine reported this error while applying the saved ${what}.`,
+          };
+    }
+    // The schema holds `applied` to equal revisions and generations.
+    if (zr.state === "applied") {
+      return {
+        kind: "applied",
+        readAt,
+        appliedAt: zr.applied_at,
+        title: "Applied to camera",
+        detail: `The camera processed a frame with the saved ${what}. Decode and analysis health are reported separately.`,
+      };
+    }
     return {
-      kind: "disconnected",
+      kind: "applying",
       readAt,
-      title: "Cannot confirm: engine could not read the saved zones",
-      detail:
-        "The engine failed to read this camera's saved zones, so whether the camera is running them is unknown. It is asked again.",
+      title: "Saved; applying to camera",
+      detail: `The engine has the saved ${what} and is waiting for the camera to process a frame with them.`,
     };
-  }
-  const parsed = zonesRuntimeSchema.safeParse(body.zones_runtime);
-  if (!parsed.success) return contract;
-  const zr = parsed.data;
-  if (zr.applied_generation === undefined) return unsupported;
-  // An answer from a generation older than one already read here.
-  if (zr.generation < epoch.generation) return pending;
-  if (zr.desired_revision !== saved.snapshot.zones_revision) {
-    return {
-      kind: "changed_elsewhere",
-      readAt,
-      title: "Zones changed elsewhere; loading them",
-      detail:
-        "The engine has a newer zone save than the one shown. It is loaded here before checking which zones the camera is running.",
-    };
-  }
-  if (zr.state === "inactive") {
-    return {
-      kind: "inactive",
-      readAt,
-      title: "Saved; applies when enabled",
-      detail: "The camera is disabled. The saved zones apply when it is enabled; this is not a failure.",
-    };
-  }
-  if (zr.state === "failed") {
-    return zr.error_code === "application_timeout"
-      ? {
-          kind: "failed",
-          readAt,
-          title: "Not applied: camera did not process a frame within 30 s",
-          detail:
-            "The saved zones stay on the engine and apply once the camera processes a frame. Check that the camera is streaming.",
-        }
-      : {
-          kind: "failed",
-          readAt,
-          title: `Not applied: ${zr.error_code?.slice(0, 64) ?? "no reason reported"}`,
-          detail: "The engine reported this error while applying the saved zones.",
-        };
-  }
-  // The schema holds `applied` to equal revisions and generations.
-  if (zr.state === "applied") {
-    return {
-      kind: "applied",
-      readAt,
-      appliedAt: zr.applied_at,
-      title: "Applied to camera",
-      detail:
-        "The camera processed a frame with the saved zones. Decode and analysis health are reported separately.",
-    };
-  }
-  return {
-    kind: "applying",
-    readAt,
-    title: "Saved; applying to camera",
-    detail: "The engine has the saved zones and is waiting for the camera to process a frame with them.",
   };
+
+  const zones = verdict(body.zones_runtime, snapshot.zones_revision, epoch.generation, "zones");
+  if (snapshot.parking_revision === undefined || zones.kind === "changed_elsewhere") return zones;
+  const parking = verdict(body.parking_runtime, snapshot.parking_revision, epoch.parkingGeneration ?? -1, "parking settings");
+  // A policy-only save elsewhere moves only the parking revision: it is
+  // loaded whatever the zones' state, a disabled camera's included.
+  return zones.kind === "applied" || parking.kind === "changed_elsewhere" ? parking : zones;
 }

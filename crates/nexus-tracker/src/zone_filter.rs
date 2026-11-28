@@ -18,7 +18,8 @@
 //!
 //! Inclusion / Dwell zones are intentionally *not* enforced here —
 //! they're observational, used by [`TrackAnnotator`] to compute
-//! `motion.zone_state`. Only Exclusion is a hard gate.
+//! `motion.zone_state`. Only Exclusion is a hard gate. Parking zones
+//! (SPEC-077) never filter here at all, not even by minimum area.
 
 use nexus_config::{ZoneConfig, ZoneKind};
 use nexus_types::{Frame, TrackedObject};
@@ -59,7 +60,7 @@ pub fn filter_excluded_zones(
 /// M_PERF_CROWD Phase B1 — per-zone minimum bbox area filter.
 ///
 /// Drops any tracked object whose bbox **centre** falls inside a zone
-/// (of any [`ZoneKind`]) that declares
+/// (of any [`ZoneKind`] but `Parking`) that declares
 /// [`ZoneConfig::min_bbox_area_px_override`] and whose bbox area
 /// (`(x2 − x1) × (y2 − y1)`, in supervisor analysis-frame pixels)
 /// is below that override.
@@ -82,7 +83,7 @@ pub fn filter_zone_min_area(
     objects: &mut Vec<TrackedObject>,
 ) -> usize {
     // Fast path: no zone declares an override.
-    if !zones.iter().any(|z| z.min_bbox_area_px_override.is_some()) {
+    if !zones.iter().any(|z| min_area_override(z).is_some()) {
         return 0;
     }
     let frame_w = (frame.width as f32).max(1.0);
@@ -100,7 +101,7 @@ pub fn filter_zone_min_area(
         // means this loop body never runs on the common no-override
         // configuration.
         !zones.iter().any(|z| {
-            let Some(min_area) = z.min_bbox_area_px_override else {
+            let Some(min_area) = min_area_override(z) else {
                 return false;
             };
             if !point_in_normalized_polygon(nx, ny, &z.polygon) {
@@ -110,6 +111,12 @@ pub fn filter_zone_min_area(
         })
     });
     before - objects.len()
+}
+
+/// A zone's minimum-area override. A parking zone never filters (SPEC-077).
+fn min_area_override(z: &ZoneConfig) -> Option<u32> {
+    z.min_bbox_area_px_override
+        .filter(|_| z.kind != ZoneKind::Parking)
 }
 
 #[cfg(test)]
@@ -382,6 +389,58 @@ mod tests {
         assert_eq!(dropped, 1);
         assert_eq!(objects.len(), 1);
         assert_eq!(objects[0].track_id, 2);
+    }
+
+    /// SPEC-077 — a parking zone marks stalls for the static filter. It is
+    /// never an exclusion or an inclusion rule, even with a minimum area set,
+    /// so a camera with parking zones filters exactly as without them.
+    #[test]
+    fn zone_filter_ignores_parking_zones() {
+        let f = frame();
+        const ALL: [(f32, f32); 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let without = vec![
+            exclusion_zone("tl", vec![(0.0, 0.0), (0.5, 0.0), (0.5, 0.5), (0.0, 0.5)]),
+            override_zone(
+                "br",
+                vec![(0.5, 0.5), (1.0, 0.5), (1.0, 1.0), (0.5, 1.0)],
+                5000,
+            ),
+            inclusion_zone("all", ALL.to_vec()),
+        ];
+        let parking = |id: &str, min_area| ZoneConfig {
+            id: id.into(),
+            name: "Stalls".into(),
+            polygon: ALL.to_vec(),
+            kind: ZoneKind::Parking,
+            min_bbox_area_px_override: min_area,
+        };
+        let mut with = without.clone();
+        with.insert(0, parking("p1", None));
+        with.push(parking("p2", Some(u32::MAX)));
+        let objects = || {
+            vec![
+                small_obj(1, 200.0, 200.0),  // TL: excluded
+                small_obj(2, 1500.0, 800.0), // BR, below its 5000 px²: dropped
+                big_obj(3, 1500.0, 800.0),   // BR, above it: kept
+                small_obj(4, 1500.0, 200.0), // TR: kept
+                big_obj(5, 200.0, 800.0),    // BL: kept
+            ]
+        };
+        let run = |zones: &[ZoneConfig]| {
+            let mut kept = objects();
+            let dropped = (
+                filter_excluded_zones(&f, zones, &mut kept),
+                filter_zone_min_area(&f, zones, &mut kept),
+            );
+            (dropped, kept.iter().map(|o| o.track_id).collect::<Vec<_>>())
+        };
+        assert_eq!(run(&without), ((1, 1), vec![3, 4, 5]));
+        assert_eq!(run(&with), run(&without));
+        assert_eq!(
+            run(&[parking("p1", None), parking("p2", Some(u32::MAX))]),
+            ((0, 0), vec![1, 2, 3, 4, 5]),
+            "parking zones alone filter nothing"
+        );
     }
 
     #[test]

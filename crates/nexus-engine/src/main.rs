@@ -792,6 +792,10 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     frame_stats
         .zone_application()
         .load_generation_floor(cfg.runtime.state_dir.join("zone_generation_floor"));
+    // SPEC-077: the parking registry hands out its own generations, so its own floor.
+    frame_stats
+        .parking_application()
+        .load_generation_floor(cfg.runtime.state_dir.join("parking_generation_floor"));
     // BUG-071: per-camera decode health, written by each pre-roll ingester's
     // GStreamer threads on either side of the decoder. Separate from
     // `frame_stats` because that one is written by the supervisor, downstream

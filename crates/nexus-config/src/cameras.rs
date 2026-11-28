@@ -165,6 +165,12 @@ pub struct CameraBehavior {
     /// per-camera registry at `runtime.state_dir`. Default: false.
     #[serde(default)]
     pub parking_lot_mode: bool,
+    /// SPEC-077 — the explicit parking stillness policy. `None` (default) is
+    /// the legacy static filter and is never serialized, so an old core sees
+    /// no new key. Requires `parking_lot_mode` and a [`ZoneKind::Parking`]
+    /// zone ([`CameraConfig::validate_finite`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parking_policy_v2: Option<ParkingPolicyV2>,
     /// Per-camera override for `tracker.static_object.anchor_ttl_secs`.
     /// When `Some`, the supervisor replaces the global TTL with this
     /// value when constructing the camera's `StaticObjectFilter`.
@@ -340,6 +346,21 @@ pub struct CameraBehavior {
     pub recording_policy_revision: String,
 }
 
+/// SPEC-077 `parking_policy_v2` of a camera ([`CameraBehavior::parking_policy_v2`]).
+/// Every value is required: there is no v2 default.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParkingPolicyV2 {
+    /// Observed stillness a vehicle needs before it is promoted, in capture seconds.
+    pub dwell_secs: f64,
+    /// Highest net speed that still counts as standing, in box diagonals per second.
+    pub max_speed_box_diagonals_per_sec: f64,
+    /// Highest drift from the first observed centre, in box diagonals.
+    pub max_displacement_box_diagonals: f64,
+    /// Longest gap between observations that keeps a dwell going, in seconds.
+    pub max_observation_gap_secs: f64,
+}
+
 /// M_TILE_REINFER (G1) — wire-shape tile grid preset.
 ///
 /// Square grids only so each cell preserves the parent's 16:9
@@ -470,7 +491,52 @@ impl CameraConfig {
     /// The same writes also refuse a zone polygon the supervisor cannot apply
     /// as saved (SPEC-088): a vertex outside the normalized frame, or fewer
     /// than three vertices. It is refused, never clamped or reordered.
+    ///
+    /// SPEC-077: a `parking_policy_v2` needs `parking_lot_mode` and a parking
+    /// zone, each of its values must be finite and above zero, and a parking
+    /// zone needs the policy, so a save never silently falls back to legacy.
+    /// A parking zone filters nothing, so a minimum-area override on it is
+    /// refused rather than silently ignored.
     pub fn validate_finite(&self) -> Result<(), String> {
+        let parking_zone = self.zones.iter().any(|z| z.kind == ZoneKind::Parking);
+        match &self.behavior.parking_policy_v2 {
+            None if parking_zone => {
+                return Err("a parking zone requires parking_policy_v2 in the same save".into())
+            }
+            None => {}
+            Some(_) if !self.behavior.parking_lot_mode => {
+                return Err("parking_policy_v2 requires parking_lot_mode = true".into())
+            }
+            Some(_) if !parking_zone => {
+                return Err("parking_policy_v2 requires at least one parking zone".into())
+            }
+            Some(policy) => {
+                let ParkingPolicyV2 {
+                    dwell_secs,
+                    max_speed_box_diagonals_per_sec,
+                    max_displacement_box_diagonals,
+                    max_observation_gap_secs,
+                } = *policy;
+                for (field, value) in [
+                    ("dwell_secs", dwell_secs),
+                    (
+                        "max_speed_box_diagonals_per_sec",
+                        max_speed_box_diagonals_per_sec,
+                    ),
+                    (
+                        "max_displacement_box_diagonals",
+                        max_displacement_box_diagonals,
+                    ),
+                    ("max_observation_gap_secs", max_observation_gap_secs),
+                ] {
+                    if !(value.is_finite() && value > 0.0) {
+                        return Err(format!(
+                            "parking_policy_v2.{field} must be a finite number above 0, got {value}"
+                        ));
+                    }
+                }
+            }
+        }
         for zone in &self.zones {
             if zone
                 .polygon
@@ -497,6 +563,13 @@ impl CameraConfig {
                     "zone '{}' needs at least 3 polygon vertices, got {}",
                     zone.id,
                     zone.polygon.len()
+                ));
+            }
+            if zone.kind == ZoneKind::Parking && zone.min_bbox_area_px_override.is_some() {
+                return Err(format!(
+                    "zone '{}' is a parking zone, which filters no detection, so its \
+                     min_bbox_area_px_override would be ignored: remove it",
+                    zone.id
                 ));
             }
         }
@@ -538,6 +611,9 @@ pub enum ZoneKind {
     Inclusion,
     Exclusion,
     Dwell,
+    /// SPEC-077 — parking stalls for `parking_policy_v2`. Never filters a
+    /// detection, as an exclusion or as an inclusion.
+    Parking,
 }
 
 #[cfg(test)]
@@ -678,6 +754,232 @@ mod tests {
         ] {
             let why = camera(polygon).validate_finite().expect_err(what);
             assert!(why.contains(refusal), "{what}: {why}");
+        }
+    }
+
+    /// SPEC-077 — candidate values from the plan's calibration grid, never a default.
+    fn parking_policy() -> ParkingPolicyV2 {
+        ParkingPolicyV2 {
+            dwell_secs: 10.0,
+            max_speed_box_diagonals_per_sec: 0.05,
+            max_displacement_box_diagonals: 0.10,
+            max_observation_gap_secs: 3.0,
+        }
+    }
+
+    fn parking_zone() -> ZoneConfig {
+        ZoneConfig {
+            id: "stalls".into(),
+            name: "Stalls".into(),
+            polygon: vec![(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)],
+            kind: ZoneKind::Parking,
+            min_bbox_area_px_override: None,
+        }
+    }
+
+    /// A camera in parking-lot mode with a parking zone and `policy`.
+    fn parking_camera(policy: Option<ParkingPolicyV2>) -> CameraConfig {
+        let mut cam: CameraConfig =
+            toml::from_str("name = \"c1\"\nurl = \"rtsp://example/cam\"").unwrap();
+        cam.behavior.parking_lot_mode = true;
+        cam.behavior.parking_policy_v2 = policy;
+        cam.zones = vec![parking_zone()];
+        cam
+    }
+
+    /// SPEC-077 — a camera with no v2 policy keeps its exact JSON, zones
+    /// included, so a consumer that predates v2 sees no new key and no new
+    /// zone kind.
+    #[test]
+    fn parking_policy_absent_keeps_legacy_camera_json_unchanged() {
+        let old = r#"{"id":7,"name":"Lot","url":"rtsp://10.0.0.5/stream","enabled":true,"max_fps":0,"prompts":[],"visual_prompts":[],"model_override":null,"parking_lot_mode":true,"zones":[{"id":"z1","name":"Lane","polygon":[[0.0,0.0],[1.0,0.0],[0.0,1.0]],"kind":"exclusion"},{"id":"z2","name":"Door","polygon":[[0.0,0.0],[0.5,0.0],[0.0,0.5]],"kind":"inclusion"},{"id":"z3","name":"Bench","polygon":[[0.5,0.5],[1.0,0.5],[0.5,1.0]],"kind":"dwell"}]}"#;
+        let camera: CameraConfig = serde_json::from_str(old).unwrap();
+        assert_eq!(camera.behavior.parking_policy_v2, None);
+        assert_eq!(camera.validate_finite(), Ok(()));
+        assert_eq!(serde_json::to_string(&camera).unwrap(), old);
+    }
+
+    /// SPEC-077 — a parking zone and the v2 policy parse from JSON and TOML
+    /// and round-trip as written.
+    #[test]
+    fn parking_policy_v2_round_trips_with_a_parking_zone() {
+        let json = serde_json::json!({
+            "id": 7, "name": "Lot", "url": "rtsp://10.0.0.5/stream", "enabled": true,
+            "max_fps": 0, "prompts": [], "visual_prompts": [], "model_override": null,
+            "parking_lot_mode": true,
+            "parking_policy_v2": {
+                "dwell_secs": 10.0,
+                "max_speed_box_diagonals_per_sec": 0.05,
+                "max_displacement_box_diagonals": 0.1,
+                "max_observation_gap_secs": 3.0
+            },
+            "zones": [{
+                "id": "stalls", "name": "Stalls",
+                "polygon": [[0.25, 0.25], [0.75, 0.25], [0.5, 0.75]],
+                "kind": "parking"
+            }]
+        });
+        let camera: CameraConfig = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(camera.behavior.parking_policy_v2, Some(parking_policy()));
+        assert_eq!(camera.zones[0].kind, ZoneKind::Parking);
+        assert_eq!(camera.validate_finite(), Ok(()));
+        assert_eq!(serde_json::to_value(&camera).unwrap(), json);
+
+        let toml_camera: CameraConfig = toml::from_str(
+            "name = \"c1\"\nurl = \"rtsp://example/cam\"\nparking_lot_mode = true\n\
+             parking_policy_v2 = { dwell_secs = 10, max_speed_box_diagonals_per_sec = 0.05, \
+             max_displacement_box_diagonals = 0.1, max_observation_gap_secs = 3 }\n\
+             [[zones]]\nid = \"stalls\"\nname = \"Stalls\"\n\
+             polygon = [[0.1, 0.1], [0.9, 0.1], [0.5, 0.9]]\nkind = \"parking\"",
+        )
+        .unwrap();
+        assert_eq!(
+            toml_camera.behavior.parking_policy_v2,
+            Some(parking_policy())
+        );
+        assert_eq!(toml_camera.zones, vec![parking_zone()]);
+        assert_eq!(toml_camera.validate_finite(), Ok(()));
+    }
+
+    /// SPEC-077 — every v2 value must be a finite number above zero, and the
+    /// object has exactly its four keys: nothing is defaulted or ignored.
+    #[test]
+    fn parking_policy_v2_refuses_malformed_values() {
+        type Set = fn(&mut ParkingPolicyV2, f64);
+        let fields: [(&str, Set); 4] = [
+            ("dwell_secs", |p, v| p.dwell_secs = v),
+            ("max_speed_box_diagonals_per_sec", |p, v| {
+                p.max_speed_box_diagonals_per_sec = v
+            }),
+            ("max_displacement_box_diagonals", |p, v| {
+                p.max_displacement_box_diagonals = v
+            }),
+            ("max_observation_gap_secs", |p, v| {
+                p.max_observation_gap_secs = v
+            }),
+        ];
+        for (field, set) in fields {
+            for bad in [f64::NAN, -1.0, 0.0, -0.0, f64::INFINITY, f64::NEG_INFINITY] {
+                let mut policy = parking_policy();
+                set(&mut policy, bad);
+                let why = parking_camera(Some(policy))
+                    .validate_finite()
+                    .expect_err(&format!("{field} = {bad}"));
+                assert!(why.contains(field), "{field} = {bad}: {why}");
+            }
+        }
+
+        let toml_nan: CameraConfig = toml::from_str(
+            "name = \"c1\"\nurl = \"rtsp://example/cam\"\nparking_lot_mode = true\n\
+             parking_policy_v2 = { dwell_secs = nan, max_speed_box_diagonals_per_sec = 0.05, \
+             max_displacement_box_diagonals = 0.1, max_observation_gap_secs = 3 }",
+        )
+        .unwrap();
+        assert!(toml_nan.validate_finite().is_err(), "TOML nan is refused");
+
+        let full = serde_json::json!({
+            "dwell_secs": 10.0,
+            "max_speed_box_diagonals_per_sec": 0.05,
+            "max_displacement_box_diagonals": 0.1,
+            "max_observation_gap_secs": 3.0
+        });
+        for key in full.as_object().unwrap().keys() {
+            let mut missing = full.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            assert!(
+                serde_json::from_value::<ParkingPolicyV2>(missing).is_err(),
+                "a v2 policy without {key} has no default to fall back on"
+            );
+        }
+        let mut extra = full.clone();
+        extra["significant_movement_pixels"] = serde_json::json!(36);
+        assert!(serde_json::from_value::<ParkingPolicyV2>(extra).is_err());
+        let mut text = full;
+        text["dwell_secs"] = serde_json::json!("10");
+        assert!(serde_json::from_value::<ParkingPolicyV2>(text).is_err());
+    }
+
+    /// SPEC-077 — v2 is only ever explicit: it needs parking-lot mode and a
+    /// parking zone, and a parking zone needs it. Without both, a camera
+    /// keeps its legacy behaviour.
+    #[test]
+    fn parking_policy_v2_needs_parking_lot_mode_and_a_parking_zone() {
+        assert_eq!(
+            parking_camera(Some(parking_policy())).validate_finite(),
+            Ok(())
+        );
+
+        let mut mode_off = parking_camera(Some(parking_policy()));
+        mode_off.behavior.parking_lot_mode = false;
+        let why = mode_off
+            .validate_finite()
+            .expect_err("v2 without parking_lot_mode");
+        assert!(why.contains("parking_lot_mode"), "{why}");
+
+        for (what, zones) in [
+            ("no zones", vec![]),
+            (
+                "only an exclusion zone",
+                vec![ZoneConfig {
+                    kind: ZoneKind::Exclusion,
+                    ..parking_zone()
+                }],
+            ),
+        ] {
+            let mut no_parking_zone = parking_camera(Some(parking_policy()));
+            no_parking_zone.zones = zones;
+            let why = no_parking_zone.validate_finite().expect_err(what);
+            assert!(why.contains("parking zone"), "{what}: {why}");
+        }
+
+        let why = parking_camera(None)
+            .validate_finite()
+            .expect_err("a parking zone without v2");
+        assert!(why.contains("parking_policy_v2"), "{why}");
+        let mut legacy_mode_off = parking_camera(None);
+        legacy_mode_off.behavior.parking_lot_mode = false;
+        assert!(
+            legacy_mode_off.validate_finite().is_err(),
+            "a parking zone is refused without v2 whatever the mode"
+        );
+
+        let mut legacy = parking_camera(None);
+        legacy.zones.clear();
+        assert_eq!(
+            legacy.validate_finite(),
+            Ok(()),
+            "parking-lot mode with no parking zone and no v2 is the legacy camera"
+        );
+    }
+
+    /// SPEC-077 — a parking zone filters no detection, so a per-zone minimum
+    /// area on it would be silently ignored: it is refused instead. Every
+    /// other zone kind keeps its override.
+    #[test]
+    fn a_parking_zone_refuses_a_min_bbox_area_override() {
+        let mut camera = parking_camera(Some(parking_policy()));
+        camera.zones[0].min_bbox_area_px_override = Some(40);
+        let why = camera
+            .validate_finite()
+            .expect_err("a parking zone with a minimum-area override");
+        assert!(
+            why.contains("stalls") && why.contains("min_bbox_area_px_override"),
+            "{why}"
+        );
+
+        for kind in [ZoneKind::Inclusion, ZoneKind::Exclusion, ZoneKind::Dwell] {
+            let mut camera = parking_camera(Some(parking_policy()));
+            camera.zones.push(ZoneConfig {
+                id: "other".into(),
+                kind,
+                min_bbox_area_px_override: Some(40),
+                ..parking_zone()
+            });
+            assert_eq!(
+                camera.validate_finite(),
+                Ok(()),
+                "{kind:?} keeps its override"
+            );
         }
     }
 }

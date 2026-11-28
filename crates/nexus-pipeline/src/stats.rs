@@ -236,6 +236,11 @@ pub struct FrameStatsRegistry {
     /// already share this registry. [`Self::clear`] leaves it alone, so a
     /// restart keeps the camera's last applied revision for comparison.
     zone_application: ZoneApplicationRegistry,
+    /// SPEC-077 — the same receipt for the parking tuple, its own instance
+    /// so a zone acknowledgement never certifies parking. Requested where
+    /// the zones are, under [`ZoneApplicationRegistry::saves`] of
+    /// `zone_application`.
+    parking_application: ZoneApplicationRegistry,
     /// SPEC-089 — each shadow camera's recording-activity runtime, for the
     /// same reason.
     recording_activity: RecordingActivityRegistry,
@@ -249,6 +254,12 @@ impl FrameStatsRegistry {
     /// Which zone revision each camera's running supervisor applied.
     pub fn zone_application(&self) -> &ZoneApplicationRegistry {
         &self.zone_application
+    }
+
+    /// Which parking revision ([`crate::zone_application::parking_revision`])
+    /// each camera's running supervisor applied.
+    pub fn parking_application(&self) -> &ZoneApplicationRegistry {
+        &self.parking_application
     }
 
     /// Which cameras run the fresh-evidence recording policy, and how.

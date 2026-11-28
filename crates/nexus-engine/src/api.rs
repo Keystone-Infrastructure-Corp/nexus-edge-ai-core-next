@@ -1349,15 +1349,17 @@ async fn list_cameras(State(s): State<ApiState>) -> Result<Json<Vec<CameraConfig
 }
 
 /// SPEC-088 — `GET /v1/admin/cameras/{camera_id}/config-snapshot`. The
-/// revision metadata sits beside `settings`, never inside it. No `parking` or
-/// `parking_revision`: this build reports no parking, and a reader takes
-/// their absence as unsupported, never as a default.
+/// revision metadata sits beside `settings`, never inside it. SPEC-077 —
+/// `settings.parking` and `parking_revision` always come together: this
+/// build reports parking, and a reader takes their absence (an older build)
+/// as unsupported, never as a default.
 #[derive(serde::Serialize)]
 struct CameraConfigSnapshot {
     schema_version: u32,
     camera_id: CameraId,
     settings: CameraZoneSettingsView,
     zones_revision: String,
+    parking_revision: String,
 }
 
 /// The settings the snapshot binds to a revision, copied field by field: no
@@ -1365,12 +1367,22 @@ struct CameraConfigSnapshot {
 #[derive(serde::Serialize)]
 struct CameraZoneSettingsView {
     zones: Vec<nexus_config::ZoneConfig>,
+    parking: CameraParkingSettingsView,
 }
 
-/// The camera's zones and the revision hashed from them, both taken from the
-/// one stored row this read decodes, so a save racing the read cannot pair
-/// one write's zones with another's revision. A row this build cannot decode
-/// answers a generic error, never the decode error, which can quote the row.
+/// SPEC-077 — the rest of the parking tuple: the mode, and the whole v2
+/// policy, an explicit `null` when the camera has none.
+#[derive(serde::Serialize)]
+struct CameraParkingSettingsView {
+    parking_lot_mode: bool,
+    parking_policy_v2: Option<nexus_config::ParkingPolicyV2>,
+}
+
+/// The camera's zones and parking settings and the revisions hashed from
+/// them, all taken from the one stored row this read decodes, so a save
+/// racing the read cannot pair one write's settings with another's revision.
+/// A row this build cannot decode answers a generic error, never the decode
+/// error, which can quote the row.
 async fn get_camera_config_snapshot(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
@@ -1387,13 +1399,19 @@ async fn get_camera_config_snapshot(
         });
     };
     let zones_revision = nexus_pipeline::zone_application::zone_revision(&camera.zones);
+    let parking_revision = nexus_pipeline::zone_application::parking_revision(&camera);
     Ok(Json(CameraConfigSnapshot {
         schema_version: 1,
         camera_id: id,
         settings: CameraZoneSettingsView {
+            parking: CameraParkingSettingsView {
+                parking_lot_mode: camera.behavior.parking_lot_mode,
+                parking_policy_v2: camera.behavior.parking_policy_v2,
+            },
             zones: camera.zones,
         },
         zones_revision,
+        parking_revision,
     }))
 }
 
@@ -1487,6 +1505,11 @@ async fn reprobe_apply(
                 s.frame_stats.zone_application().request(
                     cam.id,
                     &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+                    cam.ingest.enabled,
+                );
+                s.frame_stats.parking_application().request(
+                    cam.id,
+                    &nexus_pipeline::zone_application::parking_revision(cam),
                     cam.ingest.enabled,
                 );
                 applied_any = true;
@@ -1649,6 +1672,10 @@ struct UpsertCameraQuery {
     /// `zones_revision_conflict` with the current one and write nothing.
     /// Absent, the save is unconditional, as before.
     expected_zones_revision: Option<String>,
+    /// SPEC-077 — the same for the parking tuple (the snapshot's
+    /// `parking_revision`), checked after the zones, with 409
+    /// `parking_revision_conflict`: a policy-only save moves no zones revision.
+    expected_parking_revision: Option<String>,
 }
 
 /// A camera write's body: the camera, and beside it SPEC-089's request-only
@@ -1736,6 +1763,20 @@ async fn upsert_camera(
             let body = serde_json::json!({
                 "error": "zones_revision_conflict",
                 "zones_revision": current,
+            });
+            return Ok((StatusCode::CONFLICT, Json(body)).into_response());
+        }
+    }
+    // SPEC-077 — and the expected parking revision, in the same read.
+    if let Some(want) = q.expected_parking_revision {
+        let current = cameras
+            .iter()
+            .find(|c| c.id == id)
+            .map(nexus_pipeline::zone_application::parking_revision);
+        if current.as_deref() != Some(want.as_str()) {
+            let body = serde_json::json!({
+                "error": "parking_revision_conflict",
+                "parking_revision": current,
             });
             return Ok((StatusCode::CONFLICT, Json(body)).into_response());
         }
@@ -1878,6 +1919,12 @@ async fn commit_camera_write<G>(
         &nexus_pipeline::zone_application::zone_revision(&cam.zones),
         cam.ingest.enabled,
     );
+    // SPEC-077 — and its parking tuple, which a policy-only save changes.
+    s.frame_stats.parking_application().request(
+        id,
+        &nexus_pipeline::zone_application::parking_revision(cam),
+        cam.ingest.enabled,
+    );
     drop(saving);
     // Fire-and-forget: the engine's `config.changed` reconciler
     // listens for this and hot-starts a supervisor + pre-roll
@@ -1996,6 +2043,11 @@ async fn create_camera(
         &nexus_pipeline::zone_application::zone_revision(&cam.zones),
         cam.ingest.enabled,
     );
+    s.frame_stats.parking_application().request(
+        cam.id,
+        &nexus_pipeline::zone_application::parking_revision(&cam),
+        cam.ingest.enabled,
+    );
     drop(saving);
     let _ = s
         .bus
@@ -2070,6 +2122,7 @@ async fn delete_camera(
     s.talkdown.stop_where(|_, camera, _| camera == Some(id));
     // SPEC-088 — a deleted camera has no zone application left to report.
     s.frame_stats.zone_application().remove(id);
+    s.frame_stats.parking_application().remove(id);
     drop(saving);
     // Same channel as upsert — the reconciler diffs the live set
     // against the DB and stops the supervisor for any removed id.
@@ -3171,6 +3224,12 @@ struct CameraFrameStatsView {
     /// never as applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     zones_runtime: Option<ZonesReceipt>,
+    /// SPEC-077 — the same receipt for the camera's parking tuple (zones,
+    /// `parking_lot_mode` and `parking_policy_v2`), from its own registry, so
+    /// a policy-only save is told apart from the unchanged zones. Absent
+    /// exactly when `zones_runtime` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parking_runtime: Option<ZonesReceipt>,
     /// SPEC-089 — the recording policy the camera's supervisor runs. Present
     /// whenever one runs it: legacy (an unsupported tracker included) names
     /// only its mode, generation, applied revision and clip, with no
@@ -3256,17 +3315,24 @@ const ZONES_READ_ERROR: ZonesReceipt = ZonesReceipt::ReadError {
     error_code: (),
 };
 
+/// A camera's (`zones_runtime`, `parking_runtime`).
+type Receipts = (ZonesReceipt, ZonesReceipt);
+
+const RECEIPTS_READ_ERROR: Receipts = (ZONES_READ_ERROR, ZONES_READ_ERROR);
+
 /// SPEC-088 — each saved camera's zone application status, its desired
 /// revision hashed from the zones in the store now and its enabled flag read
 /// with them, so a read straight after a save already reports the saved
-/// zones, never the running ones as applied. `None` when the saved cameras
-/// could not be read: then no camera's status is known, and each reads
-/// [`ZONES_READ_ERROR`].
+/// zones, never the running ones as applied. SPEC-077 — beside it, the same
+/// for its parking tuple, read from the same row. `None` when the saved
+/// cameras could not be read: then no camera's status is known, and each
+/// reads [`RECEIPTS_READ_ERROR`].
 async fn zones_runtime(
     s: &ApiState,
     now: std::time::Instant,
-) -> Option<std::collections::HashMap<CameraId, ZonesReceipt>> {
+) -> Option<std::collections::HashMap<CameraId, Receipts>> {
     let registry = s.frame_stats.zone_application();
+    let parking = s.frame_stats.parking_application();
     // No save commits between this read and the requests it makes.
     let _reading = registry.saves().read().await;
     let (cameras, unreadable) = match s.store.list_readable_cameras().await {
@@ -3279,11 +3345,16 @@ async fn zones_runtime(
     let receipts = cameras.iter().map(|cam| {
         let desired = nexus_pipeline::zone_application::zone_revision(&cam.zones);
         let receipt = registry.snapshot(cam.id, &desired, cam.ingest.enabled, now);
-        (cam.id, ZonesReceipt::Read(receipt))
+        let desired = nexus_pipeline::zone_application::parking_revision(cam);
+        let parking = parking.snapshot(cam.id, &desired, cam.ingest.enabled, now);
+        (
+            cam.id,
+            (ZonesReceipt::Read(receipt), ZonesReceipt::Read(parking)),
+        )
     });
     Some(
         receipts
-            .chain(unreadable.into_iter().map(|id| (id, ZONES_READ_ERROR)))
+            .chain(unreadable.into_iter().map(|id| (id, RECEIPTS_READ_ERROR)))
             .collect(),
     )
 }
@@ -3300,7 +3371,7 @@ async fn get_camera_stats(
     let now = std::time::Instant::now();
     let zones = zones_runtime(&s, now)
         .await
-        .map_or(Some(ZONES_READ_ERROR), |mut zones| zones.remove(&id));
+        .map_or(Some(RECEIPTS_READ_ERROR), |mut zones| zones.remove(&id));
     let snap = match (s.frame_stats.snapshot(id), &zones) {
         (Some(snap), _) => snap,
         (None, Some(_)) => nexus_pipeline::CameraFrameStats::default(),
@@ -3325,9 +3396,10 @@ fn build_camera_stats_view(
     id: CameraId,
     snap: &nexus_pipeline::CameraFrameStats,
     now: std::time::Instant,
-    zones_runtime: Option<ZonesReceipt>,
+    receipts: Option<Receipts>,
     recording_activity: Option<RecordingActivityView>,
 ) -> CameraFrameStatsView {
+    let (zones_runtime, parking_runtime) = receipts.unzip();
     // Absent (camera has no RGB tap, or none of its frames have reached the
     // loop guard yet) reads as all-zero rather than 404 — the caller asked
     // for stats, and "no decode health recorded" is a zero, not an error.
@@ -3376,6 +3448,7 @@ fn build_camera_stats_view(
         decode_ceiling_fps,
         analysis_stream: analysis,
         zones_runtime,
+        parking_runtime,
         recording_activity,
     }
 }
@@ -3397,7 +3470,7 @@ async fn get_all_camera_stats(
     for (id, snap) in stats {
         let receipt = zones
             .as_mut()
-            .map_or(Some(ZONES_READ_ERROR), |zones| zones.remove(&id));
+            .map_or(Some(RECEIPTS_READ_ERROR), |zones| zones.remove(&id));
         let activity = recording_activity(&s, id, now).await;
         views.push(build_camera_stats_view(
             &s, id, &snap, now, receipt, activity,
@@ -8508,6 +8581,33 @@ mod tests {
         serde_json::from_value(snap["settings"]["zones"].clone()).unwrap()
     }
 
+    /// SPEC-077 — what the snapshot's `settings.parking` must hold for
+    /// `camera`: its mode and its whole policy, `null` when it has none.
+    fn snapshot_parking(camera: &nexus_config::CameraConfig) -> serde_json::Value {
+        serde_json::json!({
+            "parking_lot_mode": camera.behavior.parking_lot_mode,
+            "parking_policy_v2": camera.behavior.parking_policy_v2,
+        })
+    }
+
+    /// SPEC-077 — `camera` with parking-lot mode, a v2 policy and a parking
+    /// zone added to its zones.
+    fn snapshot_parked(mut camera: nexus_config::CameraConfig) -> nexus_config::CameraConfig {
+        camera.behavior.parking_lot_mode = true;
+        camera.behavior.parking_policy_v2 = Some(nexus_config::ParkingPolicyV2 {
+            dwell_secs: 10.0,
+            max_speed_box_diagonals_per_sec: 0.05,
+            max_displacement_box_diagonals: 0.10,
+            max_observation_gap_secs: 3.0,
+        });
+        camera.zones.push(nexus_config::ZoneConfig {
+            kind: nexus_config::ZoneKind::Parking,
+            min_bbox_area_px_override: None,
+            ..snapshot_zone("stalls", 0.3)
+        });
+        camera
+    }
+
     fn snapshot_zone(id: &str, x: f32) -> nexus_config::ZoneConfig {
         nexus_config::ZoneConfig {
             id: id.into(),
@@ -8552,10 +8652,12 @@ mod tests {
     /// revision, and nothing else the stored camera holds: no stream URL, no
     /// ONVIF or talk-down field, no name, no credential, in the body or in
     /// what the request logs. The legacy list still returns them all
-    /// (BUG-311 stays open); this view does not claim to fix it.
+    /// (BUG-311 stays open); this view does not claim to fix it. SPEC-077 —
+    /// with the parking mode and v2 policy and their revision beside them,
+    /// and still nothing else.
     #[tokio::test]
     async fn camera_config_snapshot_is_the_zones_and_never_a_credential() {
-        use nexus_pipeline::zone_application::zone_revision;
+        use nexus_pipeline::zone_application::{parking_revision, zone_revision};
         const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-sentinel-secret";
         const SENTINELS: [&str; 14] = [
             "name-sentinel-n0",
@@ -8593,6 +8695,7 @@ mod tests {
         camera.talk_down.backchannel_url =
             Some("rtsp://talk-user-s11:talk-pass-s12@talk-host-s13.test/back".into());
         camera.zones = vec![snapshot_zone("door", 0.1), snapshot_zone("drive", 0.2)];
+        let camera = snapshot_parked(camera);
         store.upsert_camera(&camera).await.unwrap();
         let token = sign_admin_jwt(ADMIN_SECRET);
         let (status, legacy) = {
@@ -8643,36 +8746,48 @@ mod tests {
         };
         assert_eq!(
             keys(&snap),
-            ["camera_id", "schema_version", "settings", "zones_revision"],
-            "no parking_revision: this build reports no parking"
+            [
+                "camera_id",
+                "parking_revision",
+                "schema_version",
+                "settings",
+                "zones_revision"
+            ]
         );
+        assert_eq!(keys(&snap["settings"]), ["parking", "zones"]);
         assert_eq!(
-            keys(&snap["settings"]),
-            ["zones"],
-            "no parking: unsupported"
+            keys(&snap["settings"]["parking"]),
+            ["parking_lot_mode", "parking_policy_v2"]
         );
         assert_eq!(snap["schema_version"], 1);
         assert_eq!(snap["camera_id"], camera.id);
         assert_eq!(snapshot_zones(&snap), camera.zones);
         assert_eq!(snap["zones_revision"], zone_revision(&camera.zones));
+        assert_eq!(snap["settings"]["parking"], snapshot_parking(&camera));
+        assert_eq!(snap["parking_revision"], parking_revision(&camera));
     }
 
     /// SPEC-088 — one snapshot's zones and revision come from one stored
     /// object: after each of A → B → A the read answers that write, and
     /// reads racing a writer flipping A and B never pair one write's zones
-    /// with the other's revision.
+    /// with the other's revision. SPEC-077 — nor its parking projection and
+    /// revision: A has no v2, which reads as explicit absence, and B has one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn camera_config_snapshot_pairs_zones_with_their_revision_under_writes() {
-        use nexus_pipeline::zone_application::zone_revision;
+        use nexus_pipeline::zone_application::{parking_revision, zone_revision};
         const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-pairing-secret";
         let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
         store_default_camera(&store, true).await;
         let mut a = store.list_cameras().await.unwrap()[0].clone();
         a.zones = vec![snapshot_zone("a", 0.1)];
+        a.behavior.parking_lot_mode = false;
+        a.behavior.parking_policy_v2 = None;
         let mut b = a.clone();
         b.zones = vec![snapshot_zone("b", 0.3), snapshot_zone("c", 0.4)];
+        let b = snapshot_parked(b);
         let (rev_a, rev_b) = (zone_revision(&a.zones), zone_revision(&b.zones));
         assert_ne!(rev_a, rev_b);
+        assert_ne!(parking_revision(&a), parking_revision(&b));
         let token = sign_admin_jwt(ADMIN_SECRET);
         let id = a.id.to_string();
 
@@ -8681,8 +8796,17 @@ mod tests {
             let snap = read_config_snapshot(&app, &id, &token).await;
             assert_eq!(snapshot_zones(&snap), camera.zones);
             assert_eq!(snap["zones_revision"], **rev);
+            assert_eq!(snap["settings"]["parking"], snapshot_parking(camera));
+            assert_eq!(snap["parking_revision"], parking_revision(camera));
         }
+        assert_eq!(
+            read_config_snapshot(&app, &id, &token).await["settings"]["parking"],
+            serde_json::json!({ "parking_lot_mode": false, "parking_policy_v2": null }),
+            "a camera with no v2 reports its absence explicitly"
+        );
 
+        let [a_tuple, b_tuple] =
+            [&a, &b].map(|c| (snapshot_parking(c), serde_json::json!(parking_revision(c))));
         let writer = {
             let store = store.clone();
             tokio::spawn(async move {
@@ -8699,6 +8823,12 @@ mod tests {
             let rev = snap["zones_revision"].as_str().unwrap();
             assert_eq!(rev, zone_revision(&snapshot_zones(&snap)), "{snap}");
             assert!(rev == rev_a || rev == rev_b, "{snap}");
+            let written = if rev == rev_a { &a_tuple } else { &b_tuple };
+            assert_eq!(
+                (&snap["settings"]["parking"], &snap["parking_revision"]),
+                (&written.0, &written.1),
+                "{snap}"
+            );
         }
         writer.await.unwrap();
     }
@@ -8834,6 +8964,79 @@ mod tests {
         let id = store.list_cameras().await.unwrap()[0].id.to_string();
         let snap = read_config_snapshot(&app, &id, &sign_admin_jwt(ADMIN_SECRET)).await;
         assert_eq!(snap["schema_version"], 1);
+    }
+
+    /// SPEC-077 — `parking_policy_v2` is on the heartbeat now that both things
+    /// it promises exist: a policy change restarts the camera (the
+    /// reconciler's tests) and its `parking_runtime` receipt is reported. The
+    /// receipt and the snapshot's parking tuple keep the camera
+    /// `settings.read` mapping, and a policy save keeps `settings.write`.
+    #[tokio::test]
+    async fn parking_policy_v2_capability_has_its_receipt_snapshot_and_permissions() {
+        use nexus_cloud_client::actor_token::{EnvelopeContext, VerifiedActor};
+        assert!(crate::cloud_tunnel::heartbeat_caps(None, false, false)
+            .iter()
+            .any(|c| c == "parking_policy_v2"));
+        let actor = |perm: &str| VerifiedActor {
+            sub: "human".into(),
+            role: "viewer".into(),
+            perm: Some(perm.into()),
+            jti: "jti".into(),
+            org_id: "org".into(),
+            actor_org_id: None,
+        };
+        for path in ["/admin/cameras/7/config-snapshot", "/admin/cameras/7/stats"] {
+            let envelope = EnvelopeContext {
+                method: "GET",
+                path,
+            };
+            assert!(
+                actor("settings.read").allows_rpc(envelope, None, false),
+                "{path}"
+            );
+        }
+        let policy_save = serde_json::json!({
+            "id": 7,
+            "name": "c",
+            "url": "virtual://local",
+            "parking_lot_mode": true,
+            "parking_policy_v2": {
+                "dwell_secs": 10.0,
+                "max_speed_box_diagonals_per_sec": 0.05,
+                "max_displacement_box_diagonals": 0.1,
+                "max_observation_gap_secs": 3.0
+            },
+        })
+        .to_string();
+        let put = EnvelopeContext {
+            method: "PUT",
+            path: "/admin/cameras/7",
+        };
+        assert!(actor("settings.write").allows_rpc(put, Some(policy_save.as_bytes()), false));
+        assert!(!actor("settings.read").allows_rpc(put, Some(policy_save.as_bytes()), false));
+
+        const ADMIN_SECRET: &[u8] = b"parking-policy-v2-cap-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let id = store.list_cameras().await.unwrap()[0].id.to_string();
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let snap = read_config_snapshot(&app, &id, &token).await;
+        assert!(
+            snap["settings"]["parking"].is_object() && snap["parking_revision"].is_string(),
+            "{snap}"
+        );
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/admin/cameras/{id}/stats"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let stats: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await.unwrap()).unwrap();
+        assert_eq!(stats["parking_runtime"]["schema_version"], 1, "{stats}");
     }
 
     /// SPEC-069 Phase 1 — the decode/analysis telemetry is only useful
@@ -9559,6 +9762,205 @@ mod tests {
         );
     }
 
+    /// SPEC-077 — `parking_runtime` on the camera-stats read, beside and in
+    /// the shape of `zones_runtime`: all eight keys with explicit `null`s, its
+    /// desired revision the parking tuple saved now, the batch and the single
+    /// read agreeing. A policy-only save through the API changes no zone, so
+    /// the zone receipt stays applied while parking reads applying: zone
+    /// success never certifies parking. Policy A→B→A saved with no read
+    /// between is a new request, which a matching historical digest and an
+    /// earlier token cannot satisfy. Disabled reads inactive; a deleted
+    /// camera omits it.
+    #[tokio::test]
+    async fn camera_stats_report_parking_application_in_the_agreed_shape() {
+        use nexus_pipeline::zone_application::{parking_revision, zone_revision};
+        use serde_json::json;
+
+        async fn get(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, body)
+        }
+        /// The single read's (`zones_runtime`, `parking_runtime`), once the
+        /// batch row agrees.
+        async fn runtimes(
+            app: &axum::Router,
+            id: nexus_types::CameraId,
+        ) -> (Option<serde_json::Value>, Option<serde_json::Value>) {
+            let (status, one) = get(app, &format!("/api/v1/cameras/{id}/stats")).await;
+            assert_eq!(status, StatusCode::OK, "{one}");
+            let (status, all) = get(app, "/api/v1/cameras/stats").await;
+            assert_eq!(status, StatusCode::OK, "{all}");
+            let row = all
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["camera_id"] == id))
+                .cloned()
+                .unwrap_or_else(|| panic!("camera {id} has a batch row: {all}"));
+            for key in ["zones_runtime", "parking_runtime"] {
+                assert_eq!(
+                    row.get(key),
+                    one.get(key),
+                    "{key}: the batch and the single read disagree"
+                );
+            }
+            (
+                one.get("zones_runtime").cloned(),
+                one.get("parking_runtime").cloned(),
+            )
+        }
+        async fn put(app: &axum::Router, camera: &nexus_config::CameraConfig) {
+            let mut req = Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/v1/cameras/{}", camera.id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(camera).unwrap()))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert!(res.status().is_success(), "save: {}", res.status());
+        }
+        let receipt = |desired: &str,
+                       applied: Option<&str>,
+                       generation: u64,
+                       applied_generation: Option<u64>,
+                       state: &str| {
+            json!({
+                "schema_version": 1,
+                "desired_revision": desired,
+                "applied_revision": applied,
+                "generation": generation,
+                "applied_generation": applied_generation,
+                "state": state,
+                "applied_at": applied.map(|_| "2026-11-24T16:30:00Z"),
+                "error_code": null,
+            })
+        };
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let mut a_cam = store.list_cameras().await.expect("list cameras")[0].clone();
+        a_cam.behavior.parking_lot_mode = true;
+        a_cam.behavior.parking_policy_v2 = Some(nexus_config::ParkingPolicyV2 {
+            dwell_secs: 10.0,
+            max_speed_box_diagonals_per_sec: 0.05,
+            max_displacement_box_diagonals: 0.10,
+            max_observation_gap_secs: 3.0,
+        });
+        a_cam.zones = vec![nexus_config::ZoneConfig {
+            kind: nexus_config::ZoneKind::Parking,
+            min_bbox_area_px_override: None,
+            ..snapshot_zone("stalls", 0.1)
+        }];
+        let mut b_cam = a_cam.clone();
+        if let Some(policy) = b_cam.behavior.parking_policy_v2.as_mut() {
+            policy.dwell_secs = 20.0;
+        }
+        let id = a_cam.id;
+        let (a, b, z) = (
+            parking_revision(&a_cam),
+            parking_revision(&b_cam),
+            zone_revision(&a_cam.zones),
+        );
+        let frame_stats = state.frame_stats.clone();
+        let (zones, parking) = (
+            || frame_stats.zone_application(),
+            || frame_stats.parking_application(),
+        );
+        let app = super::router(state);
+        let applied_at =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 11, 24, 16, 30, 0).unwrap();
+        put(&app, &a_cam).await;
+
+        let (_, unstarted) = runtimes(&app, id).await;
+        let unstarted = unstarted.expect("an enabled camera with no generation is reported");
+        let p0 = unstarted["generation"].as_u64().expect("a generation");
+        assert_eq!(unstarted, receipt(&a, None, p0, None, "applying"));
+
+        let (g1, p1) = (zones().start(id, &z), parking().start(id, &a));
+        assert!(p1 > p0, "a start is a newer generation");
+        let zone_token = zones().current_request(id, g1).expect("g1 runs Z");
+        zones().acknowledge(id, g1, zone_token, &z, applied_at);
+        let first = parking().current_request(id, p1).expect("p1 runs A");
+        parking().acknowledge(id, p1, first, &a, applied_at);
+        let zones_applied = receipt(&z, Some(&z), g1, Some(g1), "applied");
+        let applied_a = receipt(&a, Some(&a), p1, Some(p1), "applied");
+        assert_eq!(
+            runtimes(&app, id).await,
+            (Some(zones_applied.clone()), Some(applied_a.clone()))
+        );
+
+        put(&app, &b_cam).await;
+        assert_eq!(
+            runtimes(&app, id).await,
+            (
+                Some(zones_applied.clone()),
+                Some(receipt(&b, Some(&a), p1, Some(p1), "applying"))
+            ),
+            "a policy-only save kept the parking verdict, or moved the zones"
+        );
+
+        // Policy A→B→A through the API's save, with no read between.
+        put(&app, &a_cam).await;
+        put(&app, &b_cam).await;
+        put(&app, &a_cam).await;
+        let again = parking().current_request(id, p1).expect("p1 runs A");
+        assert_ne!(again, first, "the API's saves of B and A were no requests");
+        let reapplying = receipt(&a, Some(&a), p1, Some(p1), "applying");
+        assert_eq!(
+            runtimes(&app, id).await,
+            (Some(zones_applied.clone()), Some(reapplying.clone())),
+            "the A acknowledged before B was credited to the A saved after it"
+        );
+        parking().acknowledge(id, p1, first, &a, applied_at);
+        assert_eq!(
+            runtimes(&app, id).await.1,
+            Some(reapplying),
+            "a stale token counted"
+        );
+        parking().acknowledge(id, p1, again, &a, applied_at);
+        assert_eq!(runtimes(&app, id).await.1, Some(applied_a));
+
+        let mut disabled = b_cam.clone();
+        disabled.ingest.enabled = false;
+        put(&app, &disabled).await;
+        assert_eq!(
+            runtimes(&app, id).await.1,
+            Some(receipt(&b, Some(&a), p1, Some(p1), "inactive")),
+            "a disabled camera is inactive, neither applied nor failed"
+        );
+
+        let mut req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/api/v1/cameras/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert!(res.status().is_success(), "delete: {}", res.status());
+        let epoch = frame_stats.begin_session(id);
+        frame_stats.observe_frame(id, epoch, chrono::Utc::now(), 512, 288);
+        assert_eq!(
+            runtimes(&app, id).await,
+            (None, None),
+            "a camera that is not saved omits both objects"
+        );
+        assert_eq!(
+            parking()
+                .snapshot(id, &b, true, std::time::Instant::now())
+                .applied_revision,
+            None,
+            "the delete kept the camera's parking history"
+        );
+    }
+
     /// SPEC-088 — the registry sees saves in commit order. With A applied
     /// by g1, B is committed by a save that has not told the registry yet,
     /// and A is saved through the API meanwhile: A cannot commit before B's
@@ -9651,9 +10053,29 @@ mod tests {
         camera: nexus_config::CameraConfig,
         expected: Option<String>,
     ) -> (StatusCode, serde_json::Value) {
-        let query = expected.map_or(String::new(), |rev| {
-            format!("?expected_zones_revision={rev}")
-        });
+        put_camera_expecting_revisions(app, camera, expected, None).await
+    }
+
+    /// `PUT /api/v1/cameras/{id}` of `camera`, naming the zones and the
+    /// parking revisions it expects saved, each when given: status and body.
+    async fn put_camera_expecting_revisions(
+        app: axum::Router,
+        camera: nexus_config::CameraConfig,
+        zones: Option<String>,
+        parking: Option<String>,
+    ) -> (StatusCode, serde_json::Value) {
+        let params: Vec<String> = [
+            ("expected_zones_revision", zones),
+            ("expected_parking_revision", parking),
+        ]
+        .into_iter()
+        .filter_map(|(key, rev)| rev.map(|rev| format!("{key}={rev}")))
+        .collect();
+        let query = if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        };
         let mut req = Request::builder()
             .method(Method::PUT)
             .uri(format!("/api/v1/cameras/{}{query}", camera.id))
@@ -9751,6 +10173,131 @@ mod tests {
         );
     }
 
+    /// `camera` with its v2 dwell set to `dwell_secs`: a policy-only edit.
+    fn with_dwell(
+        mut camera: nexus_config::CameraConfig,
+        dwell_secs: f64,
+    ) -> nexus_config::CameraConfig {
+        if let Some(policy) = camera.behavior.parking_policy_v2.as_mut() {
+            policy.dwell_secs = dwell_secs;
+        }
+        camera
+    }
+
+    /// SPEC-077 — a camera save naming the parking revision it expects saves
+    /// only while the stored parking tuple still has it, checked after the
+    /// zones revision. A policy-only save moves no zones revision, so only
+    /// this sees it: a stale one answers 409 `parking_revision_conflict` with
+    /// the current revision and writes nothing; the current one saves; a save
+    /// naming none saves as before; a camera not stored never matches.
+    #[tokio::test]
+    async fn a_camera_save_expecting_a_stale_parking_revision_conflicts_and_writes_nothing() {
+        use nexus_pipeline::zone_application::{parking_revision, zone_revision};
+        async fn stored(store: &Store) -> (String, Option<nexus_config::ParkingPolicyV2>) {
+            let cams = store.list_cameras().await.unwrap();
+            assert_eq!(cams.len(), 1, "a refused save created a camera");
+            (cams[0].name.clone(), cams[0].behavior.parking_policy_v2)
+        }
+        let (app, store, _dir) = build_test_router(None).await;
+        store_default_camera(&store, true).await;
+        let saved = snapshot_parked(store.list_cameras().await.unwrap()[0].clone());
+        store.upsert_camera(&saved).await.unwrap();
+        let (zones, current) = (zone_revision(&saved.zones), parking_revision(&saved));
+        let before = (saved.name.clone(), saved.behavior.parking_policy_v2);
+
+        let mut edit = with_dwell(saved.clone(), 20.0);
+        edit.name = "renamed".into();
+        let stale = Some(parking_revision(&with_dwell(saved.clone(), 5.0)));
+        let put = |camera, zones, parking| {
+            put_camera_expecting_revisions(app.clone(), camera, zones, parking)
+        };
+        let (status, body) = put(edit.clone(), Some(zones.clone()), stale.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "parking_revision_conflict", "parking_revision": current })
+        );
+        assert_eq!(stored(&store).await, before, "a refused save wrote");
+
+        // The zones are checked first.
+        let (status, body) = put(edit.clone(), Some(zone_revision(&[])), stale).await;
+        assert_eq!(body["error"], "zones_revision_conflict", "{body}");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(stored(&store).await, before, "a refused save wrote");
+
+        let (status, body) = put(edit.clone(), Some(zones), Some(current)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            stored(&store).await,
+            (edit.name.clone(), edit.behavior.parking_policy_v2)
+        );
+
+        let edit = with_dwell(edit, 30.0);
+        let (status, body) = put(edit.clone(), None, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let after = (edit.name.clone(), edit.behavior.parking_policy_v2);
+        assert_eq!(stored(&store).await, after);
+
+        let mut missing = edit.clone();
+        missing.id += 1;
+        let (status, body) = put(missing, None, Some(parking_revision(&edit))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "parking_revision_conflict", "parking_revision": null })
+        );
+        assert_eq!(stored(&store).await, after, "a refused save wrote");
+    }
+
+    /// SPEC-077 — the parking expectation is checked inside the same save
+    /// lock: a policy-only save another writer commits while this one waits
+    /// for the lock is seen, so the waiting save conflicts instead of
+    /// overwriting it, though the zones revision it expects still holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parking_revision_expectation_is_checked_inside_the_save_lock() {
+        use nexus_pipeline::zone_application::{parking_revision, zone_revision};
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let mine = snapshot_parked(store.list_cameras().await.unwrap()[0].clone());
+        store.upsert_camera(&mine).await.unwrap();
+        let theirs = with_dwell(mine.clone(), 20.0);
+        let frame_stats = state.frame_stats.clone();
+        let registry = frame_stats.zone_application();
+        let app = super::router(state);
+
+        // Another writer is mid-save, holding the lock (for reading, so the
+        // save queued behind it shows: a queued writer makes `try_read` fail).
+        let other = registry.saves().read().await;
+        let save = tokio::spawn(put_camera_expecting_revisions(
+            app.clone(),
+            mine.clone(),
+            Some(zone_revision(&mine.zones)),
+            Some(parking_revision(&mine)),
+        ));
+        while registry.saves().try_read().is_ok() && !save.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        store.upsert_camera(&theirs).await.unwrap();
+        drop(other);
+
+        let (status, body) = save.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": "parking_revision_conflict",
+                "parking_revision": parking_revision(&theirs),
+            })
+        );
+        assert_eq!(
+            store.list_cameras().await.unwrap()[0]
+                .behavior
+                .parking_policy_v2,
+            theirs.behavior.parking_policy_v2,
+            "the queued save overwrote the parking settings saved ahead of it"
+        );
+    }
+
     /// SPEC-088 review 11 — a failed read of the saved zones is no answer.
     /// While the store cannot list the cameras, every camera's stats, one with
     /// frames and one without, carry a `read_error` receipt, never an omitted
@@ -9773,10 +10320,11 @@ mod tests {
             let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
             (status, serde_json::from_slice(&bytes).unwrap_or_default())
         }
-        /// The single read's `zones_runtime`, and the batch row's.
+        /// The single read's `key` receipt, and the batch row's.
         async fn receipts(
             app: &axum::Router,
             id: nexus_types::CameraId,
+            key: &str,
         ) -> (serde_json::Value, serde_json::Value) {
             let (status, one) = get(app, &format!("/api/v1/cameras/{id}/stats")).await;
             assert_eq!(status, StatusCode::OK, "camera {id}: {one}");
@@ -9785,9 +10333,11 @@ mod tests {
             let row = all
                 .as_array()
                 .and_then(|rows| rows.iter().find(|r| r["camera_id"] == id))
-                .map_or(serde_json::Value::Null, |r| r["zones_runtime"].clone());
-            (one["zones_runtime"].clone(), row)
+                .map_or(serde_json::Value::Null, |r| r[key].clone());
+            (one[key].clone(), row)
         }
+        // SPEC-077 — the parking receipt fails its read the same way.
+        const KEYS: [&str; 2] = ["zones_runtime", "parking_runtime"];
 
         let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
         store_default_camera(&store, true).await;
@@ -9813,16 +10363,19 @@ mod tests {
             .execute(store.pool())
             .await
             .expect("make the saved cameras unreadable");
-        assert_eq!(
-            receipts(&app, id).await,
-            (read_error.clone(), read_error.clone()),
-            "a camera with frames hid the failed read"
-        );
-        assert_eq!(
-            receipts(&app, frameless).await.0,
-            read_error,
-            "a camera with no frame, saved or not, cannot be told apart while the read fails"
-        );
+        for key in KEYS {
+            assert_eq!(
+                receipts(&app, id, key).await,
+                (read_error.clone(), read_error.clone()),
+                "{key}: a camera with frames hid the failed read"
+            );
+            assert_eq!(
+                receipts(&app, frameless, key).await.0,
+                read_error,
+                "{key}: a camera with no frame, saved or not, cannot be told apart while the \
+                 read fails"
+            );
+        }
 
         sqlx::query("ALTER TABLE cameras_away RENAME TO cameras")
             .execute(store.pool())
@@ -9841,23 +10394,23 @@ mod tests {
         .execute(store.pool())
         .await
         .expect("give it a codec this build cannot read");
-        let (one, row) = receipts(&app, id).await;
-        assert_eq!(one, row, "the batch and the single read disagree");
-        assert_eq!(
-            (&one["state"], &one["desired_revision"]),
-            (
-                &json!("applying"),
-                &json!(nexus_pipeline::zone_application::zone_revision(
-                    &camera.zones
-                ))
-            ),
-            "the receipt did not recover with the store: {one}"
-        );
-        assert_eq!(
-            receipts(&app, frameless).await,
-            (read_error.clone(), read_error),
-            "a row this build cannot read hid the failed read"
-        );
+        for (key, desired) in KEYS.into_iter().zip([
+            nexus_pipeline::zone_application::zone_revision(&camera.zones),
+            nexus_pipeline::zone_application::parking_revision(&camera),
+        ]) {
+            let (one, row) = receipts(&app, id, key).await;
+            assert_eq!(one, row, "{key}: the batch and the single read disagree");
+            assert_eq!(
+                (&one["state"], &one["desired_revision"]),
+                (&json!("applying"), &json!(desired)),
+                "{key}: the receipt did not recover with the store: {one}"
+            );
+            assert_eq!(
+                receipts(&app, frameless, key).await,
+                (read_error.clone(), read_error.clone()),
+                "{key}: a row this build cannot read hid the failed read"
+            );
+        }
     }
 
     /// An admin JSON request from a loopback peer; its status.

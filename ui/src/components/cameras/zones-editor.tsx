@@ -56,12 +56,15 @@ export function ZonesEditor({
   cameraId,
   isNew,
   zones,
+  parking,
   onChange,
   onSketchingChange,
 }: {
   cameraId: number;
   isNew: boolean;
   zones: ZoneConfig[];
+  /** The engine reports parking (SPEC-077): offer the parking kind. */
+  parking: boolean;
   onChange: (zones: ZoneConfig[]) => void;
   /** Whether a polygon is being drawn with at least one vertex: an unsaved edit. */
   onSketchingChange: (sketching: boolean) => void;
@@ -596,6 +599,7 @@ export function ZonesEditor({
                 <option value="inclusion">inclusion</option>
                 <option value="exclusion">exclusion</option>
                 <option value="dwell">dwell</option>
+                {parking || z.kind === "parking" ? <option value="parking">parking</option> : null}
               </select>
               <span className="font-mono text-[10px] text-muted-foreground">
                 {z.polygon.length} pt

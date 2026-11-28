@@ -38,14 +38,22 @@ export function createCamera(camera: CameraConfig): Promise<CameraConfig> {
 /// use `createCamera`. SPEC-088 — with `expectedZonesRevision` the
 /// engine saves only while the stored zones still have that revision;
 /// otherwise it answers 409 `zones_revision_conflict` and writes nothing.
+/// SPEC-077 — `expectedParkingRevision` does the same for the parking
+/// settings, checked after it, with 409 `parking_revision_conflict`.
 export function updateCamera(
   camera: CameraConfig,
   expectedZonesRevision?: string,
+  expectedParkingRevision?: string,
 ): Promise<CameraConfig> {
   return api.put<CameraConfig>(
     `/cameras/${encodeURIComponent(String(camera.id))}`,
     camera,
-    { query: { expected_zones_revision: expectedZonesRevision } },
+    {
+      query: {
+        expected_zones_revision: expectedZonesRevision,
+        expected_parking_revision: expectedParkingRevision,
+      },
+    },
   );
 }
 
@@ -56,11 +64,12 @@ export function updateCamera(
 export function upsertCamera(
   camera: CameraConfig,
   expectedZonesRevision?: string,
+  expectedParkingRevision?: string,
 ): Promise<CameraConfig> {
   if (!camera.id || camera.id <= 0) {
     return createCamera(camera);
   }
-  return updateCamera(camera, expectedZonesRevision);
+  return updateCamera(camera, expectedZonesRevision, expectedParkingRevision);
 }
 
 export function deleteCamera(id: number): Promise<void> {

@@ -36,7 +36,7 @@ import type {
   ModelOverride,
   ModelPromptsCatalog,
   ModelPromptsEntry,
-  ZoneConfig,
+  ParkingPolicyV2,
 } from "@/api/types";
 import { DecodeVerdictChip } from "@/components/DecodeVerdictChip";
 import { Badge, type BadgeProps } from "@/components/ui/badge";
@@ -62,11 +62,11 @@ import { detectorInputFor, supervisorDimsFor } from "@/lib/supervisor-frame";
 import {
   deriveZoneApplication,
   isDenied,
-  isZonesRevisionConflict,
   markZoneSave,
   nextAcceptanceSeq,
   parseConfigSnapshot,
   receiptGeneration,
+  revisionConflict,
   zoneApplicationPollMs,
   zoneSaveSeq,
   type AcceptanceEpoch,
@@ -76,6 +76,7 @@ import {
   type ZoneApplication,
   type ZoneDraftState,
 } from "@/lib/zone-application";
+import { PARKING_FIELDS, parkingProblem } from "@/lib/zone-geometry";
 import { ZonesEditor } from "@/components/cameras/zones-editor";
 
 // ---------------------------------------------------------------------------
@@ -199,71 +200,122 @@ function restartQuery(
 }
 
 /**
- * The zone side of the editor. `synced` is the zones array the draft last
- * matched, installed from a snapshot (`base` = its revision) or sent in a
- * save (`base` = null): the draft's zones are dirty when they are another
- * array. `installed` is the snapshot shown, with the acceptance seq of its
+ * What the zone status certifies: the zones and, where the engine reports
+ * parking (SPEC-077), the parking-lot mode and v2 policy with them.
+ */
+type ZoneTuple = Pick<CameraConfig, "zones" | "parking_lot_mode" | "parking_policy_v2">;
+
+const pickParking = ({ parking_lot_mode, parking_policy_v2 }: ZoneTuple) => ({ parking_lot_mode, parking_policy_v2 });
+const tupleOf = (c: ZoneTuple): ZoneTuple => ({ zones: c.zones, ...pickParking(c) });
+
+/** The policy by reference, as an edit replaces it. */
+const sameParking = (a: ZoneTuple, b: ZoneTuple) =>
+  (a.parking_lot_mode ?? false) === (b.parking_lot_mode ?? false) && a.parking_policy_v2 === b.parking_policy_v2;
+
+/** Whether `draft` holds other Parking zones or another v2 policy than `base`, by value. */
+const parkingEdited = (draft: ZoneTuple, base: ZoneTuple) => {
+  const parking = (t: ZoneTuple) =>
+    JSON.stringify([(t.zones ?? []).filter((z) => z.kind === "parking"), t.parking_policy_v2 ?? null]);
+  return parking(draft) !== parking(base);
+};
+
+/** The zones by reference, as an edit replaces them; parking counts only where reported. */
+const sameTuple = (a: ZoneTuple, b: ZoneTuple, parking: boolean) =>
+  a.zones === b.zones && (!parking || sameParking(a, b));
+
+/** A snapshot's tuple; one without parking leaves `draft`'s parking fields as they are. */
+const snapshotTuple = ({ settings }: CameraConfigSnapshot, draft: ZoneTuple): ZoneTuple => ({
+  zones: settings.zones,
+  parking_lot_mode: settings.parking ? settings.parking.parking_lot_mode : draft.parking_lot_mode,
+  parking_policy_v2: settings.parking ? (settings.parking.parking_policy_v2 ?? undefined) : draft.parking_policy_v2,
+});
+
+/**
+ * The zone side of the editor. `synced` is the tuple the draft last
+ * matched, installed from a snapshot (`base` = its zone revision,
+ * `parkingBase` its parking revision) or sent in a save (both null): the
+ * draft is dirty when it holds another zones array or parking value.
+ * `installed` is the snapshot shown, with the acceptance seq of its
  * installation; `awaiting` a settled save whose snapshot is not installed
- * yet; `generation` the newest supervisor generation read here. The latest
- * save start or end is per camera, outside the editor (`zoneSaveSeq`).
+ * yet; `generation` the newest supervisor generation read here, and
+ * `parkingGeneration` the newest of the parking receipt's own (SPEC-077).
+ * The latest save start or end is per camera, outside the editor
+ * (`zoneSaveSeq`).
  */
 type ZoneView = {
-  synced: ZoneConfig[] | undefined;
+  synced: ZoneTuple;
   base: string | null;
+  parkingBase: string | null;
   installed: { read: Tagged<CameraConfigSnapshot>; seq: number } | null;
   savedAt: number | null;
   awaiting: boolean;
   generation: number;
+  parkingGeneration: number;
 };
 
-type Saved = { camera: CameraConfig; zones: ZoneConfig[] | undefined; revision: string | null };
+type Saved = { camera: CameraConfig; tuple: ZoneTuple; revision: string | null; parkingRevision: string | null };
 
 /**
  * The camera as saved, read again just before a save: whole from the camera
- * list and, with `zones`, its zones with their revision from the config
- * snapshot, read first. When that read fails (a role that may save but not
- * read it, say) the zones are the listed ones, with no revision. Throws when
- * the list cannot be read. The save expects the snapshot's revision, so
- * another save landing after this read is refused (409), never overwritten.
- * The list gives no revision to expect: that save is unconditional, as
- * before, and still overwrites one landing after it, as does a save landing
- * after the list read in any field outside the zones.
+ * list and, with `zones`, its zones and parking settings with their
+ * revisions from the config snapshot, read first (one without parking
+ * leaves `draft`'s parking fields as they are). When that read fails (a
+ * role that may save but not read it, say) they are the listed ones, with
+ * no revision. Throws when the list cannot be read. The save expects the
+ * snapshot's zones and parking revisions, so another zone or parking save
+ * landing after this read is refused (409), never overwritten. The list
+ * gives no revision to expect: that save is unconditional, as before, and
+ * still overwrites one landing after it, as does a save landing after the
+ * list read in any other field.
  */
-async function rereadSaved(cameraId: number, zones: boolean): Promise<Saved> {
+async function rereadSaved(cameraId: number, zones: boolean, draft: ZoneTuple): Promise<Saved> {
   let snap: CameraConfigSnapshot | null = null;
   if (zones) {
     try {
       snap = parseConfigSnapshot(await getCameraConfigSnapshot(cameraId));
     } catch {
-      // The listed zones stand in, with no revision.
+      // The listed zones and parking settings stand in, with no revision.
     }
   }
   const camera = (await listCameras()).find((c) => c.id === cameraId);
   if (!camera) throw new Error(`camera ${cameraId} is not listed`);
   return snap
-    ? { camera, zones: snap.settings.zones, revision: snap.zones_revision }
-    : { camera, zones: camera.zones, revision: null };
+    ? {
+        camera,
+        tuple: snapshotTuple(snap, draft),
+        revision: snap.zones_revision,
+        parkingRevision: snap.parking_revision ?? null,
+      }
+    : { camera, tuple: tupleOf(camera), revision: null, parkingRevision: null };
 }
 
 /**
  * `theirs` with every field `mine` changed from `base` (by value), and
- * `mine`'s zones, which the zone view tracks by identity.
+ * `mine`'s zones and, with `parking`, its parking settings, which the zone
+ * view tracks by identity. A field equal to `theirs` keeps `mine`'s.
  */
-function rebase(mine: CameraConfig, base: CameraConfig, theirs: CameraConfig): CameraConfig {
-  const edited = Object.entries(mine).filter(
-    ([k, v]) => k === "zones" || JSON.stringify(v) !== JSON.stringify(base[k as keyof CameraConfig]),
+function rebase(mine: CameraConfig, base: CameraConfig, theirs: CameraConfig, parking: boolean): CameraConfig {
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const kept = Object.entries(mine).filter(
+    ([k, v]) =>
+      k === "zones" ||
+      (parking && (k === "parking_lot_mode" || k === "parking_policy_v2")) ||
+      !same(v, base[k as keyof CameraConfig]) ||
+      same(v, theirs[k as keyof CameraConfig]),
   );
-  return { ...theirs, ...Object.fromEntries(edited) };
+  return { ...theirs, ...Object.fromEntries(kept) };
 }
 
-/** A zone view with nothing read, showing `zones`. */
-const unreadZoneView = (zones: ZoneConfig[] | undefined): ZoneView => ({
-  synced: zones,
+/** A zone view with nothing read, showing `camera`'s zones and parking settings. */
+const unreadZoneView = (camera: ZoneTuple): ZoneView => ({
+  synced: tupleOf(camera),
   base: null,
+  parkingBase: null,
   installed: null,
   savedAt: null,
   awaiting: false,
   generation: -1,
+  parkingGeneration: -1,
 });
 
 const APPLICATION_BADGE: Record<
@@ -305,6 +357,82 @@ function ZoneApplicationStatus({ application: a }: { application: ZoneApplicatio
         {a.kind === "applied" && a.appliedAt ? `Applied ${clock(a.appliedAt)} · ` : ""}
         {a.readAt !== null ? `Last read ${clock(a.readAt)}` : "No successful read yet"}
       </p>
+    </div>
+  );
+}
+
+/** Opted in with nothing filled: the operator enters every value (SPEC-077 has no default). */
+const UNFILLED_POLICY: ParkingPolicyV2 = {
+  dwell_secs: NaN,
+  max_speed_box_diagonals_per_sec: NaN,
+  max_displacement_box_diagonals: NaN,
+  max_observation_gap_secs: NaN,
+};
+
+/**
+ * SPEC-077 — the explicit opt-in to parking zones and their v2 stillness
+ * policy, shown only where the engine reports parking. What runs without it
+ * is said plainly, and `problem` says why a save would be refused.
+ */
+function ParkingZonesPolicy({
+  draft,
+  problem,
+  onChange,
+}: {
+  draft: CameraConfig;
+  problem: string | null;
+  onChange: (policy: ParkingPolicyV2 | undefined) => void;
+}) {
+  const policy = draft.parking_policy_v2;
+  return (
+    <div className="space-y-2 rounded-md border border-border p-2.5 text-xs">
+      <label className="inline-flex items-center gap-2 text-sm">
+        <input
+          type="checkbox"
+          checked={policy !== undefined}
+          onChange={(e) => onChange(e.target.checked ? UNFILLED_POLICY : undefined)}
+          className="h-4 w-4 rounded border-border"
+        />
+        Use parking zones (v2)
+      </label>
+      <p className="text-muted-foreground">
+        {policy !== undefined
+          ? "Only vehicles standing still inside a parking zone are suppressed. Every value is required; none is filled in for you."
+          : draft.parking_lot_mode === true
+            ? "Off: parking-lot mode suppresses still vehicles anywhere in the camera view (the legacy static filter)."
+            : "Off, and parking-lot mode is off too: no vehicle is suppressed as parked."}
+      </p>
+      {policy !== undefined ? (
+        <div className="grid gap-2 sm:grid-cols-2">
+          {PARKING_FIELDS.map(({ key, id, label }) => (
+            <div key={key} className="flex flex-col gap-1">
+              <Label htmlFor={id} className="text-xs text-muted-foreground">
+                {label}
+              </Label>
+              <Input
+                id={id}
+                type="number"
+                min={0}
+                step="any"
+                inputMode="decimal"
+                className="h-8"
+                // A number, so React leaves a half-typed "0.0" alone.
+                value={Number.isFinite(policy[key]) ? policy[key] : ""}
+                onChange={(e) => onChange({ ...policy, [key]: e.target.valueAsNumber })}
+              />
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {problem ? (
+        <p
+          role="alert"
+          data-testid="parking-problem"
+          className="rounded-md border border-destructive/50 bg-destructive/10 px-2 py-1 text-destructive"
+        >
+          {problem}
+        </p>
+      ) : null}
     </div>
   );
 }
@@ -465,30 +593,32 @@ export function CameraEditor({
   // acceptance epoch; only a stats request begun after it can certify them.
   // The draft stays the full-config write base: a save sends it whole, with
   // the zones on screen, and nothing from the snapshot but its zones.
-  const [zoneView, setZoneView] = useState<ZoneView>(() => unreadZoneView(camera.zones));
+  const [zoneView, setZoneView] = useState<ZoneView>(() => unreadZoneView(camera));
 
   // The save, its fence and its post-save snapshot read outlive this editor:
   // a reopened one sees the save pending, and its settling refreshes it.
   const mutation = useMutation({
     mutationKey: saveKey(camera.id),
-    mutationFn: ({ cfg, expected }: { cfg: CameraConfig; expected?: string }) =>
-      upsertCamera(cfg, expected),
+    mutationFn: ({ cfg, expected, expectedParking }: { cfg: CameraConfig; expected?: string; expectedParking?: string }) =>
+      upsertCamera(cfg, expected, expectedParking),
     onMutate: () => markZoneSave(camera.id),
     onSuccess: () => {
       if (!isNew) toast.success("Camera saved");
       onSaved(isNew);
     },
-    // A refused save is never retried: the saved zones it raced are read
-    // again on settling, rebasing a clean view or showing an edit as
-    // changed elsewhere, and the operator saves again.
-    onError: (e: unknown) =>
+    // A refused save is never retried: the saved zones and parking settings
+    // it raced are read again on settling, rebasing a clean view or showing
+    // an edit as changed elsewhere, and the operator saves again.
+    onError: (e: unknown) => {
+      const raced = revisionConflict(e);
       setError(
-        isZonesRevisionConflict(e)
-          ? "Not saved: someone else saved this camera's zones since they were last read here, so nothing was changed. Check the zones and save again."
+        raced
+          ? `Not saved: someone else saved this camera's ${raced} since they were last read here, so nothing was changed. Check the ${raced} and save again.`
           : e instanceof Error
             ? e.message
             : String(e),
-      ),
+      );
+    },
     // A failed PUT may still have committed: read what is saved either way.
     onSettled: () => {
       markZoneSave(camera.id);
@@ -513,9 +643,17 @@ export function CameraEditor({
   });
   // A polygon being drawn is an edit too, though not yet in the draft.
   const [sketching, setSketching] = useState(false);
+  // The engine reports parking (SPEC-077): its snapshot carries the parking
+  // settings, which the zone status then certifies with the zones.
+  const parkingShown = zoneView.installed?.read.body.parking_revision !== undefined;
+  // The installed snapshot stopped carrying parking (a core rollback): the
+  // parking controls are gone, so a parking edit made before is held: never
+  // sent, and an unsaved change until discarded or parking is reported again.
+  const parkingHeld = zoneView.installed !== null && !parkingShown && parkingEdited(draft, zoneView.synced);
   // Install a snapshot read begun after the latest save; a clean view shows
-  // its zones, a dirty edit keeps the operator's. A sketch holds it until
-  // finished or cancelled: it joins the zones it was drawn over, never newer.
+  // its zones and parking settings, a dirty edit keeps the operator's. A
+  // sketch holds it until finished or cancelled: it joins the zones it was
+  // drawn over, never newer.
   const snap = snapQ.data;
   if (
     snap &&
@@ -524,21 +662,36 @@ export function CameraEditor({
     !sketching &&
     snap.seq > zoneSaveSeq(camera.id)
   ) {
-    const clean = draft.zones === zoneView.synced;
+    // Parking counts where either snapshot reports it: a parking-mode edit
+    // made during the first read is kept, not overwritten by that read. A
+    // held parking edit is never taken as synced: `synced` keeps the saved
+    // parking the save guard compares it with, across reads without parking.
+    const clean =
+      !parkingHeld && sameTuple(draft, zoneView.synced, parkingShown || snap.body.parking_revision !== undefined);
+    const tuple = snapshotTuple(snap.body, draft);
     setZoneView((v) => ({
       ...v,
       installed: { read: snap, seq: nextAcceptanceSeq() },
       awaiting: false,
-      ...(clean ? { synced: snap.body.settings.zones, base: snap.body.zones_revision } : {}),
+      ...(clean
+        ? { synced: tuple, base: snap.body.zones_revision, parkingBase: snap.body.parking_revision ?? null }
+        : {}),
     }));
-    if (clean) setDraft((d) => ({ ...d, zones: snap.body.settings.zones }));
+    if (clean) setDraft((d) => ({ ...d, ...tuple }));
   }
 
-  const sentZones = mutation.isPending ? mutation.variables?.cfg.zones : zoneView.synced;
+  const sent = mutation.isPending && mutation.variables ? mutation.variables.cfg : zoneView.synced;
   const zoneDraft: ZoneDraftState = {
     phase:
-      sketching || draft.zones !== sentZones ? "dirty" : saving ? "saving" : zoneView.awaiting ? "saved" : "clean",
+      sketching || parkingHeld || !sameTuple(draft, sent, parkingShown)
+        ? "dirty"
+        : saving
+          ? "saving"
+          : zoneView.awaiting
+            ? "saved"
+            : "clean",
     base: zoneView.base,
+    parkingBase: zoneView.parkingBase,
     awaiting: zoneView.awaiting,
   };
   const saved: SavedSnapshot = {
@@ -548,6 +701,7 @@ export function CameraEditor({
   const epoch: AcceptanceEpoch = {
     seq: Math.max(zoneSaveSeq(camera.id), zoneView.installed?.seq ?? 0),
     generation: zoneView.generation,
+    parkingGeneration: zoneView.parkingGeneration,
   };
   const zonePollMs = (read: ReceiptRead & { error: unknown }) =>
     zoneApplicationPollMs(
@@ -572,10 +726,15 @@ export function CameraEditor({
     retry: false,
     refetchOnWindowFocus: (q) => (zonePollMs(q.state) === false ? false : "always"),
   });
-  const readGeneration =
-    statsQ.data?.body.camera_id === camera.id ? receiptGeneration(statsQ.data.body) : undefined;
-  if (readGeneration !== undefined && readGeneration > zoneView.generation) {
-    setZoneView((v) => (readGeneration > v.generation ? { ...v, generation: readGeneration } : v));
+  const readBody = statsQ.data?.body.camera_id === camera.id ? statsQ.data.body : undefined;
+  const readGeneration = receiptGeneration(readBody) ?? -1;
+  const readParkingGeneration = receiptGeneration(readBody, "parking_runtime") ?? -1;
+  if (readGeneration > zoneView.generation || readParkingGeneration > zoneView.parkingGeneration) {
+    setZoneView((v) => ({
+      ...v,
+      generation: Math.max(v.generation, readGeneration),
+      parkingGeneration: Math.max(v.parkingGeneration, readParkingGeneration),
+    }));
   }
   const application = deriveZoneApplication(saved, statsQ, zoneDraft, epoch);
   const pollMs = zoneApplicationPollMs(application, [statsQ.error, snapQ.error], zoneView.savedAt);
@@ -633,7 +792,7 @@ export function CameraEditor({
     onvifEndpointTouched.current = Boolean(base.onvif?.endpoint);
     setDraft(base);
     setError(null);
-    setZoneView(unreadZoneView(base.zones));
+    setZoneView(unreadZoneView(base));
     if (changed) {
       restartQuery(qc, snapshotKey(camera.id));
       restartQuery(qc, statsKey(camera.id));
@@ -676,32 +835,47 @@ export function CameraEditor({
       setError("URL is required.");
       return;
     }
-    // The save replaces the camera's zones whole, expecting the revision of
-    // the saved zones it replaces, so a save from elsewhere it has not read
-    // is refused (409), never overwritten. Unedited zones go out as saved
-    // now, not as last read here, so an unrelated edit never reverts another
-    // operator's newer zones; they expect their re-read revision (see
-    // `rereadSaved`). Edited zones, a drawing in progress included (it
-    // freezes the zones it was drawn over), are sent as shown, expecting the
-    // latest snapshot read here since the latest save, installed or held by
-    // the drawing: once one has read another operator's save, the status
-    // says the zones changed elsewhere and saving replaces them knowingly.
-    // With no snapshot read, nothing is expected. Every other field the
-    // draft has not changed from the write base goes out as saved now too,
-    // so a save never reverts another operator's change to a field not
-    // edited here.
+    // A held parking edit is not sent. Unchanged saved parking zones and
+    // policy still pass through.
+    if (parkingHeld) {
+      setError("Not saved: this core no longer reports parking zones. Discard the parking changes or reload.");
+      return;
+    }
+    const problem = parkingProblem(draft);
+    if (problem) {
+      setError(`Not saved: ${problem}`);
+      return;
+    }
+    // The save replaces the camera's zones and parking settings whole,
+    // expecting the zones and parking revisions it replaces, both from one
+    // snapshot read (no parking revision where the snapshot has none), so a
+    // zone or parking save from elsewhere it has not read is refused (409),
+    // never overwritten. Unedited ones go
+    // out as saved now, not as last read here, so an unrelated edit never
+    // reverts another operator's newer ones; they expect their re-read
+    // revision (see `rereadSaved`). Edited ones, a drawing in progress
+    // included (it freezes the zones it was drawn over), are sent as shown,
+    // expecting the latest snapshot read here since the latest save,
+    // installed or held by the drawing: once one has read another operator's
+    // save, the status says they changed elsewhere and saving replaces them
+    // knowingly. With no snapshot read, nothing is expected. Every other
+    // field the draft has not changed from the write base goes out as saved
+    // now too, so a save never reverts another operator's change to a field
+    // not edited here.
     let cfg = draft;
     const read = snap && snap.seq > zoneSaveSeq(camera.id) ? snap : zoneView.installed?.read;
     let expected = read?.body.zones_revision;
+    let expectedParking = read?.body.parking_revision;
+    const parkingClean = sameParking(draft, zoneView.synced);
     if (!isNew) {
-      const zonesClean = !sketching && draft.zones === zoneView.synced;
+      const tupleClean = !sketching && draft.zones === zoneView.synced.zones && (parkingClean || !parkingShown);
       // An access reset during the re-read (it marks a zone save) dropped
       // this draft: the save is dropped too, with nothing sent or reported.
       const fence = zoneSaveSeq(camera.id);
       setChecking(true);
       let saved: Saved;
       try {
-        saved = await rereadSaved(camera.id, zonesClean);
+        saved = await rereadSaved(camera.id, tupleClean, draft);
       } catch (err) {
         if (zoneSaveSeq(camera.id) !== fence) return;
         setError(
@@ -713,36 +887,42 @@ export function CameraEditor({
         setChecking(false);
       }
       if (zoneSaveSeq(camera.id) !== fence) return;
-      cfg = rebase(draft, writeBase.current, saved.camera);
-      if (zonesClean) {
-        const { zones, revision } = saved;
+      cfg = rebase(draft, writeBase.current, saved.camera, parkingShown);
+      if (tupleClean) {
+        const { tuple, revision, parkingRevision } = saved;
         expected = revision ?? undefined;
+        expectedParking = parkingRevision ?? undefined;
         const changed =
           revision !== null
-            ? revision !== zoneView.base
-            : JSON.stringify(zones) !== JSON.stringify(draft.zones);
+            ? revision !== zoneView.base || parkingRevision !== zoneView.parkingBase
+            : JSON.stringify(tuple) !== JSON.stringify(tupleOf(draft));
         if (changed) {
-          cfg = { ...cfg, zones };
-          setZoneView((v) => ({ ...v, synced: zones, base: revision }));
-          setDraft((d) => (d.zones === draft.zones ? { ...d, zones } : d));
+          // Where the engine reports no parking, parking-lot mode is a plain
+          // field, rebased as the others are.
+          const next = parkingShown ? tuple : { ...tuple, ...pickParking(cfg) };
+          cfg = { ...cfg, ...next };
+          setZoneView((v) => ({ ...v, synced: next, base: revision, parkingBase: parkingRevision }));
+          setDraft((d) => (sameTuple(d, draft, true) ? { ...d, ...next } : d));
         }
       }
     }
-    mutation.mutate({ cfg, expected }, {
+    mutation.mutate({ cfg, expected, expectedParking }, {
       // Not called once `resetSave` fenced the save. The PUT answer carries
-      // no revision and its zones are not applied: the post-save snapshot
-      // and a fresh receipt decide. Outside the zones it is the write base
-      // now, and every field not typed in since the save began shows it;
-      // typing since then stays.
+      // no revision and its zones (and parking settings, where the engine
+      // reports parking) are not applied: the post-save snapshot and a fresh
+      // receipt decide. Outside them it is the write base now, and every
+      // field not typed in since the save began shows it; typing since then
+      // stays.
       onSuccess: (saved, { cfg }) => {
         writeBase.current = saved;
-        setDraft((d) => rebase(d, draft, saved));
+        setDraft((d) => rebase(d, draft, saved, parkingShown));
         setZoneView((v) => ({
           ...v,
           savedAt: Date.now(),
           awaiting: true,
-          synced: cfg.zones,
+          synced: tupleOf(cfg),
           base: null,
+          parkingBase: null,
         }));
       },
     });
@@ -1339,9 +1519,17 @@ export function CameraEditor({
             cameraId={draft.id}
             isNew={isNew}
             zones={draft.zones ?? []}
+            parking={parkingShown}
             onChange={(z) => set("zones", z)}
             onSketchingChange={setSketching}
           />
+          {parkingShown ? (
+            <ParkingZonesPolicy
+              draft={draft}
+              problem={parkingProblem(draft)}
+              onChange={(p) => set("parking_policy_v2", p)}
+            />
+          ) : null}
         </SheetSection>
 
         {!isNew ? (
