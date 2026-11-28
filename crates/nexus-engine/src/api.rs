@@ -1922,7 +1922,7 @@ async fn commit_camera_write<G>(
     // SPEC-077 — and its parking tuple, which a policy-only save changes.
     s.frame_stats.parking_application().request(
         id,
-        &nexus_pipeline::zone_application::parking_revision(&cam),
+        &nexus_pipeline::zone_application::parking_revision(cam),
         cam.ingest.enabled,
     );
     drop(saving);
