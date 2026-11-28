@@ -957,9 +957,10 @@ impl Controller {
         if was_observed && !self.observed {
             // Rollback: legacy takes the open clip over, its post-roll from now;
             // with none open, its first frame opens one for still-live motion,
-            // which links the alerts a failed observed open held.
+            // which links the alerts a failed observed open held. A failed
+            // open's demand stands too: an alert-only one has no live track.
             self.post_roll = PostRoll::new(self.cfg.post_roll_secs);
-            self.pending_open = self.clip.is_none() && self.live;
+            self.pending_open = self.clip.is_none() && (self.pending_open || self.live);
             if !self.pending_open {
                 self.pending_links.clear();
             }

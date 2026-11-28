@@ -2757,6 +2757,44 @@ mod controller {
         assert_eq!(c.linked(&event).await, Some(2), "linked on legacy's open");
     }
 
+    /// PR #406, Codex P1: as above, but the refused open was for an
+    /// alert-only frame (no live track). The failed open's demand outlives
+    /// the rollback: legacy's next frame, quiet, still opens and links it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rollback_keeps_an_alert_only_failed_open_and_its_link() {
+        let mut c = observed_and_quiet(1, 0).await;
+        let t = c.elapsed_ms();
+        let event = c.event(t).await;
+        c.rec.set_panic(true);
+        let alerted = Motion {
+            alerts: 1,
+            ..quiet()
+        };
+        let refused = c
+            .frame_within(t, AnalysisOutcome::Success, 1, alerted, LONG)
+            .await
+            .unwrap();
+        assert_eq!(
+            (refused.clip.is_none(), refused.error),
+            (true, Some(RecordingError::Refused))
+        );
+        let held = c.alert(t, &event).await;
+        assert_eq!(
+            (held.clip.is_none(), held.error),
+            (true, Some(RecordingError::Refused))
+        );
+        c.send(
+            RecordingCommand::PolicyChanged(None, "rev-legacy".into()),
+            LONG,
+        )
+        .await
+        .unwrap();
+        c.rec.set_panic(false);
+        let opened = c.frame(t + 200, quiet()).await;
+        assert_eq!(clip_id(&opened), Some(2), "{:#?}", c.rec.calls());
+        assert_eq!(c.linked(&event).await, Some(2), "linked on legacy's open");
+    }
+
     /// PR #406, Codex P1: a legacy frame ends its post-roll while carrying
     /// an alert (alert recording off), so its close waits for the alert to
     /// link. A switch to observed lands between the two: observed now owns
