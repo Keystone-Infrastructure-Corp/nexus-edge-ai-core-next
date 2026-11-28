@@ -495,7 +495,7 @@ impl Store {
         error: &str,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        let camera_id: Option<CameraId> = sqlx::query_scalar(
+        let camera_id: CameraId = sqlx::query_scalar(
             "UPDATE alert_clips
                 SET cold_attempts = cold_attempts + 1,
                     cold_last_attempt_at = ?,
@@ -507,22 +507,21 @@ impl Store {
         .bind(error)
         .bind(id)
         .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("alert_clip id={id}")))?;
+        let failed = DeliveryCounters {
+            failure_count: 1,
+            ..DeliveryCounters::default()
+        };
+        add_to_bucket(
+            self,
+            &mut tx,
+            camera_id,
+            RecordingSource::Alert,
+            now,
+            &failed,
+        )
         .await?;
-        if let Some(camera_id) = camera_id {
-            let failed = DeliveryCounters {
-                failure_count: 1,
-                ..DeliveryCounters::default()
-            };
-            add_to_bucket(
-                self,
-                &mut tx,
-                camera_id,
-                RecordingSource::Alert,
-                now,
-                &failed,
-            )
-            .await?;
-        }
         tx.commit().await?;
         Ok(())
     }

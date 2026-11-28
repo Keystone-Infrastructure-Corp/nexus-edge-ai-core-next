@@ -15,7 +15,7 @@ use chrono::{DateTime, Duration, SecondsFormat, TimeZone, Utc};
 use nexus_config::{CameraConfig, StoreConfig};
 use nexus_store::{
     AlertClipColdMark, ClipClose, ClipColdMark, DeliveryCounters, DeliveryWindow, NewAlertClip,
-    NewClip, QueuePartition, RecordingDeliverySnapshot, RecordingSource, Store,
+    NewClip, QueuePartition, RecordingDeliverySnapshot, RecordingSource, Store, StoreError,
 };
 use tempfile::TempDir;
 use url::Url;
@@ -887,6 +887,32 @@ async fn recording_delivery_keeps_an_ordinary_loss_when_the_upload_fails_after_e
         ),
         (0, 1_000, 1)
     );
+}
+
+/// PR #404 Codex P1: an alert PUT that fails after `delete_camera` cascaded
+/// its row away reports the vanished row as `NotFound`, like the ordinary
+/// failure path, so the uploader records an accounting gap for the counted
+/// attempt.
+#[tokio::test]
+async fn recording_delivery_reports_an_alert_failure_whose_row_vanished() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let alert = alert_clip(&store, 1, Utc::now() - Duration::minutes(5)).await;
+    store
+        .mark_alert_clip_ready(alert, 5_000, 40, Some(&"b".repeat(64)))
+        .await
+        .unwrap();
+    store
+        .record_upload_attempt(RecordingSource::Alert, alert, Utc::now(), 40)
+        .await
+        .unwrap();
+    store.delete_camera(1).await.unwrap();
+    assert!(matches!(
+        store
+            .record_alert_clip_cold_failure(alert, Utc::now(), "put failed")
+            .await,
+        Err(StoreError::NotFound(_))
+    ));
 }
 
 /// Codex review 10: the loss is taken back from the minute that counted the
