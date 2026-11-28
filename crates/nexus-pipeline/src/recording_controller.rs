@@ -297,7 +297,9 @@ pub struct RecordingControl {
 
 impl RecordingControl {
     /// Send `command` and wait for its receipt, all within `timeout`. A
-    /// receipt from another generation is refused.
+    /// receipt from another generation is refused. A command that times out
+    /// before a full queue takes it is still delivered, in order: it may
+    /// carry the only Born or Died of a track.
     pub async fn request(
         &self,
         command: RecordingCommand,
@@ -309,15 +311,22 @@ impl RecordingControl {
             command,
             reply,
         };
-        let receipt = tokio::time::timeout(timeout, async {
-            self.tx
-                .send(request)
-                .await
-                .map_err(|_| RecordingError::Stopped)?;
-            receipt.await.map_err(|_| RecordingError::Stopped)
-        })
-        .await
-        .map_err(|_| RecordingError::Timeout(timeout))??;
+        let tx = self.tx.clone();
+        // Boxed so a timed-out send can move to a task without leaving its
+        // place in the channel's FIFO queue of waiting senders.
+        let mut send = Box::pin(async move { tx.send(request).await });
+        let deadline = tokio::time::Instant::now() + timeout;
+        match tokio::time::timeout_at(deadline, &mut send).await {
+            Ok(sent) => sent.map_err(|_| RecordingError::Stopped)?,
+            Err(_) => {
+                tokio::spawn(send);
+                return Err(RecordingError::Timeout(timeout));
+            }
+        }
+        let receipt = tokio::time::timeout_at(deadline, receipt)
+            .await
+            .map_err(|_| RecordingError::Timeout(timeout))?
+            .map_err(|_| RecordingError::Stopped)?;
         if receipt.generation != self.generation {
             return Err(RecordingError::StaleGeneration {
                 sent: self.generation,
@@ -1313,9 +1322,9 @@ async fn sleep(wait: Option<Duration>) {
 /// Persist what a traced state finished. A summary the store refuses is
 /// reported on the camera's diagnostics, not retried: the trace says it has
 /// a gap.
-// shortcut: awaited on the controller like motion rows (at most a minute row and a clip row per change), move off-loop if store latency ever delays recorder decisions.
+// shortcut: awaited on the controller like motion rows (a minute row per minute crossed and a clip row per change), move off-loop if store latency ever delays recorder decisions.
 async fn persist(store: &Store, shadow: &ShadowRecording, writes: ShadowWrites) {
-    if let Some(minute) = writes.minute {
+    for minute in writes.minutes {
         if let Err(e) = store.insert_recording_activity_minute(&minute).await {
             shadow.collector_failed(format!("minute summary not saved: {e}"));
         }

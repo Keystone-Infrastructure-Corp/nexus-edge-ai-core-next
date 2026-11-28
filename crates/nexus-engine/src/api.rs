@@ -9076,7 +9076,7 @@ mod tests {
             false,
             Some(clip.clip_id),
         );
-        assert!(writes.minute.is_none() && writes.episode.is_none());
+        assert!(writes.minutes.is_empty() && writes.episode.is_none());
 
         let mut got = activity(&app, id).await.expect("a shadow camera reports");
         // Ages and elapsed time count from the frame to the read.

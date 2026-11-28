@@ -1920,6 +1920,53 @@ mod controller {
         );
     }
 
+    /// A command produced while a wedged close has filled the command queue
+    /// times out for its requester but is not lost: the Born it carries
+    /// reaches the controller once the close ends, and legacy opens a clip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_born_sent_into_a_full_queue_still_opens_its_clip() {
+        let mut cfg = config(None);
+        cfg.post_roll_secs = 0;
+        let mut c = cam(cfg, 0, false, true).await;
+        assert!(c.frame(0, live(true)).await.clip.is_some());
+        let closing = c
+            .frame_within(500, AnalysisOutcome::Success, 0, quiet(), SHORT)
+            .await;
+        assert_eq!(closing.unwrap_err(), RecordingError::Timeout(SHORT));
+        let (mono, wall) = c.clock(1_000);
+        let fill: Vec<_> = (0..rc::COMMAND_CAPACITY)
+            .map(|_| {
+                let control = c.control.clone();
+                let arrived = c.producer.arrived(mono, wall);
+                tokio::spawn(async move {
+                    control
+                        .request(RecordingCommand::Evidence(arrived), SHORT)
+                        .await
+                })
+            })
+            .collect();
+        tokio::time::sleep(SHORT / 2).await;
+        let born = c.producer.analysed(
+            mono,
+            wall,
+            AnalysisOutcome::Success,
+            EvidenceCounts::default(),
+            Some(live(true)),
+        );
+        assert_eq!(
+            c.send(RecordingCommand::Evidence(born), SHORT)
+                .await
+                .unwrap_err(),
+            RecordingError::Timeout(SHORT),
+            "the queue is full behind the close"
+        );
+        for f in fill {
+            let _ = f.await.unwrap();
+        }
+        c.rec.closes.add_permits(FREE);
+        c.until(5, "opened 2").await;
+    }
+
     /// A stop that lands while an open is in flight waits for it and
     /// finalizes the clip it produced before it answers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -349,6 +349,15 @@ impl RecordingDiagnostics {
         self.elapsed
     }
 
+    /// Time as credited through `at_ms` in the current state, without crediting it.
+    fn elapsed_at(&self, at_ms: u64) -> Elapsed {
+        let mut elapsed = self.elapsed;
+        if let Some(state) = self.state {
+            elapsed.add(state, at_ms.saturating_sub(self.credited_ms));
+        }
+        elapsed
+    }
+
     /// The retained transitions, oldest first.
     pub fn transitions(&self) -> impl Iterator<Item = &Transition> {
         self.ring.iter()
@@ -356,10 +365,7 @@ impl RecordingDiagnostics {
 
     pub fn snapshot(&self, now_ms: u64) -> DiagnosticsSnapshot {
         let now = now_ms.max(self.credited_ms);
-        let mut elapsed = self.elapsed;
-        if let Some(state) = self.state {
-            elapsed.add(state, now - self.credited_ms);
-        }
+        let elapsed = self.elapsed_at(now);
         let age = |t: Option<u64>| t.map(|t| now.saturating_sub(t));
         DiagnosticsSnapshot {
             legacy_open: self.state.is_some_and(|s| s.legacy_open),
@@ -577,7 +583,7 @@ struct Episode {
 /// Summaries a frame finished, for the supervisor to persist.
 #[derive(Debug, Default)]
 pub struct ShadowWrites {
-    pub minute: Option<RecordingActivityMinute>,
+    pub minutes: Vec<RecordingActivityMinute>,
     pub episode: Option<RecordingActivityEpisode>,
 }
 
@@ -922,16 +928,25 @@ impl ShadowRecording {
         match self.minute {
             // Forward only: a minute index is written once.
             Some((current, started)) if traced && index > current => {
-                // Closed at its own end; this frame counts in the next one.
-                let counters = shared.diagnostics.take_minute((current + 1) * MINUTE_MS);
-                writes.minute = Some(minute_row(
-                    self.camera_id,
-                    self.generation,
-                    &shared.policy_revision,
-                    current,
-                    started,
-                    &counters,
-                ));
+                // Each minute crossed is closed at its own end, a stall's
+                // too; this frame counts in the last one.
+                for minute in current..index {
+                    let counters = shared.diagnostics.take_minute((minute + 1) * MINUTE_MS);
+                    let started = if minute == current {
+                        started
+                    } else {
+                        captured_at
+                            - chrono::Duration::milliseconds((at - minute * MINUTE_MS) as i64)
+                    };
+                    writes.minutes.push(minute_row(
+                        self.camera_id,
+                        self.generation,
+                        &shared.policy_revision,
+                        minute,
+                        started,
+                        &counters,
+                    ));
+                }
                 self.minute = Some((index, captured_at));
             }
             None => self.minute = Some((index, captured_at)),
@@ -983,8 +998,8 @@ impl ShadowRecording {
         }
 
         if self.episode.as_ref().map(|e| e.clip_id) != writer_clip {
-            // shortcut: a rotation at a wake that traces nothing splits the clips' elapsed at the latest traced time, not at the rotation; defer the episode row until the trace passes it if per-clip splits must be exact.
-            let elapsed = d.elapsed().legacy_open;
+            // A rotation at a wake that traced nothing splits at the rotation, not the latest trace.
+            let elapsed = d.elapsed_at(at).legacy_open;
             writes.episode = self.episode.take().map(|e| {
                 episode_row(
                     self.camera_id,
@@ -1030,16 +1045,18 @@ impl ShadowRecording {
                 elapsed,
             )
         });
-        writes.minute = self.minute.take().map(|(index, started)| {
-            minute_row(
-                self.camera_id,
-                self.generation,
-                &shared.policy_revision,
-                index,
-                started,
-                &minute,
-            )
-        });
+        writes
+            .minutes
+            .extend(self.minute.take().map(|(index, started)| {
+                minute_row(
+                    self.camera_id,
+                    self.generation,
+                    &shared.policy_revision,
+                    index,
+                    started,
+                    &minute,
+                )
+            }));
         writes
     }
 
@@ -1415,12 +1432,13 @@ mod tests {
                 clip,
             )
         };
-        let quiet = |w: &ShadowWrites| w.minute.is_none() && w.episode.is_none();
+        let quiet = |w: &ShadowWrites| w.minutes.is_empty() && w.episode.is_none();
         assert!(quiet(&frame(0, None)));
         assert!(quiet(&frame(30_000, Some(1))), "legacy opened clip 1");
         // Legacy rotated to clip 2 in a new minute; analysis was never healthy.
-        let w = frame(61_000, Some(2));
-        let minute = w.minute.unwrap();
+        let mut w = frame(61_000, Some(2));
+        let minute = w.minutes.pop().unwrap();
+        assert!(w.minutes.is_empty());
         assert_eq!(
             (minute.camera_id, minute.generation, minute.minute),
             (3, 9, 0)
@@ -1454,7 +1472,7 @@ mod tests {
             r#"{"activity":0,"post_roll":0,"degraded_coverage":31000,"quiet":0}"#
         );
         let w = frame(62_000, None);
-        assert!(w.minute.is_none());
+        assert!(w.minutes.is_empty());
         assert!(w
             .episode
             .unwrap()
@@ -1462,7 +1480,9 @@ mod tests {
             .contains(r#""degraded_coverage":1000"#));
         let w = s.finish();
         assert!(w.episode.is_none(), "legacy already closed");
-        let last = w.minute.unwrap();
+        let [last] = &w.minutes[..] else {
+            panic!("{:?}", w.minutes)
+        };
         assert_eq!(last.minute, 1);
         let counters: serde_json::Value = serde_json::from_str(&last.counters_json).unwrap();
         assert_eq!(
@@ -1788,7 +1808,7 @@ mod tests {
             let t = s.next_minute().unwrap();
             s.tick(t);
             let wall = w0 + chrono::Duration::from_std(t - t0).unwrap();
-            rows.extend(s.record(t, wall, None, false).minute);
+            rows.extend(s.record(t, wall, None, false).minutes);
         }
         let degraded: Vec<_> = rows
             .iter()
@@ -1802,6 +1822,86 @@ mod tests {
             .collect();
         let minute = Some(MINUTE_MS);
         assert_eq!(degraded, [(0, minute), (1, minute), (2, minute)]);
+    }
+
+    /// A controller stalled past more than one minute's end (a recorder
+    /// close that blocks it) still writes a row for every minute crossed,
+    /// each credited only its own time.
+    #[test]
+    fn a_trace_that_jumps_minutes_writes_each_minute_crossed() {
+        let registry = RecordingActivityRegistry::default();
+        let policy = RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 60_000,
+        };
+        let mut s =
+            ShadowRecording::start(&registry, 3, 9, Some(policy), "rev-9", "iou-naive", 1, 0)
+                .unwrap();
+        let (t0, w0) = (Instant::now(), Utc::now());
+        let failed = AnalysisOutcome::Failed;
+        s.frame(t0, w0, failed, EvidenceCounts::default(), false, None);
+        let t = t0 + std::time::Duration::from_millis(2 * MINUTE_MS + 30_000);
+        s.tick(t);
+        let wall = w0 + chrono::Duration::from_std(t - t0).unwrap();
+        let mut rows = s.record(t, wall, None, false).minutes;
+        rows.extend(s.finish().minutes);
+        let degraded: Vec<_> = rows
+            .iter()
+            .map(|m| {
+                let c: serde_json::Value = serde_json::from_str(&m.counters_json).unwrap();
+                (
+                    m.minute,
+                    m.started_at_ms - w0.timestamp_millis(),
+                    c["elapsed"]["legacy_closed"]["degraded_coverage"].as_u64(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            degraded,
+            [
+                (0, 0, Some(MINUTE_MS)),
+                (1, MINUTE_MS as i64, Some(MINUTE_MS)),
+                (2, 2 * MINUTE_MS as i64 + 30_000, Some(30_000)),
+            ]
+        );
+    }
+
+    /// A rotation at a wake that traces nothing (the writer and policy
+    /// states are unchanged) credits the old clip through the rotation, and
+    /// the new clip only from there.
+    #[test]
+    fn a_rotation_at_an_untraced_wake_splits_elapsed_at_the_rotation() {
+        let registry = RecordingActivityRegistry::default();
+        let policy = RecordingPolicyConfig {
+            mode: RecordingPolicyMode::Shadow,
+            analysis_stale_after_ms: 60_000,
+        };
+        let mut s =
+            ShadowRecording::start(&registry, 3, 9, Some(policy), "rev-9", "iou-naive", 1, 0)
+                .unwrap();
+        let (t0, w0) = (Instant::now(), Utc::now());
+        let at = |ms: u64| {
+            (
+                t0 + std::time::Duration::from_millis(ms),
+                w0 + chrono::Duration::milliseconds(ms as i64),
+            )
+        };
+        let failed = AnalysisOutcome::Failed;
+        s.frame(t0, w0, failed, EvidenceCounts::default(), false, Some(1));
+        let (t, wall) = at(5_000);
+        s.tick(t);
+        let old = s.record(t, wall, Some(2), false).episode.unwrap();
+        assert_eq!(
+            old.elapsed_json,
+            r#"{"activity":0,"post_roll":0,"degraded_coverage":5000,"quiet":0}"#
+        );
+        let (t, wall) = at(8_000);
+        s.tick(t);
+        let new = s.record(t, wall, None, false).episode.unwrap();
+        assert_eq!(
+            new.elapsed_json,
+            r#"{"activity":0,"post_roll":0,"degraded_coverage":3000,"quiet":0}"#
+        );
     }
 
     /// Evidence captured in a minute already cut, here by the stale wake at
