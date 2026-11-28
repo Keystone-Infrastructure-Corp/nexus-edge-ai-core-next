@@ -593,6 +593,10 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/cameras/{id}",
             put(upsert_camera).delete(delete_camera),
         )
+        .route(
+            "/v1/admin/cameras/{camera_id}/recording-policy",
+            put(put_camera_recording_policy),
+        )
         // SPEC-088 — the camera's zones bound to their revision, read-only,
         // behind the same gate as the camera list.
         .route(
@@ -964,6 +968,10 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/cloud/status", get(cloud_status))
         .route("/v1/cameras", get(list_cameras).post(create_camera))
         .route("/v1/cameras/{id}", put(upsert_camera).delete(delete_camera))
+        .route(
+            "/v1/cameras/{id}/recording-policy",
+            put(put_camera_recording_policy),
+        )
         .route("/v1/cameras/{id}/frames/latest", get(get_latest_frame_jpeg))
         .route(
             "/v1/cameras/{id}/frames/latest.json",
@@ -1707,7 +1715,6 @@ async fn upsert_camera(
     validate_analysis_url(&cam.ingest)?;
     cam.validate_finite()
         .map_err(|why| ApiError(StatusCode::BAD_REQUEST, why))?;
-    let resource_id = id.to_string();
     // SPEC-088 — no other save commits, and no read requests, between this
     // commit and the request below, so the registry sees saves in order.
     let saving = s.frame_stats.zone_application().saves().write().await;
@@ -1741,8 +1748,86 @@ async fn upsert_camera(
     }
     let before = cameras.into_iter().find(|c| c.id == id);
     compare_and_set_recording_policy(before.as_ref(), &mut cam, expected.as_deref())?;
-    let after_str = camera_audit_json(&cam);
-    let before_str = before.as_ref().and_then(camera_audit_json);
+    commit_camera_write(
+        &s,
+        &headers,
+        peer,
+        session.as_ref(),
+        before.as_ref(),
+        &cam,
+        saving,
+    )
+    .await?;
+    Ok(Json(cam).into_response())
+}
+
+/// Body of `PUT /cameras/{id}/recording-policy`: the policy alone, with the
+/// same compare-and-set revision a camera write takes.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordingPolicyWrite {
+    #[serde(default)]
+    recording_policy: Option<nexus_config::RecordingPolicyConfig>,
+    #[serde(default)]
+    expected_recording_policy_revision: Option<String>,
+}
+
+/// SPEC-089 — `PUT /cameras/{id}/recording-policy`: replace only the stored
+/// camera's `recording_policy`, under the same save lock and compare-and-set
+/// as `upsert_camera`, so a field another operator saved after the caller's
+/// read is never written back. Answers the saved camera, as the camera PUT.
+async fn put_camera_recording_policy(
+    State(s): State<ApiState>,
+    Path(id): Path<CameraId>,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    session: Option<crate::auth::require_role::SessionContext>,
+    Json(write): Json<RecordingPolicyWrite>,
+) -> Result<Response, ApiError> {
+    let saving = s.frame_stats.zone_application().saves().write().await;
+    let (cameras, unreadable) = s.store.list_readable_cameras().await?;
+    if unreadable.contains(&id) {
+        return Err(recording_policy_conflict());
+    }
+    let Some(before) = cameras.into_iter().find(|c| c.id == id) else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "camera not found".into()));
+    };
+    let mut cam = before.clone();
+    cam.behavior.recording_policy = write.recording_policy;
+    compare_and_set_recording_policy(
+        Some(&before),
+        &mut cam,
+        write.expected_recording_policy_revision.as_deref(),
+    )?;
+    commit_camera_write(
+        &s,
+        &headers,
+        peer,
+        session.as_ref(),
+        Some(&before),
+        &cam,
+        saving,
+    )
+    .await?;
+    Ok(Json(cam).into_response())
+}
+
+/// Commit a camera write made under `saving` (the SPEC-088 save lock) with
+/// its audit row, request its zones, release the lock and tell the
+/// reconciler, which applies the saved row to the running pipeline.
+async fn commit_camera_write<G>(
+    s: &ApiState,
+    headers: &HeaderMap,
+    peer: SocketAddr,
+    session: Option<&crate::auth::require_role::SessionContext>,
+    before: Option<&CameraConfig>,
+    cam: &CameraConfig,
+    saving: G,
+) -> Result<(), ApiError> {
+    let id = cam.id;
+    let resource_id = id.to_string();
+    let after_str = camera_audit_json(cam);
+    let before_str = before.and_then(camera_audit_json);
     // M6 Phase 4 Step 4.1 (tx-merge) — the domain mutation
     // and the success audit row commit together in one SQLite
     // tx. If the audit write fails, the tx drops and the camera
@@ -1750,12 +1835,12 @@ async fn upsert_camera(
     // be missing a row for a mutation that actually landed.
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
-        s.store.upsert_camera_tx(&mut tx, &cam).await?;
+        s.store.upsert_camera_tx(&mut tx, cam).await?;
         crate::auth::admin_audit::audit_admin_action_in_tx(
             &s.store,
             &mut tx,
-            session.as_ref(),
-            &headers,
+            session,
+            headers,
             peer.ip(),
             "camera.upsert",
             "camera",
@@ -1773,8 +1858,8 @@ async fn upsert_camera(
         // if the in-tx audit was what failed above.
         crate::auth::admin_audit::audit_admin_action(
             &s.store,
-            session.as_ref(),
-            &headers,
+            session,
+            headers,
             peer.ip(),
             "camera.upsert",
             "camera",
@@ -1805,7 +1890,7 @@ async fn upsert_camera(
             &serde_json::json!({ "kind": "camera", "action": "upsert", "camera_id": id }),
         )
         .await;
-    Ok(Json(cam).into_response())
+    Ok(())
 }
 
 /// `POST /cameras` — create a new camera with a server-assigned
@@ -10229,6 +10314,124 @@ mod tests {
             after,
             "an unchanged policy keeps its revision"
         );
+    }
+
+    /// SPEC-089 — the policy-only write: a rename another operator saved
+    /// after this writer's read survives; a stale revision is a 409 that
+    /// changes nothing; an unknown camera is a 404; the answer is the saved
+    /// camera with the new policy and revision; the local route matches; and
+    /// `recording_policy_write_v1` and the cloud's camera `settings.write`
+    /// mapping both stand behind it.
+    #[tokio::test]
+    async fn a_policy_only_write_keeps_a_concurrent_rename() {
+        use nexus_cloud_client::actor_token::{EnvelopeContext, VerifiedActor};
+        const SECRET: &[u8] = b"recording-policy-write-secret";
+        let (app, _store, _dir) = build_test_router(Some(SECRET)).await;
+        let token = sign_admin_jwt(SECRET);
+        let (id, read) = create_policy_camera(&app, &token).await;
+        let r0 = revision(&read);
+        let policy_uri = format!("/api/v1/admin/cameras/{id}/recording-policy");
+        let policy = |mode: &str, expected: &str| {
+            serde_json::json!({
+                "recording_policy": { "mode": mode },
+                "expected_recording_policy_revision": expected,
+            })
+        };
+
+        // Another operator renames the camera after this writer's read.
+        let mut renamed = read.clone();
+        renamed["name"] = "renamed by another operator".into();
+        let uri = format!("/api/v1/admin/cameras/{id}");
+        let (status, _) = send_camera(&app, &token, Method::PUT, &uri, renamed, None).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (status, body) = send_camera(
+            &app,
+            &token,
+            Method::PUT,
+            &policy_uri,
+            policy("shadow", &r0),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let after = listed_camera(&app, &token, id).await;
+        assert_eq!(after["name"], "renamed by another operator");
+        assert_eq!(after["recording_policy"]["mode"], "shadow");
+        let r1 = revision(&after);
+        assert_ne!(r1, r0);
+        assert_eq!(body, after, "the answer is the saved camera");
+
+        // The old revision is stale: 409, nothing changes, locally too.
+        for uri in [
+            policy_uri.clone(),
+            format!("/api/v1/cameras/{id}/recording-policy"),
+        ] {
+            let refused = send_camera(
+                &app,
+                &token,
+                Method::PUT,
+                &uri,
+                policy("observed", &r0),
+                None,
+            )
+            .await;
+            assert_eq!(refused, policy_conflict(), "{uri}");
+        }
+        assert_eq!(listed_camera(&app, &token, id).await, after);
+        let (status, _) = send_camera(
+            &app,
+            &token,
+            Method::PUT,
+            &format!("/api/v1/cameras/{id}/recording-policy"),
+            policy("observed", &r1),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            listed_camera(&app, &token, id).await["recording_policy"]["mode"],
+            "observed"
+        );
+
+        // An unknown camera, and a full camera body, are refused.
+        let (status, _) = send_camera(
+            &app,
+            &token,
+            Method::PUT,
+            "/api/v1/admin/cameras/999999/recording-policy",
+            policy("shadow", &r0),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) =
+            send_camera(&app, &token, Method::PUT, &policy_uri, after.clone(), None).await;
+        assert!(status.is_client_error(), "{status}");
+
+        assert!(crate::cloud_tunnel::heartbeat_caps(None, false, false)
+            .iter()
+            .any(|c| c == "recording_policy_write_v1"));
+        let allows = |perm: &str| {
+            VerifiedActor {
+                sub: "human".into(),
+                role: "viewer".into(),
+                perm: Some(perm.into()),
+                jti: "jti".into(),
+                org_id: "org".into(),
+                actor_org_id: None,
+            }
+            .allows_rpc(
+                EnvelopeContext {
+                    method: "PUT",
+                    path: "/admin/cameras/7/recording-policy",
+                },
+                Some(br#"{"recording_policy":{"mode":"observed"}}"#),
+                false,
+            )
+        };
+        assert!(allows("settings.write"));
+        assert!(!allows("settings.read"));
     }
 
     /// SPEC-089 R-9 — two policy changes made from one read: exactly one

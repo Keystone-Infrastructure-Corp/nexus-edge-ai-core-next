@@ -326,7 +326,7 @@ fn camera_rpc_permissions(method: &str, tail: &[&str]) -> &'static [&'static str
         ("GET", ["talk-down"]) => &["settings.read", "live.talkdown"],
         ("PUT", ["talk-down"])
         | ("PUT" | "DELETE", [])
-        | ("PUT", ["imaging" | "encoder"])
+        | ("PUT", ["imaging" | "encoder" | "recording-policy"])
         | ("PUT", ["network", "safe"])
         | ("PUT", ["deviceio", "relays"])
         | ("POST", ["device"])
