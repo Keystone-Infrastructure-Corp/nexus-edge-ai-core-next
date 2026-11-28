@@ -1275,10 +1275,7 @@ impl Store {
             Some(lost)
         };
         if let Some(r) = counted {
-            let delivered = DeliveryCounters {
-                delivered_bytes: payload_bytes.unwrap_or_else(|| r.get(1)).max(0),
-                ..DeliveryCounters::default()
-            };
+            let delivered = DeliveryCounters::delivered(payload_bytes.unwrap_or_else(|| r.get(1)));
             add_to_bucket(
                 self,
                 &mut tx,

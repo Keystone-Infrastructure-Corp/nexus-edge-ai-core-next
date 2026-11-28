@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS recording_minute_buckets (
     generated_unknown_size_count INTEGER NOT NULL DEFAULT 0,
     recorded_ms                  INTEGER NOT NULL DEFAULT 0,
     delivered_bytes              INTEGER NOT NULL DEFAULT 0,
+    delivered_unknown_size_count INTEGER NOT NULL DEFAULT 0,
     attempted_bytes              INTEGER NOT NULL DEFAULT 0,
     retry_count                  INTEGER NOT NULL DEFAULT 0,
     failure_count                INTEGER NOT NULL DEFAULT 0,
@@ -64,6 +65,16 @@ CREATE TABLE IF NOT EXISTS motion_clip_evictions (
 );
 CREATE INDEX IF NOT EXISTS motion_clip_evictions_by_time
     ON motion_clip_evictions (evicted_at);
+-- Camera deletion cascades alert rows away too, `acct_evicted_at` with
+-- them, so their losses are kept here the same way.
+CREATE TABLE IF NOT EXISTS alert_clip_evictions (
+    clip_id    INTEGER PRIMARY KEY,
+    camera_id  INTEGER NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    evicted_at TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS alert_clip_evictions_by_time
+    ON alert_clip_evictions (evicted_at);
 -- Cold transfers started per clip, counted in the transaction that counts
 -- the attempt. `cold_attempts` grows only on a recorded failure, so a
 -- transfer cut short by a restart would leave no trace and the next one

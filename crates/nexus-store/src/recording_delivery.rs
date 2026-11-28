@@ -382,6 +382,8 @@ pub struct DeliveryCounters {
     pub recorded_ms: i64,
     /// Bytes of clips whose cold copy was durably recorded.
     pub delivered_bytes: i64,
+    /// Delivered clips whose size was unknown (not in `delivered_bytes`).
+    pub delivered_unknown_size_count: i64,
     /// Bytes handed to a transfer, retries included, whatever the outcome.
     pub attempted_bytes: i64,
     /// Transfers of a clip that had started a transfer or failed before.
@@ -400,6 +402,7 @@ impl DeliveryCounters {
         self.generated_unknown_size_count += o.generated_unknown_size_count;
         self.recorded_ms += o.recorded_ms;
         self.delivered_bytes += o.delivered_bytes;
+        self.delivered_unknown_size_count += o.delivered_unknown_size_count;
         self.attempted_bytes += o.attempted_bytes;
         self.retry_count += o.retry_count;
         self.failure_count += o.failure_count;
@@ -412,6 +415,14 @@ impl DeliveryCounters {
             generated_bytes: size_bytes.max(0),
             generated_unknown_size_count: i64::from(size_bytes <= 0),
             recorded_ms: duration_ms.max(0),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn delivered(size_bytes: i64) -> Self {
+        Self {
+            delivered_bytes: size_bytes.max(0),
+            delivered_unknown_size_count: i64::from(size_bytes <= 0),
             ..Self::default()
         }
     }
@@ -494,15 +505,17 @@ pub(crate) async fn add_to_bucket(
         "INSERT INTO recording_minute_buckets
              (minute_utc, camera_id, source_kind, generated_bytes,
               generated_unknown_size_count, recorded_ms, delivered_bytes,
-              attempted_bytes, retry_count, failure_count,
-              evicted_before_upload_bytes, evicted_before_upload_count)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              delivered_unknown_size_count, attempted_bytes, retry_count,
+              failure_count, evicted_before_upload_bytes, evicted_before_upload_count)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (minute_utc, camera_id, source_kind) DO UPDATE SET
              generated_bytes = generated_bytes + excluded.generated_bytes,
              generated_unknown_size_count =
                  generated_unknown_size_count + excluded.generated_unknown_size_count,
              recorded_ms = recorded_ms + excluded.recorded_ms,
              delivered_bytes = delivered_bytes + excluded.delivered_bytes,
+             delivered_unknown_size_count =
+                 delivered_unknown_size_count + excluded.delivered_unknown_size_count,
              attempted_bytes = attempted_bytes + excluded.attempted_bytes,
              retry_count = retry_count + excluded.retry_count,
              failure_count = failure_count + excluded.failure_count,
@@ -518,6 +531,7 @@ pub(crate) async fn add_to_bucket(
     .bind(d.generated_unknown_size_count)
     .bind(d.recorded_ms)
     .bind(d.delivered_bytes)
+    .bind(d.delivered_unknown_size_count)
     .bind(d.attempted_bytes)
     .bind(d.retry_count)
     .bind(d.failure_count)
@@ -530,14 +544,15 @@ pub(crate) async fn add_to_bucket(
         .bind(cutoff)
         .execute(&mut *conn)
         .await?;
-    // An ordinary eviction's loss record goes with the bucket it counted in.
-    sqlx::query("DELETE FROM motion_clip_evictions WHERE evicted_at < ?")
-        .bind(
-            DateTime::<Utc>::from_timestamp(cutoff, 0)
-                .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true)),
-        )
-        .execute(&mut *conn)
-        .await?;
+    // An eviction's loss record goes with the bucket it counted in.
+    let cutoff_at = DateTime::<Utc>::from_timestamp(cutoff, 0)
+        .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true));
+    for table in ["motion_clip_evictions", "alert_clip_evictions"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE evicted_at < ?"))
+            .bind(&cutoff_at)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -578,8 +593,9 @@ pub(crate) async fn take_back_loss(
 }
 
 const COUNTER_SUMS: &str = "SUM(generated_bytes), SUM(generated_unknown_size_count),
-    SUM(recorded_ms), SUM(delivered_bytes), SUM(attempted_bytes), SUM(retry_count),
-    SUM(failure_count), SUM(evicted_before_upload_bytes), SUM(evicted_before_upload_count)";
+    SUM(recorded_ms), SUM(delivered_bytes), SUM(delivered_unknown_size_count),
+    SUM(attempted_bytes), SUM(retry_count), SUM(failure_count),
+    SUM(evicted_before_upload_bytes), SUM(evicted_before_upload_count)";
 
 impl Store {
     /// SPEC-090 — notice a wall-clock discontinuity: the wall clock moved
@@ -751,12 +767,16 @@ impl Store {
     /// Count `camera_id`'s undelivered queue (at or after the enrollment
     /// floor) as evicted before upload, in the caller's transaction: a
     /// camera delete's FK cascade removes those clips without the evictors.
+    /// Each loss is recorded as the evictors record theirs, so a transfer
+    /// that completes after the cascade still takes it back.
     pub(crate) async fn record_camera_loss(
         &self,
         conn: &mut SqliteConnection,
         camera_id: CameraId,
     ) -> Result<(), StoreError> {
         let floor = self.eviction_floor().await;
+        let now = Utc::now();
+        let now_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
         for source in [RecordingSource::Ordinary, RecordingSource::Alert] {
             let g = source.gates();
             let (bytes, count): (i64, i64) = sqlx::query_as(&format!(
@@ -774,8 +794,31 @@ impl Store {
                     evicted_before_upload_count: count,
                     ..DeliveryCounters::default()
                 };
-                add_to_bucket(self, conn, camera_id, source, Utc::now(), &lost).await?;
+                add_to_bucket(self, conn, camera_id, source, now, &lost).await?;
             }
+            // The cascade drops the rows a late completion would mark, so
+            // each loss is kept as the evictors keep theirs: the queue's,
+            // and an alert's already recorded in `acct_evicted_at`.
+            let (evictions, earlier) = match source {
+                RecordingSource::Ordinary => ("motion_clip_evictions", ""),
+                RecordingSource::Alert => (
+                    "alert_clip_evictions",
+                    " UNION ALL SELECT id, camera_id, size_bytes, acct_evicted_at
+                        FROM alert_clips
+                       WHERE camera_id = ?1 AND acct_evicted_at IS NOT NULL",
+                ),
+            };
+            sqlx::query(&format!(
+                "INSERT INTO {evictions} (clip_id, camera_id, size_bytes, evicted_at)
+                 SELECT id, camera_id, size_bytes, ?3 FROM {}
+                  WHERE camera_id = ?1 AND {} AND {}{earlier}",
+                g.table, g.queue, g.after_floor
+            ))
+            .bind(camera_id)
+            .bind(floor.as_deref())
+            .bind(&now_at)
+            .execute(&mut *conn)
+            .await?;
         }
         Ok(())
     }
@@ -962,11 +1005,12 @@ async fn bucket_sums(
             generated_unknown_size_count: r.get(3),
             recorded_ms: r.get(4),
             delivered_bytes: r.get(5),
-            attempted_bytes: r.get(6),
-            retry_count: r.get(7),
-            failure_count: r.get(8),
-            evicted_before_upload_bytes: r.get(9),
-            evicted_before_upload_count: r.get(10),
+            delivered_unknown_size_count: r.get(6),
+            attempted_bytes: r.get(7),
+            retry_count: r.get(8),
+            failure_count: r.get(9),
+            evicted_before_upload_bytes: r.get(10),
+            evicted_before_upload_count: r.get(11),
         };
         let cam = cameras.entry(r.get(0)).or_default();
         let (cam_slot, core_slot) = match r.get::<&str, _>(1) {

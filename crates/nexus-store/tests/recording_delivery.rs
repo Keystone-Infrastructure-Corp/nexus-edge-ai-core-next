@@ -1480,3 +1480,134 @@ async fn recording_delivery_counts_generation_at_finalization_not_last_frame() {
     .unwrap();
     assert_eq!(minute, at(13, 0, 0).timestamp(), "bucketed at finalization");
 }
+
+/// PR #404 review: uploads are in flight when their camera is deleted. The
+/// deletion counts the queue lost and the cascade removes the rows, an
+/// alert clip evicted earlier included; the late completions still count
+/// delivered once and take every loss back. A duplicate changes nothing.
+#[tokio::test]
+async fn recording_delivery_reconciles_camera_deletion_when_uploads_complete_after_it() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let started = Utc::now() - Duration::minutes(5);
+    let clip = closed_clip(&store, 1, started, 1_000, true).await;
+    let queued = alert_clip(&store, 1, started).await;
+    let evicted = alert_clip(&store, 1, started).await;
+    for id in [queued, evicted] {
+        store
+            .mark_alert_clip_ready(id, 5_000, 60, Some(&"b".repeat(64)))
+            .await
+            .unwrap();
+    }
+    store.mark_alert_clip_evicted(evicted).await.unwrap();
+
+    store.delete_camera(1).await.unwrap();
+
+    let now = Utc::now();
+    let mark = cold_mark("c.mp4", now);
+    let alert_mark = AlertClipColdMark {
+        cold_handle: "cold".into(),
+        cold_path: "a.mp4".into(),
+        cold_uploaded_at: now,
+    };
+    store
+        .mark_cold_uploaded(clip, &mark, Some(1_000))
+        .await
+        .unwrap();
+    for id in [queued, evicted] {
+        store
+            .mark_alert_clip_cold_uploaded(id, &alert_mark, Some(60))
+            .await
+            .unwrap();
+    }
+
+    let t = Utc::now() + Duration::minutes(2);
+    let after = store.recording_delivery_stats(|| t, None).await.unwrap();
+    let w = hour(&after);
+    for (c, delivered, what) in [
+        (w.core.ordinary, 1_000, "ordinary"),
+        (w.core.alert, 120, "alert"),
+    ] {
+        assert_eq!(
+            (
+                c.delivered_bytes,
+                c.evicted_before_upload_bytes,
+                c.evicted_before_upload_count
+            ),
+            (delivered, 0, 0),
+            "{what}: delivered after the deletion, so not lost"
+        );
+    }
+
+    assert!(store
+        .mark_cold_uploaded(clip, &mark, Some(1_000))
+        .await
+        .is_err());
+    assert!(store
+        .mark_alert_clip_cold_uploaded(queued, &alert_mark, Some(60))
+        .await
+        .is_err());
+    assert_eq!(
+        store.recording_delivery_stats(|| t, None).await.unwrap(),
+        after,
+        "a duplicate completion changes nothing"
+    );
+}
+
+/// PR #404 review: a completion whose payload size is unknown (no transfer
+/// size and a stored size of 0) counts an unknown-size delivery, never a
+/// known 0-byte one.
+#[tokio::test]
+async fn recording_delivery_counts_an_unknown_delivered_size_explicitly() {
+    let (store, _dir) = fresh_store().await;
+    cold_backend(&store).await;
+    let started = Utc::now() - Duration::minutes(5);
+    let unknown = closed_clip(&store, 1, started, 0, true).await;
+    let known = closed_clip(&store, 1, started, 0, true).await;
+    let alert = alert_clip(&store, 1, started).await;
+    store
+        .mark_alert_clip_ready(alert, 5_000, 0, Some(&"b".repeat(64)))
+        .await
+        .unwrap();
+    let now = Utc::now();
+    store
+        .mark_cold_uploaded(unknown, &cold_mark("u.mp4", now), None)
+        .await
+        .unwrap();
+    store
+        .mark_cold_uploaded(known, &cold_mark("k.mp4", now), Some(700))
+        .await
+        .unwrap();
+    store
+        .mark_alert_clip_cold_uploaded(
+            alert,
+            &AlertClipColdMark {
+                cold_handle: "cold".into(),
+                cold_path: "a.mp4".into(),
+                cold_uploaded_at: now,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+    let snap = store
+        .recording_delivery_stats(|| Utc::now() + Duration::minutes(2), None)
+        .await
+        .unwrap();
+    let w = hour(&snap);
+    assert_eq!(
+        (
+            w.core.ordinary.delivered_bytes,
+            w.core.ordinary.delivered_unknown_size_count
+        ),
+        (700, 1)
+    );
+    assert_eq!(
+        (
+            w.core.alert.delivered_bytes,
+            w.core.alert.delivered_unknown_size_count
+        ),
+        (0, 1)
+    );
+}

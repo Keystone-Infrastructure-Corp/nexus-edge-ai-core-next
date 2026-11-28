@@ -1042,11 +1042,16 @@ async fn upload_alert_clip_one(
     let announce = match cold_url {
         Some(url) => {
             let env = alert_clip_envelope(clip, url.clone());
-            store
+            match store
                 .stamp_alert_clip_announce(clip.id, &url, &env.meta.id)
                 .await
-                .map_err(UploadError::Store)?;
-            Some(env)
+            {
+                Ok(()) => Some(env),
+                // SPEC-090 — camera deleted mid-PUT: no row to announce, but
+                // the mark below still counts the delivery against the loss.
+                Err(nexus_store::StoreError::NotFound(_)) => None,
+                Err(e) => return Err(UploadError::Store(e)),
+            }
         }
         None => None,
     };
@@ -1245,10 +1250,7 @@ async fn upload_one(
 /// SPEC-090 — the payload size of a copy the backend already holds (an
 /// earlier PUT whose completion was never recorded): the hot file it was
 /// written from, which `exists` matched by hash. `None` counts the stored
-/// size instead.
-// shortcut: with the hot file unreadable and the stored size unknown the
-// delivery counts 0 bytes (warned); flagging it as unknown-size needs a
-// bucket column (a migration); add one if this warning is ever seen.
+/// size instead, or an unknown-size delivery when that is unknown too.
 async fn existing_copy_bytes(cfg: &ColdReplicatorConfig, hot_path_rel: &str) -> Option<i64> {
     let abs = cfg.clips_dir.join(hot_path_rel);
     match tokio::fs::metadata(&abs).await {
@@ -2889,6 +2891,117 @@ mod tests {
                 "with_url={with_url}: delivered, so not lost"
             );
         }
+    }
+
+    /// PR #404 review — the camera is deleted (the cascade drops the clip
+    /// rows after counting them lost) while a motion and an alert PUT are in
+    /// flight with blob URLs to announce. Both PUTs land, so both clips
+    /// count delivered and not lost.
+    #[tokio::test]
+    async fn recording_delivery_camera_deleted_mid_upload_counts_delivered_not_lost() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        store.write_cold_replica(Some("mock"), 0).await.unwrap();
+        let alert_id = insert_alert_clip_file(&store, &clips_dir, 1).await;
+        store
+            .mark_alert_clip_ready(alert_id, 1000, 11, Some(&"a".repeat(64)))
+            .await
+            .unwrap();
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+
+        // The alert PUT is held in flight...
+        let alert_backend = MockBackend::new("mock", HealthStatus::Ok);
+        *alert_backend.with_url.lock() = true;
+        let release = Arc::new(Notify::new());
+        let hook_release = release.clone();
+        *alert_backend.first_put_hook.lock() = Some(Box::pin(async move {
+            hook_release.notified().await;
+        }));
+        let registry = Registry::new();
+        registry.replace_all([alert_backend.clone() as Arc<dyn ColdBackend>]);
+        let alert_upload = {
+            let (cfg, store) = (cfg.clone(), store.clone());
+            tokio::spawn(async move { alert_upload_pass(&cfg, &store, &registry).await })
+        };
+        for _ in 0..200 {
+            if !alert_backend.put_paths.lock().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            alert_backend.put_paths.lock().len(),
+            1,
+            "alert put in flight"
+        );
+
+        // ...and the camera is deleted during the motion PUT.
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        *backend.with_url.lock() = true;
+        let deleter = store.clone();
+        *backend.first_put_hook.lock() = Some(Box::pin(async move {
+            deleter.delete_camera(1).await.unwrap();
+        }));
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+        upload_one(
+            &cfg,
+            &store,
+            &*backend,
+            &TokenBucket::new(0),
+            "mock",
+            &clip,
+            None,
+        )
+        .await
+        .unwrap();
+        release.notify_one();
+        alert_upload.await.unwrap();
+
+        let c = hour_counters(&store).await;
+        for (c, delivered, what) in [(c.ordinary, 10, "ordinary"), (c.alert, 11, "alert")] {
+            assert_eq!(
+                (
+                    c.delivered_bytes,
+                    c.evicted_before_upload_bytes,
+                    c.evicted_before_upload_count
+                ),
+                (delivered, 0, 0),
+                "{what}: delivered, so not lost"
+            );
+        }
+    }
+
+    /// PR #404 review — the backend already holds the clip, but neither the
+    /// hot file's size nor the stored size is known: the delivery counts as
+    /// one of unknown size, never as a known 0 bytes.
+    #[tokio::test]
+    async fn recording_delivery_existing_copy_of_unknown_size_counts_unknown() {
+        let (store, clip_id, clips_dir, _dir) = seed_one_pending_clip().await;
+        sqlx::query("UPDATE motion_clips SET size_bytes = 0 WHERE id = ?")
+            .bind(clip_id)
+            .execute(store.pool())
+            .await
+            .unwrap();
+        tokio::fs::remove_file(clips_dir.join("1/clip_0001.mp4"))
+            .await
+            .unwrap();
+        let backend = MockBackend::new("mock", HealthStatus::Ok);
+        backend.existing.lock().insert(format!("1/{clip_id}.mp4"));
+        let clip = store.get_clip(clip_id).await.unwrap().unwrap();
+        let cfg = announce_cfg(clips_dir, Arc::new(TunnelOutbox::new()));
+        upload_one(
+            &cfg,
+            &store,
+            &*backend,
+            &TokenBucket::new(0),
+            "mock",
+            &clip,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let c = hour_counters(&store).await.ordinary;
+        assert_eq!((c.delivered_bytes, c.delivered_unknown_size_count), (0, 1));
     }
 
     /// SPEC-090 — while its PUT is in flight a clip is marked in flight

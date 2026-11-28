@@ -317,7 +317,9 @@ impl Store {
 
     /// [`Store::mark_alert_clip_cold_replicated`] after a transfer of
     /// `payload_bytes`, counted as delivered like
-    /// [`Store::mark_cold_uploaded`]. `None` counts the stored size.
+    /// [`Store::mark_cold_uploaded`]. `None` counts the stored size. A
+    /// clip evicted, or whose camera was deleted, while this transfer was
+    /// in flight is counted delivered once and its loss taken back.
     pub async fn mark_alert_clip_cold_uploaded(
         &self,
         id: AlertClipId,
@@ -325,7 +327,7 @@ impl Store {
         payload_bytes: Option<i64>,
     ) -> Result<(), StoreError> {
         let mut tx = self.pool.begin().await?;
-        let evicted_at: Option<String> = sqlx::query_scalar(
+        let updated: Option<Option<String>> = sqlx::query_scalar(
             "UPDATE alert_clips
                 SET cold_handle = ?, cold_path = ?, cold_uploaded_at = ?
               WHERE id = ?
@@ -336,24 +338,38 @@ impl Store {
         .bind(mark.cold_uploaded_at.to_rfc3339())
         .bind(id)
         .fetch_optional(&mut *tx)
-        .await?
-        .ok_or_else(|| StoreError::NotFound(format!("alert_clip id={id}")))?;
-        let counted = sqlx::query(
-            "UPDATE alert_clips SET acct_delivered = 1, acct_evicted_at = NULL
-              WHERE id = ? AND acct_delivered = 0
-              RETURNING camera_id, size_bytes",
-        )
-        .bind(id)
-        .fetch_optional(&mut *tx)
         .await?;
+        let (counted, evicted_at) = match updated {
+            Some(evicted_at) => {
+                let counted = sqlx::query(
+                    "UPDATE alert_clips SET acct_delivered = 1, acct_evicted_at = NULL
+                      WHERE id = ? AND acct_delivered = 0
+                      RETURNING camera_id, size_bytes",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+                (counted, evicted_at)
+            }
+            // Its camera was deleted mid-transfer: the loss was kept apart.
+            None => {
+                let lost = sqlx::query(
+                    "DELETE FROM alert_clip_evictions WHERE clip_id = ?
+                     RETURNING camera_id, size_bytes, evicted_at",
+                )
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| StoreError::NotFound(format!("alert_clip id={id}")))?;
+                let at = lost.get(2);
+                (Some(lost), Some(at))
+            }
+        };
         if let Some(r) = counted {
             if let Some(at) = evicted_at {
                 take_back_loss(&mut tx, r.get(0), RecordingSource::Alert, &at, r.get(1)).await?;
             }
-            let delivered = DeliveryCounters {
-                delivered_bytes: payload_bytes.unwrap_or_else(|| r.get(1)).max(0),
-                ..DeliveryCounters::default()
-            };
+            let delivered = DeliveryCounters::delivered(payload_bytes.unwrap_or_else(|| r.get(1)));
             add_to_bucket(
                 self,
                 &mut tx,
