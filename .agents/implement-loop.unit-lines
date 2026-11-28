@@ -1,0 +1,11 @@
+TARGET=/tmp/nx-@SLUG@-target-u-edge-@UNIT@
+Rust verifies run inside the worktree as `CARGO_TARGET_DIR="$TARGET" cargo <verify args>`.
+Read AGENTS.md. Keep the supplied base fixed: never rebase or merge, per AGENTS.md's
+unit exception. Cap terminal output.
+A fresh worktree has no node_modules: run `(cd "$WT/ui" && npm ci)` (Node 22) before any
+npm verify. Install Playwright browsers once per machine with
+`npm --prefix "$WT/ui" run e2e:install` before its first E2E run.
+Edge UI E2E: `E2E_PORT=<port> npm --prefix "$WT/ui" run e2e`, following
+.agents/skills/implement-loop/e2e-ownership.md (the top level serializes edge E2E).
+Edge UI unit tests: `npm --prefix "$WT/ui" run test`.
+Report also: skipped gates, assumptions, and open findings.
