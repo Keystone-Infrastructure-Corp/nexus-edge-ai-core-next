@@ -1,10 +1,19 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  focusManager,
+  useIsMutating,
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryClient,
+} from "@tanstack/react-query";
 import {
   AlertTriangle,
   X,
 } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { toast } from "sonner";
 
+import { getCameraConfigSnapshot } from "@/api/admin";
 import {
   attachVisualPrompt,
   detachVisualPrompt,
@@ -16,17 +25,21 @@ import {
 import {
   getCameraStats,
   getStaticObjectDefaults,
+  listCameras,
+  type CameraFrameStats,
 } from "@/api/system";
 import type {
   CameraConfig,
+  CameraConfigSnapshot,
   CameraOnvif,
   CodecKind,
   ModelOverride,
   ModelPromptsCatalog,
   ModelPromptsEntry,
+  ZoneConfig,
 } from "@/api/types";
 import { DecodeVerdictChip } from "@/components/DecodeVerdictChip";
-import { Badge } from "@/components/ui/badge";
+import { Badge, type BadgeProps } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -44,7 +57,25 @@ import {
   decodeSummaryText,
   decodeVerdictPresentation,
 } from "@/lib/decodeCapacity";
+import { useSession } from "@/lib/auth";
 import { detectorInputFor, supervisorDimsFor } from "@/lib/supervisor-frame";
+import {
+  deriveZoneApplication,
+  isDenied,
+  isZonesRevisionConflict,
+  markZoneSave,
+  nextAcceptanceSeq,
+  parseConfigSnapshot,
+  receiptGeneration,
+  zoneApplicationPollMs,
+  zoneSaveSeq,
+  type AcceptanceEpoch,
+  type ReceiptRead,
+  type SavedSnapshot,
+  type Tagged,
+  type ZoneApplication,
+  type ZoneDraftState,
+} from "@/lib/zone-application";
 import { ZonesEditor } from "@/components/cameras/zones-editor";
 
 // ---------------------------------------------------------------------------
@@ -58,16 +89,16 @@ import { ZonesEditor } from "@/components/cameras/zones-editor";
  *
  * Every branch below distinguishes "not read yet" from a real answer: a
  * pending or failed stats request says so rather than rendering Healthy.
+ * The editor owns the stats read, which zone application shares.
  */
-function CameraDecodeSection({ cameraId }: { cameraId: number }) {
+function CameraDecodeSection({
+  stats: s,
+  read,
+}: {
+  stats: CameraFrameStats | undefined;
+  read: boolean;
+}) {
   const [showCounters, setShowCounters] = useState(false);
-  const q = useQuery({
-    queryKey: ["cameras", "stats", cameraId],
-    queryFn: () => getCameraStats(cameraId),
-    refetchInterval: 5_000,
-  });
-  const read = q.isSuccess;
-  const s = q.data;
   const p = decodeVerdictPresentation(s?.decode_verdict, read);
   const analysis = analysisStreamLabel(s?.analysis_stream);
 
@@ -145,6 +176,139 @@ function round2(n: number): string {
   return Number.isInteger(n) ? String(n) : n.toFixed(2);
 }
 
+// ---------------------------------------------------------------------------
+// SPEC-088 zone application status.
+// ---------------------------------------------------------------------------
+
+const statsKey = (id: number) => ["cameras", "stats", id] as const;
+const snapshotKey = (id: number) => ["cameras", "config-snapshot", id] as const;
+const saveKey = (id: number) => ["cameras", "save", id] as const;
+
+/**
+ * Drop any request in flight and start a new one, rather than joining it.
+ * `refetchType: "none"` only marks the query stale, for its revalidation.
+ */
+function restartQuery(
+  qc: QueryClient,
+  queryKey: readonly unknown[],
+  refetchType: "active" | "none" = "active",
+) {
+  void qc
+    .cancelQueries({ queryKey, exact: true })
+    .then(() => qc.invalidateQueries({ queryKey, exact: true, refetchType }));
+}
+
+/**
+ * The zone side of the editor. `synced` is the zones array the draft last
+ * matched, installed from a snapshot (`base` = its revision) or sent in a
+ * save (`base` = null): the draft's zones are dirty when they are another
+ * array. `installed` is the snapshot shown, with the acceptance seq of its
+ * installation; `awaiting` a settled save whose snapshot is not installed
+ * yet; `generation` the newest supervisor generation read here. The latest
+ * save start or end is per camera, outside the editor (`zoneSaveSeq`).
+ */
+type ZoneView = {
+  synced: ZoneConfig[] | undefined;
+  base: string | null;
+  installed: { read: Tagged<CameraConfigSnapshot>; seq: number } | null;
+  savedAt: number | null;
+  awaiting: boolean;
+  generation: number;
+};
+
+type Saved = { camera: CameraConfig; zones: ZoneConfig[] | undefined; revision: string | null };
+
+/**
+ * The camera as saved, read again just before a save: whole from the camera
+ * list and, with `zones`, its zones with their revision from the config
+ * snapshot, read first. When that read fails (a role that may save but not
+ * read it, say) the zones are the listed ones, with no revision. Throws when
+ * the list cannot be read. The save expects the snapshot's revision, so
+ * another save landing after this read is refused (409), never overwritten.
+ * The list gives no revision to expect: that save is unconditional, as
+ * before, and still overwrites one landing after it, as does a save landing
+ * after the list read in any field outside the zones.
+ */
+async function rereadSaved(cameraId: number, zones: boolean): Promise<Saved> {
+  let snap: CameraConfigSnapshot | null = null;
+  if (zones) {
+    try {
+      snap = parseConfigSnapshot(await getCameraConfigSnapshot(cameraId));
+    } catch {
+      // The listed zones stand in, with no revision.
+    }
+  }
+  const camera = (await listCameras()).find((c) => c.id === cameraId);
+  if (!camera) throw new Error(`camera ${cameraId} is not listed`);
+  return snap
+    ? { camera, zones: snap.settings.zones, revision: snap.zones_revision }
+    : { camera, zones: camera.zones, revision: null };
+}
+
+/**
+ * `theirs` with every field `mine` changed from `base` (by value), and
+ * `mine`'s zones, which the zone view tracks by identity.
+ */
+function rebase(mine: CameraConfig, base: CameraConfig, theirs: CameraConfig): CameraConfig {
+  const edited = Object.entries(mine).filter(
+    ([k, v]) => k === "zones" || JSON.stringify(v) !== JSON.stringify(base[k as keyof CameraConfig]),
+  );
+  return { ...theirs, ...Object.fromEntries(edited) };
+}
+
+/** A zone view with nothing read, showing `zones`. */
+const unreadZoneView = (zones: ZoneConfig[] | undefined): ZoneView => ({
+  synced: zones,
+  base: null,
+  installed: null,
+  savedAt: null,
+  awaiting: false,
+  generation: -1,
+});
+
+const APPLICATION_BADGE: Record<
+  ZoneApplication["kind"],
+  { label: string; variant: BadgeProps["variant"] }
+> = {
+  unread: { label: "Reading", variant: "secondary" },
+  unsupported: { label: "Unverified", variant: "secondary" },
+  inactive: { label: "Inactive", variant: "secondary" },
+  applying: { label: "Applying", variant: "default" },
+  applied: { label: "Applied", variant: "success" },
+  failed: { label: "Failed", variant: "destructive" },
+  disconnected: { label: "Unconfirmed", variant: "warning" },
+  changed_elsewhere: { label: "Changed", variant: "warning" },
+  unsaved: { label: "Unsaved", variant: "secondary" },
+};
+
+const clock = (at: number | string) => new Date(at).toLocaleTimeString();
+
+/** Only the verdict is a live region: the read time changes with every poll. */
+function ZoneApplicationStatus({ application: a }: { application: ZoneApplication }) {
+  const badge = APPLICATION_BADGE[a.kind];
+  return (
+    <div
+      data-testid="zone-application"
+      data-state={a.kind}
+      className="space-y-1 rounded-md border border-border bg-muted/20 p-2.5 text-xs"
+    >
+      <div role="status" aria-live="polite">
+        <div className="flex items-start gap-2">
+          <Badge variant={badge.variant} className="shrink-0">
+            {badge.label}
+          </Badge>
+          <span className="font-semibold">{a.title}</span>
+        </div>
+        <p className="mt-1 text-muted-foreground">{a.detail}</p>
+      </div>
+      <p className="tabular-nums text-muted-foreground">
+        {a.kind === "applied" && a.appliedAt ? `Applied ${clock(a.appliedAt)} · ` : ""}
+        {a.readAt !== null ? `Last read ${clock(a.readAt)}` : "No successful read yet"}
+      </p>
+    </div>
+  );
+}
+
 /**
  * Derive the conventional ONVIF device-service URL from an RTSP URL's host —
  * `rtsp://…@192.168.1.64:554/s1` → `http://192.168.1.64/onvif/device_service`.
@@ -172,9 +336,15 @@ export function CameraEditor({
   camera: CameraConfig;
   existing: CameraConfig[];
   onClose: () => void;
-  onSaved: () => void;
+  /** `created`: the save added a new camera rather than updating one. */
+  onSaved: (created: boolean) => void;
 }) {
+  const qc = useQueryClient();
   const [draft, setDraft] = useState<CameraConfig>(camera);
+  // The full-config write base: the camera as last saved here, or as opened.
+  // A save sends every field the draft has not changed from it as saved by
+  // then; an access reset returns the draft to it.
+  const writeBase = useRef(camera);
   const [error, setError] = useState<string | null>(null);
   // Tracks whether the operator has hand-edited the ONVIF endpoint. While
   // false, the endpoint auto-tracks the RTSP URL host (see the URL input's
@@ -290,12 +460,185 @@ export function CameraEditor({
     return { text, cost, exact };
   })();
 
+  // SPEC-088 — does the running camera use the zones shown? Installing a
+  // saved-zone snapshot, or a save starting or ending, advances the
+  // acceptance epoch; only a stats request begun after it can certify them.
+  // The draft stays the full-config write base: a save sends it whole, with
+  // the zones on screen, and nothing from the snapshot but its zones.
+  const [zoneView, setZoneView] = useState<ZoneView>(() => unreadZoneView(camera.zones));
+
+  // The save, its fence and its post-save snapshot read outlive this editor:
+  // a reopened one sees the save pending, and its settling refreshes it.
   const mutation = useMutation({
-    mutationFn: (cfg: CameraConfig) => upsertCamera(cfg),
-    onSuccess: onSaved,
+    mutationKey: saveKey(camera.id),
+    mutationFn: ({ cfg, expected }: { cfg: CameraConfig; expected?: string }) =>
+      upsertCamera(cfg, expected),
+    onMutate: () => markZoneSave(camera.id),
+    onSuccess: () => {
+      if (!isNew) toast.success("Camera saved");
+      onSaved(isNew);
+    },
+    // A refused save is never retried: the saved zones it raced are read
+    // again on settling, rebasing a clean view or showing an edit as
+    // changed elsewhere, and the operator saves again.
     onError: (e: unknown) =>
-      setError(e instanceof Error ? e.message : String(e)),
+      setError(
+        isZonesRevisionConflict(e)
+          ? "Not saved: someone else saved this camera's zones since they were last read here, so nothing was changed. Check the zones and save again."
+          : e instanceof Error
+            ? e.message
+            : String(e),
+      ),
+    // A failed PUT may still have committed: read what is saved either way.
+    onSettled: () => {
+      markZoneSave(camera.id);
+      restartQuery(qc, snapshotKey(camera.id));
+    },
   });
+  const saving = useIsMutating({ mutationKey: saveKey(camera.id) }) > 0;
+  const resetSave = mutation.reset;
+
+  const snapQ = useQuery({
+    queryKey: snapshotKey(camera.id),
+    enabled: !isNew,
+    queryFn: async ({ signal }) => {
+      const seq = nextAcceptanceSeq();
+      return { seq, body: parseConfigSnapshot(await getCameraConfigSnapshot(camera.id, signal)) };
+    },
+    // Read on open, after a save and to reconcile a mismatch; never on a timer.
+    staleTime: Infinity,
+    gcTime: 0,
+    retry: false,
+    refetchOnWindowFocus: false,
+  });
+  // A polygon being drawn is an edit too, though not yet in the draft.
+  const [sketching, setSketching] = useState(false);
+  // Install a snapshot read begun after the latest save; a clean view shows
+  // its zones, a dirty edit keeps the operator's. A sketch holds it until
+  // finished or cancelled: it joins the zones it was drawn over, never newer.
+  const snap = snapQ.data;
+  if (
+    snap &&
+    snap !== zoneView.installed?.read &&
+    !saving &&
+    !sketching &&
+    snap.seq > zoneSaveSeq(camera.id)
+  ) {
+    const clean = draft.zones === zoneView.synced;
+    setZoneView((v) => ({
+      ...v,
+      installed: { read: snap, seq: nextAcceptanceSeq() },
+      awaiting: false,
+      ...(clean ? { synced: snap.body.settings.zones, base: snap.body.zones_revision } : {}),
+    }));
+    if (clean) setDraft((d) => ({ ...d, zones: snap.body.settings.zones }));
+  }
+
+  const sentZones = mutation.isPending ? mutation.variables?.cfg.zones : zoneView.synced;
+  const zoneDraft: ZoneDraftState = {
+    phase:
+      sketching || draft.zones !== sentZones ? "dirty" : saving ? "saving" : zoneView.awaiting ? "saved" : "clean",
+    base: zoneView.base,
+    awaiting: zoneView.awaiting,
+  };
+  const saved: SavedSnapshot = {
+    snapshot: zoneView.installed?.read.body ?? null,
+    error: snapQ.error,
+  };
+  const epoch: AcceptanceEpoch = {
+    seq: Math.max(zoneSaveSeq(camera.id), zoneView.installed?.seq ?? 0),
+    generation: zoneView.generation,
+  };
+  const zonePollMs = (read: ReceiptRead & { error: unknown }) =>
+    zoneApplicationPollMs(
+      deriveZoneApplication(saved, read, zoneDraft, epoch),
+      [read.error, snapQ.error],
+      zoneView.savedAt,
+    );
+  const statsQ = useQuery({
+    queryKey: statsKey(camera.id),
+    enabled: !isNew,
+    queryFn: async () => {
+      const seq = nextAcceptanceSeq();
+      return { seq, body: await getCameraStats(camera.id) };
+    },
+    // One read for decode health and zone application, at the receipt's
+    // cadence: once a minute when Applied or Inactive, none when denied or
+    // unsupported. Paused while the page is hidden, re-read at once when it
+    // is visible again.
+    refetchInterval: (q) => zonePollMs(q.state),
+    // A failed read shows at once: an internal retry would keep the last
+    // answer (an Applied, say) on screen meanwhile. The cadence reads again.
+    retry: false,
+    refetchOnWindowFocus: (q) => (zonePollMs(q.state) === false ? false : "always"),
+  });
+  const readGeneration =
+    statsQ.data?.body.camera_id === camera.id ? receiptGeneration(statsQ.data.body) : undefined;
+  if (readGeneration !== undefined && readGeneration > zoneView.generation) {
+    setZoneView((v) => (readGeneration > v.generation ? { ...v, generation: readGeneration } : v));
+  }
+  const application = deriveZoneApplication(saved, statsQ, zoneDraft, epoch);
+  const pollMs = zoneApplicationPollMs(application, [statsQ.error, snapQ.error], zoneView.savedAt);
+
+  // A newly installed snapshot needs a stats read begun after it. A hidden
+  // page leaves that read to its revalidation once visible again.
+  const installedSeq = zoneView.installed?.seq;
+  useEffect(() => {
+    if (installedSeq === undefined) return;
+    restartQuery(qc, statsKey(camera.id), focusManager.isFocused() ? "active" : "none");
+  }, [qc, camera.id, installedSeq]);
+  // A mismatch or a failed snapshot read reloads the saved zones at once,
+  // then at most once per receipt interval, never while a save is pending
+  // or while the page is hidden (it reconciles once visible again).
+  const receiptKind = application.kind === "unsaved" ? application.receipt.kind : application.kind;
+  const visible = useSyncExternalStore(focusManager.subscribe, () => focusManager.isFocused());
+  const reconcile =
+    visible &&
+    !isNew &&
+    pollMs !== false &&
+    !saving &&
+    !snapQ.isFetching &&
+    (receiptKind === "changed_elsewhere" || snapQ.isError);
+  const reconciledAt = useRef(-Infinity);
+  useEffect(() => {
+    if (!reconcile || Date.now() - reconciledAt.current < pollMs) return;
+    reconciledAt.current = Date.now();
+    void qc.refetchQueries({ queryKey: snapshotKey(camera.id), exact: true });
+  }, [qc, camera.id, reconcile, pollMs, statsQ.dataUpdatedAt, statsQ.errorUpdatedAt]);
+
+  // What this editor shows and certifies was read with the signed-in role.
+  // A token refresh can carry another role (or user) without unmounting the
+  // editor, and a denied read means the access is gone: either drops the
+  // edit and the acceptance state, fencing out every read begun before, and
+  // a role change reads the saved zones again as the new role.
+  const user = useSession()?.user;
+  const authority = user ? `${user.id}:${user.role}` : "";
+  // A re-read of a query never answered clears its error until it settles:
+  // that is no access regained, so a denial holds through it.
+  const readDenied = [snapQ.error, statsQ.error].some(isDenied);
+  const [denied, setDenied] = useState(readDenied);
+  const rereading = snapQ.fetchStatus !== "idle" || statsQ.fetchStatus !== "idle";
+  if (readDenied !== denied && !(denied && rereading)) setDenied(readDenied);
+  const heldAs = useRef({ authority, denied });
+  useEffect(() => {
+    const was = heldAs.current;
+    heldAs.current = { authority, denied };
+    const changed = authority !== was.authority;
+    if (!changed && (!denied || was.denied)) return;
+    markZoneSave(camera.id);
+    // A save begun before stays on the engine but no longer sets what this
+    // editor sent or synced: its zones would read as an edit or a verdict.
+    resetSave();
+    const base = writeBase.current;
+    onvifEndpointTouched.current = Boolean(base.onvif?.endpoint);
+    setDraft(base);
+    setError(null);
+    setZoneView(unreadZoneView(base.zones));
+    if (changed) {
+      restartQuery(qc, snapshotKey(camera.id));
+      restartQuery(qc, statsKey(camera.id));
+    }
+  }, [qc, camera.id, authority, denied, resetSave]);
 
   const set = <K extends keyof CameraConfig>(
     k: K,
@@ -320,7 +663,10 @@ export function CameraEditor({
     });
   };
 
-  const onSubmit = (e: React.FormEvent) => {
+  // The saved zones are being read again before a save is sent.
+  const [checking, setChecking] = useState(false);
+
+  const onSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
     // ID is server-assigned on create (POST /cameras returns
@@ -330,7 +676,76 @@ export function CameraEditor({
       setError("URL is required.");
       return;
     }
-    mutation.mutate(draft);
+    // The save replaces the camera's zones whole, expecting the revision of
+    // the saved zones it replaces, so a save from elsewhere it has not read
+    // is refused (409), never overwritten. Unedited zones go out as saved
+    // now, not as last read here, so an unrelated edit never reverts another
+    // operator's newer zones; they expect their re-read revision (see
+    // `rereadSaved`). Edited zones, a drawing in progress included (it
+    // freezes the zones it was drawn over), are sent as shown, expecting the
+    // latest snapshot read here since the latest save, installed or held by
+    // the drawing: once one has read another operator's save, the status
+    // says the zones changed elsewhere and saving replaces them knowingly.
+    // With no snapshot read, nothing is expected. Every other field the
+    // draft has not changed from the write base goes out as saved now too,
+    // so a save never reverts another operator's change to a field not
+    // edited here.
+    let cfg = draft;
+    const read = snap && snap.seq > zoneSaveSeq(camera.id) ? snap : zoneView.installed?.read;
+    let expected = read?.body.zones_revision;
+    if (!isNew) {
+      const zonesClean = !sketching && draft.zones === zoneView.synced;
+      // An access reset during the re-read (it marks a zone save) dropped
+      // this draft: the save is dropped too, with nothing sent or reported.
+      const fence = zoneSaveSeq(camera.id);
+      setChecking(true);
+      let saved: Saved;
+      try {
+        saved = await rereadSaved(camera.id, zonesClean);
+      } catch (err) {
+        if (zoneSaveSeq(camera.id) !== fence) return;
+        setError(
+          `Not saved: this camera could not be re-read, so saving could undo ` +
+            `another operator's changes (${err instanceof Error ? err.message : String(err)}). Try again.`,
+        );
+        return;
+      } finally {
+        setChecking(false);
+      }
+      if (zoneSaveSeq(camera.id) !== fence) return;
+      cfg = rebase(draft, writeBase.current, saved.camera);
+      if (zonesClean) {
+        const { zones, revision } = saved;
+        expected = revision ?? undefined;
+        const changed =
+          revision !== null
+            ? revision !== zoneView.base
+            : JSON.stringify(zones) !== JSON.stringify(draft.zones);
+        if (changed) {
+          cfg = { ...cfg, zones };
+          setZoneView((v) => ({ ...v, synced: zones, base: revision }));
+          setDraft((d) => (d.zones === draft.zones ? { ...d, zones } : d));
+        }
+      }
+    }
+    mutation.mutate({ cfg, expected }, {
+      // Not called once `resetSave` fenced the save. The PUT answer carries
+      // no revision and its zones are not applied: the post-save snapshot
+      // and a fresh receipt decide. Outside the zones it is the write base
+      // now, and every field not typed in since the save began shows it;
+      // typing since then stays.
+      onSuccess: (saved, { cfg }) => {
+        writeBase.current = saved;
+        setDraft((d) => rebase(d, draft, saved));
+        setZoneView((v) => ({
+          ...v,
+          savedAt: Date.now(),
+          awaiting: true,
+          synced: cfg.zones,
+          base: null,
+        }));
+      },
+    });
   };
 
   return (
@@ -344,8 +759,8 @@ export function CameraEditor({
           <Button variant="outline" onClick={onClose}>
             Cancel
           </Button>
-          <Button onClick={onSubmit} disabled={mutation.isPending}>
-            {mutation.isPending ? "Saving…" : "Save"}
+          <Button onClick={onSubmit} disabled={saving || checking}>
+            {saving || checking ? "Saving…" : "Save"}
           </Button>
         </>
       }
@@ -357,7 +772,9 @@ export function CameraEditor({
           </div>
         ) : null}
 
-        {isNew ? null : <CameraDecodeSection cameraId={draft.id} />}
+        {isNew ? null : (
+          <CameraDecodeSection stats={statsQ.data?.body} read={statsQ.isSuccess} />
+        )}
 
         {restartRequired ? (
           <div className="flex items-start gap-2 border-b border-warning/40 bg-warning/10 px-5 py-3 text-xs">
@@ -914,11 +1331,16 @@ export function CameraEditor({
           title="Zones"
           description="Draw polygon zones on the live snapshot. Click to add vertices, double-click to close, drag a vertex to move it, right-click a vertex to delete it. Coordinates are stored normalized 0..1 of the source frame."
         >
+          {isNew ? null : <ZoneApplicationStatus application={application} />}
           <ZonesEditor
+            // The access reset above drops the draft; this drops the
+            // unfinished drawing the editor holds of its own.
+            key={`${authority}:${denied}`}
             cameraId={draft.id}
             isNew={isNew}
             zones={draft.zones ?? []}
             onChange={(z) => set("zones", z)}
+            onSketchingChange={setSketching}
           />
         </SheetSection>
 

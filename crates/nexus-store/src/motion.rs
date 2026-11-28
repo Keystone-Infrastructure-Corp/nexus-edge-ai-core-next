@@ -125,6 +125,15 @@ pub struct ClipClose {
     pub sha256: Option<String>,
 }
 
+/// What [`Store::close_damaged_clip`] records with a damaged clip's close.
+#[derive(Debug, Clone)]
+pub struct ClipDamage {
+    /// Samples the recorder's live pump never pushed into the muxer.
+    pub dropped_samples: i64,
+    /// Why the clip is quarantined from cold upload, when it is.
+    pub quarantine: Option<String>,
+}
+
 /// Hydrated `motion_clips` row.
 ///
 /// `hot_*` columns are non-NULL while a clip is readable from a hot
@@ -375,26 +384,46 @@ impl Store {
         Ok(row.get::<i64, _>(0))
     }
 
-    /// Flag a clip as recorded with gaps. Called by the recorder at
-    /// close when the live pump reports dropped samples, which on a
-    /// drop-oldest broadcast ring means missing IDRs — i.e. the file
-    /// stops being decodable somewhere after the pre-roll window.
+    /// [`Self::close_clip`] for a clip recorded with gaps or a damaged
+    /// layout, flagging it degraded and applying `damage.quarantine` in
+    /// the same transaction: the close makes the row eligible for cold
+    /// upload, so it must never land without them (SPEC-088). Dropped
+    /// samples on a drop-oldest broadcast ring are missing IDRs, i.e. the
+    /// file stops being decodable somewhere after the pre-roll window.
     /// Kept off [`ClipClose`] deliberately: this is the exceptional
     /// path, and every healthy close should stay a single UPDATE.
-    pub async fn mark_clip_degraded(
+    pub async fn close_damaged_clip(
         &self,
         clip_id: ClipId,
-        dropped_samples: i64,
+        close: &ClipClose,
+        damage: &ClipDamage,
     ) -> Result<(), StoreError> {
+        let mut tx = self.begin_tx().await?;
         sqlx::query(
             "UPDATE motion_clips
                 SET dropped_samples = ?, degraded = 1
               WHERE id = ?",
         )
-        .bind(dropped_samples)
+        .bind(damage.dropped_samples)
         .bind(clip_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if let Some(reason) = &damage.quarantine {
+            sqlx::query(
+                "UPDATE motion_clips
+                    SET cold_quarantined = 1,
+                        cold_last_attempt_at = ?,
+                        cold_last_error = ?
+                  WHERE id = ?",
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(reason)
+            .bind(clip_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        Self::close_clip_on(&mut *tx, clip_id, close).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -406,6 +435,14 @@ impl Store {
     /// the final clip bytes; the cold replicator gates upload on
     /// this being non-NULL.
     pub async fn close_clip(&self, clip_id: ClipId, close: &ClipClose) -> Result<(), StoreError> {
+        Self::close_clip_on(&self.pool, clip_id, close).await
+    }
+
+    async fn close_clip_on<'e>(
+        exec: impl sqlx::SqliteExecutor<'e>,
+        clip_id: ClipId,
+        close: &ClipClose,
+    ) -> Result<(), StoreError> {
         // The four bind parameters are always the same prefix
         // (ended_at, duration_ms, size_bytes, clip_id) regardless of
         // which optional columns we patch — keep the dynamic
@@ -424,7 +461,7 @@ impl Store {
                 .bind(hot_path)
                 .bind(sha)
                 .bind(clip_id)
-                .execute(&self.pool)
+                .execute(exec)
                 .await?
             }
             (Some(hot_path), None) => {
@@ -438,7 +475,7 @@ impl Store {
                 .bind(close.size_bytes)
                 .bind(hot_path)
                 .bind(clip_id)
-                .execute(&self.pool)
+                .execute(exec)
                 .await?
             }
             (None, Some(sha)) => {
@@ -452,7 +489,7 @@ impl Store {
                 .bind(close.size_bytes)
                 .bind(sha)
                 .bind(clip_id)
-                .execute(&self.pool)
+                .execute(exec)
                 .await?
             }
             (None, None) => {
@@ -465,7 +502,7 @@ impl Store {
                 .bind(close.duration_ms)
                 .bind(close.size_bytes)
                 .bind(clip_id)
-                .execute(&self.pool)
+                .execute(exec)
                 .await?
             }
         };

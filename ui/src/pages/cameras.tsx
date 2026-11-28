@@ -182,8 +182,10 @@ export function CamerasPage() {
     }
   };
 
-  const handleSaved = () => {
-    closeEditor();
+  // An existing camera's editor stays open after a save, to report whether
+  // the camera applied the saved zones (SPEC-088).
+  const handleSaved = (created: boolean) => {
+    if (created) closeEditor();
     qc.invalidateQueries({ queryKey: ["cameras", "list"] });
   };
 

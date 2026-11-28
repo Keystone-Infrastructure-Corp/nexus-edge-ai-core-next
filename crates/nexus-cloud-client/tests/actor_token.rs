@@ -1420,3 +1420,85 @@ fn typed_speech_needs_a_signed_live_talkdown_speak() {
     }
     assert!(!actor(None, "owner").allows_rpc(preview, Some(&up), true));
 }
+
+/// SPEC-088 — the zone config snapshot is a camera-scoped settings read in
+/// every path shape the table maps. No other permission reads it, it has no
+/// write method, and a token signed for one camera does not read another.
+#[tokio::test]
+async fn camera_config_snapshot_is_a_camera_settings_read() {
+    let actor = |perm: &str| VerifiedActor {
+        sub: "human".into(),
+        role: "viewer".into(),
+        perm: Some(perm.into()),
+        jti: "jti".into(),
+        org_id: ORG_ID.into(),
+        actor_org_id: None,
+    };
+    for path in [
+        "/admin/cameras/7/config-snapshot",
+        "admin/cameras/7/config-snapshot",
+        "/admin/cameras/7/config-snapshot/",
+    ] {
+        for (method, perm, allowed) in [
+            ("GET", "settings.read", true),
+            ("GET", "settings.write", false),
+            ("GET", "live.ptz", false),
+            ("PUT", "settings.read", false),
+            ("PUT", "settings.write", false),
+            ("POST", "settings.write", false),
+        ] {
+            assert_eq!(
+                actor(perm).allows_rpc(EnvelopeContext { method, path }, None, false),
+                allowed,
+                "{method} {path} {perm}"
+            );
+        }
+    }
+    assert!(!actor("settings.read").allows_rpc(
+        EnvelopeContext {
+            method: "GET",
+            path: "/admin/cameras/front/config-snapshot"
+        },
+        None,
+        false
+    ));
+
+    let (sk, verifier) = build_verifier_with("k1");
+    let dispatcher = RpcDispatcher::new(verifier, SystemMethodPolicy::default(), OkHandler);
+    let signed = |path: &str| {
+        let mut spec = TokenSpec::fresh(Utc::now().timestamp(), "GET", path, "k1");
+        spec.role = "viewer".into();
+        spec.perm = Some("settings.read".into());
+        mint(&sk, &spec)
+    };
+    let path = "/admin/cameras/7/config-snapshot";
+    assert!(dispatcher
+        .dispatch(
+            "config-snapshot",
+            EnvelopeContext {
+                method: "GET",
+                path
+            },
+            Some(&signed(path)),
+            None,
+        )
+        .await
+        .is_ok());
+    let result = dispatcher
+        .dispatch(
+            "config-snapshot",
+            EnvelopeContext {
+                method: "GET",
+                path: "/admin/cameras/8/config-snapshot",
+            },
+            Some(&signed(path)),
+            None,
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(DispatchError::Reject(RejectReason::Invalid(
+            InvalidReason::PathMismatch
+        )))
+    ));
+}

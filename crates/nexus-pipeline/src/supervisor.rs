@@ -234,6 +234,9 @@ pub struct CameraHandle {
     /// once the supervisor has returned, since its receiver drops with it.
     /// Dropping this sender requests nothing.
     pub stop: watch::Sender<bool>,
+    /// SPEC-088 — the zone generation this supervisor runs, which the
+    /// reconciler names when it stops it.
+    pub zone_generation: u64,
 }
 
 /// Aborts its task on drop, so a task the supervisor spawns ends with it —
@@ -308,6 +311,10 @@ pub fn spawn_camera(
 ) -> CameraHandle {
     let camera_id = cfg.id;
     let (stop, stop_rx) = watch::channel(false);
+    // SPEC-088 — the revision of the zones this task freezes, and the
+    // generation that must acknowledge it, both fixed before the task runs.
+    let zone_revision = crate::zone_application::zone_revision(&cfg.zones);
+    let zone_generation = stats.zone_application().start(camera_id, &zone_revision);
     let task = tokio::spawn(run_camera(
         cfg,
         detector,
@@ -334,11 +341,14 @@ pub fn spawn_camera(
         sink_router,
         alert_clip_gate,
         stop_rx,
+        zone_generation,
+        zone_revision,
     ));
     CameraHandle {
         camera_id,
         task,
         stop,
+        zone_generation,
     }
 }
 
@@ -389,6 +399,8 @@ async fn run_camera(
     sink_router: Arc<dyn SinkRouter>,
     alert_clip_gate: Arc<dyn AlertClipScheduleGate>,
     mut stop: watch::Receiver<bool>,
+    zone_generation: u64,
+    zone_revision: String,
 ) {
     let span = info_span!(
         "camera.pipeline",
@@ -477,6 +489,8 @@ async fn run_camera(
         let mut detected: u64 = 0;
         let prompts = cfg.detector.prompts.clone();
         let zones = cfg.zones.clone();
+        // SPEC-088 — the last request this generation acknowledged.
+        let mut zones_acknowledged = None;
         // Phase 8.1: equipment classes the static filter should also
         // promote to anchors (captured before the annotator config moves).
         let anchor_classes = annotator_cfg.static_anchor_classes.clone();
@@ -643,6 +657,12 @@ async fn run_camera(
                 None => continue,
             };
             decoded += 1;
+            // SPEC-088 — the request this frame may acknowledge, taken before
+            // it is processed, so a save that lands mid-frame is not credited
+            // to it.
+            let zone_request = stats
+                .zone_application()
+                .current_request(cfg.id, zone_generation);
             // Count frames the source produced that this loop never saw.
             //
             // It has to be HERE, not in the tap above: the tap drains
@@ -1512,6 +1532,22 @@ async fn run_camera(
                     }
                 }
 
+                // SPEC-088 — this frame went through the zone filters and
+                // everything downstream of them, so this generation now runs
+                // its zones for the request current when the frame began. A
+                // frame that ended early (gate drop, detector error, source
+                // rebuild) returned above without getting here.
+                if let Some(request) = zone_request.filter(|r| zones_acknowledged != Some(*r)) {
+                    stats.zone_application().acknowledge(
+                        cfg.id,
+                        zone_generation,
+                        request,
+                        &zone_revision,
+                        chrono::Utc::now(),
+                    );
+                    zones_acknowledged = Some(request);
+                }
+
                 ControlFlow::Continue(())
             }
             .instrument(frame_span)
@@ -1534,6 +1570,24 @@ async fn run_camera(
         if !rebuild_source || *stop.borrow() {
             break 'outer;
         }
+        }
+
+        // A stop request is the reconciler replacing or removing this
+        // generation. Ending on its own before any frame is a failure; after
+        // one, nothing runs its zones any more. Said before the teardown
+        // below, whose final close can wait out the recorder's drain.
+        if !*stop.borrow() {
+            let registry = stats.zone_application();
+            if zones_acknowledged.is_some() {
+                registry.stop(cfg.id, zone_generation);
+            } else if let Some(request) = registry.current_request(cfg.id, zone_generation) {
+                registry.fail(
+                    cfg.id,
+                    zone_generation,
+                    request,
+                    crate::zone_application::ZoneApplicationError::SupervisorExited,
+                );
+            }
         }
 
         // Pipeline ended — close any clip still open so its row

@@ -28,11 +28,12 @@
 //! or removed, and a change to most — not all — of the camera's
 //! `behavior` block ([`changed_behavior_field`] names the three it
 //! deliberately ignores). Rules are not a trigger either, because they
-//! hot-reload through the rule evaluator. Detector prompts and zones are not
-//! triggers and do not hot-reload: each is frozen in the supervisor's `cfg`
-//! snapshot the same way behavior was, and nothing in this process pushes
-//! them to a live task today, so an edit to either still needs a process
-//! restart.
+//! hot-reload through the rule evaluator. Zones are a trigger: `run_camera`
+//! reads them once, so a saved edit restarts that camera alone (SPEC-088).
+//! Detector prompts are not a trigger and do not hot-reload: they are frozen
+//! in the supervisor's `cfg` snapshot the same way behavior was, and nothing
+//! in this process pushes them to a live task today, so an edit to them still
+//! needs a process restart.
 //!
 //! A registration the recorder refused, and a substream session the
 //! SPEC-069 fallback shut down, are not restart triggers: each pass
@@ -46,7 +47,7 @@ use futures::StreamExt;
 use nexus_bus::{topic, Bus, BusExt};
 use nexus_config::TrackerConfig;
 use nexus_config::{
-    AnnotatorConfig, CameraBehavior, CameraConfig, ClipsConfig, StaticObjectConfig,
+    AnnotatorConfig, CameraBehavior, CameraConfig, ClipsConfig, StaticObjectConfig, ZoneConfig,
 };
 use nexus_inference::InferenceRouter;
 use nexus_pipeline::{
@@ -85,6 +86,9 @@ pub struct RunningCameraEntry {
     /// supervisor. Each pass registers it again without restarting the
     /// camera ([`retry_sessions`]); the no-change guard never reads it.
     sessions: Sessions,
+    /// SPEC-088 — the supervisor's zone generation, which [`stop_camera`]
+    /// names when it stops it.
+    zone_generation: u64,
 }
 
 impl RunningCameraEntry {
@@ -143,6 +147,11 @@ pub(crate) struct EntryKey {
     /// (BUG-285). Which fields that covers is decided in
     /// [`changed_behavior_field`], not here.
     behavior: CameraBehavior,
+    /// The camera's zones, in saved order and as saved. `run_camera` reads
+    /// them once into its exclusion and min-area filters, the annotator and
+    /// the rules, so a restart is the only way to apply an edit (SPEC-088,
+    /// #399). Nothing is sorted or rewritten: only a real edit differs.
+    zones: Vec<ZoneConfig>,
 }
 
 /// Field by field rather than derived, because the behavior half compares
@@ -158,6 +167,7 @@ impl PartialEq for EntryKey {
             analysis_url,
             score_threshold,
             behavior,
+            zones,
         } = self;
         *url == other.url
             && *supervisor_dims == other.supervisor_dims
@@ -165,6 +175,7 @@ impl PartialEq for EntryKey {
             && *analysis_url == other.analysis_url
             && *score_threshold == other.score_threshold
             && changed_behavior_field(behavior, &other.behavior).is_none()
+            && *zones == other.zones
     }
 }
 
@@ -182,6 +193,7 @@ impl EntryKey {
                 .as_ref()
                 .map(|m| m.score_threshold.to_bits()),
             behavior: cam.behavior.clone(),
+            zones: cam.zones.clone(),
         }
     }
 
@@ -581,6 +593,9 @@ async fn run(args: ReconcilerArgs, supervise_every: std::time::Duration) {
 ///   * restarts the supervisor + ingester for any enabled camera
 ///     whose ingest URL has changed, or whose supervisor has exited.
 async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
+    let zone_application = args.frame_stats.zone_application();
+    // SPEC-088 — no save commits between this read and its requests below.
+    let reading = zone_application.saves().read().await;
     let (live, unreadable) = args.store.list_readable_cameras().await?;
     *args.unreadable_cameras.lock() = unreadable;
 
@@ -594,12 +609,25 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
         .filter(|c| c.ingest.enabled)
         .map(|c| c.id)
         .collect();
+    // SPEC-088 — a pass reads the saved zones and enabled flags, so it is a
+    // request too: a save that bypassed the API's (which requests on its own)
+    // still lets the generation started for it acknowledge.
+    for cam in &live {
+        zone_application.request(
+            cam.id,
+            &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+            cam.ingest.enabled,
+        );
+    }
+    drop(reading);
 
     // 1. Remove anything that is gone-or-disabled, or whose row this build
     //    cannot read: boot would not have started it either.
     for id in current.keys().copied().collect::<Vec<_>>() {
         if !live_enabled.contains(&id) {
-            stop_camera(args, id).await;
+            if !stop_camera(args, id).await {
+                continue;
+            }
             // Reap the LBR pump here and *only* here. A camera that is gone
             // or disabled has no frames to pump, so its encode task would
             // poll a cache entry that will never be refilled. The restart
@@ -610,6 +638,11 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
             // restart the pump reports `stalled` for the gap and clears
             // itself when frames resume.
             args.live_view.stop(id);
+            // A disabled camera reads inactive, its last acknowledgement kept
+            // for comparison; one that is gone has nothing left to report.
+            if !live.iter().any(|c| c.id == id) {
+                zone_application.remove(id);
+            }
         }
     }
 
@@ -618,8 +651,12 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
         let cam_id = cam.id;
         let want = EntryKey::wanted(args, &cam);
         match current.get(&cam_id) {
-            // `==` compares url, dims, codec, analysis_url, then behavior.
-            Some(entry) if entry.key == want && !entry.task.is_finished() => {
+            // `==` compares url, dims, codec, analysis_url, score threshold, behavior, then zones.
+            Some(entry)
+                if entry.key == want
+                    && !entry.task.is_finished()
+                    && zone_application.runs(cam_id, entry.zone_generation) =>
+            {
                 // No change — supervisor still alive, URL still the
                 // same, supervisor dims still match, ingest codec
                 // still matches what's in the DB. Skip (we
@@ -630,12 +667,19 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                 continue;
             }
             Some(entry) => {
-                // A finished task here was not stopped by us: `stop_camera`
-                // runs in this task, so no pass sees an entry mid-stop.
-                if entry.task.is_finished() {
+                // `stop_camera` runs in this task, so the only entry a pass
+                // sees mid-stop is one an earlier pass could not finish
+                // stopping; any other finished task was not stopped by us.
+                if entry.exited_on_its_own() {
                     error!(
                         camera_id = cam_id,
                         "camera reconciler: supervisor exited without being stopped; restarting"
+                    );
+                } else if *entry.stop.borrow() {
+                    info!(
+                        camera_id = cam_id,
+                        "camera reconciler: checking again on a camera still stopping (its \
+                         supervisor outlived its abort, or its recorder work was not drained)"
                     );
                 } else if entry.key.url != want.url {
                     info!(
@@ -668,6 +712,18 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                         camera_id = cam_id,
                         "camera reconciler: score threshold changed; restarting supervisor"
                     );
+                } else if entry.key.zones != want.zones {
+                    info!(
+                        camera_id = cam_id,
+                        "camera reconciler: camera zones changed; restarting supervisor"
+                    );
+                } else if entry.key == want {
+                    info!(
+                        camera_id = cam_id,
+                        "camera reconciler: supervisor's zone generation is no longer running \
+                         (its source ended, or the camera was deleted and re-created); \
+                         restarting supervisor"
+                    );
                 } else {
                     info!(
                         camera_id = cam_id,
@@ -676,7 +732,9 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
                         "camera reconciler: camera behavior changed; restarting supervisor"
                     );
                 }
-                stop_camera(args, cam_id).await;
+                if !stop_camera(args, cam_id).await {
+                    continue;
+                }
             }
             None => {}
         }
@@ -694,48 +752,115 @@ async fn reconcile(args: &ReconcilerArgs) -> anyhow::Result<()> {
 /// in a pass, so normal closes are serialized too.
 ///
 /// It sits well above the recorder's own worst-case close — up to 2 s for
-/// the live pump plus `EOS_DRAIN_TIMEOUT` (5 s) for the drain — because an
-/// abort that lands *inside* that close is worse than none: the clip has
-/// already left the recorder's open map, so neither its finalization nor the
-/// recorder-wide shutdown drain will ever reach it.
+/// the live pump plus `EOS_DRAIN_TIMEOUT` (5 s) for the drain — so a normal
+/// close finishes inside it. An abort that lands inside an open or close no
+/// longer abandons the clip: `GstClipRecorder` runs both in tasks it owns and
+/// its shutdown drain waits for them (SPEC-088 Z-4). A clip an aborted
+/// supervisor merely held is finalized by [`stop_camera`]'s drain of the
+/// camera, also bounded by this; a camera not drained within it stays
+/// stopping.
 const SUPERVISOR_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
-    // The entry stays in the map until the supervisor has ended. Shutdown
-    // (`main.rs`) aborts the reconciler without joining it, then aborts every
-    // supervisor it finds in the map before the recorder's shutdown snapshot.
+/// Whether the camera's supervisor has ended, the recorder work it left is
+/// done and its camera was torn down. `false` means the camera is still
+/// stopping: its supervisor outlived its abort, or the recorder has not
+/// drained the camera. It stays in the map, nothing else is torn down, and
+/// the caller must not start a replacement; a later pass checks on it again
+/// without waiting.
+async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) -> bool {
+    // The entry stays in the map until the supervisor has ended and the
+    // recorder has drained the camera. Shutdown (`main.rs`) aborts the
+    // reconciler without joining it, then aborts every supervisor it finds in
+    // the map before the recorder's shutdown snapshot.
     // An entry removed up front would leave a supervisor that is still mid-stop
     // (a frame paused in `recorder.open`, say) out of that sweep, free to open
     // a clip after the snapshot that nothing would finalize. The price is that
     // a finished task in the map no longer always means a crash:
     // [`RunningCameraEntry::exited_on_its_own`] tells the two apart.
-    let stopping = args
-        .handles
-        .lock()
-        .get(&cam_id)
-        .map(|entry| (entry.stop.clone(), entry.task.clone()));
-    if let Some((stop, task)) = stopping {
-        // Stop, not abort: an aborted supervisor never reaches the close of
-        // its open motion clip, which is abandoned (BUG-285). The receiver
-        // drops when `run_camera` returns, which is what `closed` awaits.
-        let _ = stop.send(true);
-        if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
-            .await
-            .is_ok()
-        {
-            info!(camera_id = cam_id, "camera reconciler: stopped supervisor");
+    let stopping = args.handles.lock().get(&cam_id).map(|entry| {
+        (
+            entry.stop.clone(),
+            entry.task.clone(),
+            entry.zone_generation,
+        )
+    });
+    // Only an earlier pass that could not finish the stop left a stop request
+    // behind in the map: look again, without waiting.
+    let mut recheck = false;
+    if let Some((stop, task, zone_generation)) = stopping {
+        recheck = *stop.borrow();
+        let ended = if recheck {
+            task.is_finished()
         } else {
-            task.abort();
+            // From here on the generation's zones no longer count as applied.
+            args.frame_stats
+                .zone_application()
+                .stop(cam_id, zone_generation);
+            // Stop, not abort: an aborted supervisor never reaches the close of
+            // its open motion clip, which is abandoned (BUG-285). The receiver
+            // drops when `run_camera` returns, which is what `closed` awaits.
+            // Stored even with no receiver left, so the entry reads as stopping.
+            stop.send_replace(true);
+            if tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
+                .await
+                .is_ok()
+            {
+                info!(camera_id = cam_id, "camera reconciler: stopped supervisor");
+                true
+            } else {
+                task.abort();
+                // The abort lands at the supervisor's next await; until it has,
+                // the entry stays in shutdown's sweep. Bounded, because a
+                // supervisor wedged in synchronous code never reaches one.
+                let ended = tokio::time::timeout(SUPERVISOR_STOP_TIMEOUT, stop.closed())
+                    .await
+                    .is_ok();
+                warn!(
+                    camera_id = cam_id,
+                    timeout_secs = SUPERVISOR_STOP_TIMEOUT.as_secs(),
+                    ended,
+                    "camera reconciler: supervisor did not stop in time; aborted it, and any \
+                     clip it had open is finalized before the camera is torn down"
+                );
+                ended
+            }
+        };
+        if !ended {
+            // Removing it would hide a live supervisor from shutdown's sweep
+            // and start a second one for the camera beside it.
             warn!(
                 camera_id = cam_id,
-                timeout_secs = SUPERVISOR_STOP_TIMEOUT.as_secs(),
-                "camera reconciler: supervisor did not stop in time; aborted it, and any \
-                 clip it had open is abandoned"
+                "camera reconciler: aborted supervisor is still running; keeping it tracked \
+                 and not restarting the camera until it ends"
             );
+            return false;
         }
-        args.handles.lock().remove(&cam_id);
     }
     // Only now that the supervisor is done: its clip closes on this ingester.
+    // An aborted one skipped the close of a clip it held, or left an open or
+    // close in flight, which would keep recording beside the replacement's
+    // (SPEC-088 Z-4). Until the drain succeeds the camera stays stopping, as
+    // a supervisor that outlived its abort does; the recorder's owned tasks
+    // run on meanwhile, and shutdown waits for them.
+    let bound = if recheck {
+        std::time::Duration::ZERO
+    } else {
+        SUPERVISOR_STOP_TIMEOUT
+    };
+    let drained = match tokio::time::timeout(bound, args.recorder.drain_camera(cam_id)).await {
+        Ok(drained) => drained.map_err(|e| e.to_string()),
+        Err(_) => Err("still in flight".to_owned()),
+    };
+    if let Err(error) = drained {
+        warn!(
+            camera_id = cam_id,
+            error,
+            "camera reconciler: the stopped supervisor's recorder work is not finished; keeping \
+             the camera stopping and not restarting it until a pass has drained it"
+        );
+        return false;
+    }
+    args.handles.lock().remove(&cam_id);
     args.recorder.remove_camera_ingester(cam_id);
     // The substream session lives in a separate map and would otherwise
     // keep its RTSP connection and decode chain alive with no
@@ -754,6 +879,7 @@ async fn stop_camera(args: &ReconcilerArgs, cam_id: CameraId) {
     args.frame_stats.clear(cam_id);
     args.decode_health.clear(cam_id);
     args.analysis_stream.clear(cam_id);
+    true
 }
 
 /// Attach or detach a camera's SPEC-069 analysis substream session, and
@@ -1150,6 +1276,7 @@ pub(crate) fn spawn_supervisor(
         stop: Arc::new(handle.stop),
         key: start.key,
         sessions: start.sessions,
+        zone_generation: handle.zone_generation,
     }
 }
 
@@ -1158,7 +1285,11 @@ mod tests {
     use super::*;
     use nexus_config::{
         CameraBehavior, CameraDetector, CameraIngest, CameraOnvif, CameraTalkDown, RecorderKind,
-        TileGridConfig,
+        TileGridConfig, ZoneKind,
+    };
+    use nexus_pipeline::zone_application::{
+        zone_revision, ZoneApplicationError, ZoneApplicationState, ZonesRuntime,
+        APPLICATION_TIMEOUT,
     };
     use nexus_pipeline::{ClipFinal, ClipHandle, ClipMeta, OpenClip, RecorderError};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1424,6 +1555,8 @@ mod tests {
         AlwaysEnds,
         /// Every source keeps running.
         NeverEnds,
+        /// Every source fails before delivering a frame.
+        NoFrames,
     }
 
     /// Delivers frames for `after` and then returns, the way a `FrameSource`
@@ -1521,6 +1654,11 @@ mod tests {
                 *n
             };
             let ends_after = match self.scripts[&camera_id] {
+                SourceScript::NoFrames => {
+                    return Some(Box::new(nexus_pipeline::FailingSource {
+                        message: "no frames".into(),
+                    }))
+                }
                 SourceScript::EndsOnce if built == 1 => Some(std::time::Duration::from_millis(300)),
                 SourceScript::AlwaysEnds => Some(std::time::Duration::ZERO),
                 SourceScript::EndsOnce | SourceScript::NeverEnds => None,
@@ -1885,17 +2023,106 @@ mod tests {
     }
 
     /// Accepts every clip and logs each open, close and ingester removal in
-    /// call order, so a test can see whether a restart finalized the clip
-    /// its old supervisor had open, and while the ingester recording it
-    /// still existed. Frames come from a `VirtualSource` that never ends.
+    /// call order, by camera, so a test can see whether a restart finalized
+    /// the clip its old supervisor had open, and while the ingester recording
+    /// it still existed. Clip ids count from 1 per camera. Frames come from a
+    /// `VirtualSource` that never ends; it counts the sources each camera's
+    /// supervisors built, one per start.
     #[derive(Default)]
     struct ClipLogRecorder {
-        calls: Mutex<Vec<ClipCall>>,
+        calls: Mutex<Vec<(CameraId, ClipCall)>>,
+        sources_built: Mutex<HashMap<CameraId, usize>>,
+        /// Set by [`Self::wedge_store_on_open`]: the store whose every pooled
+        /// connection the next open checks out.
+        wedge: Mutex<Option<Arc<Store>>>,
+        /// The connections a wedged open holds.
+        wedged: Mutex<Vec<sqlx::pool::PoolConnection<sqlx::Sqlite>>>,
+        /// What the next drains do, in order; once used up, each succeeds.
+        drains: Mutex<std::collections::VecDeque<Drain>>,
+        /// When set, a close is logged as it begins and then waits for a
+        /// permit of this gate.
+        close_gate: Option<tokio::sync::Semaphore>,
+        /// When set, a camera's first frame source ends once this is
+        /// notified, as [`SourceUntil`].
+        end_first_source: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    /// Delivers frames until `end` is notified, then returns as
+    /// [`SourceThatEnds`] does.
+    struct SourceUntil {
+        camera_id: CameraId,
+        end: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl nexus_pipeline::FrameSource for SourceUntil {
+        async fn run(
+            self: Box<Self>,
+            tx: tokio::sync::mpsc::Sender<nexus_types::Frame>,
+        ) -> Result<(), nexus_pipeline::FrameSourceError> {
+            let frames = Box::new(nexus_pipeline::VirtualSource {
+                camera_id: self.camera_id,
+                width: 512,
+                height: 288,
+                fps: 10,
+            });
+            tokio::select! {
+                _ = frames.run(tx) => {}
+                () = self.end.notified() => {}
+            }
+            Err(nexus_pipeline::FrameSourceError::Backend(
+                "upstream session ended".into(),
+            ))
+        }
+    }
+
+    /// A [`ClipLogRecorder`] drain that does not succeed at once.
+    enum Drain {
+        /// Never finishes, as a close or open stalled in the recorder.
+        Stalls,
+        /// Reports a clip it could not finalize.
+        Fails,
+        /// Succeeds once this reads true: the recorder's own tasks run its
+        /// work on whether or not a drain waits for them.
+        Until(tokio::sync::watch::Receiver<bool>),
     }
 
     impl ClipLogRecorder {
+        /// The next open hands its clip over with every connection of
+        /// `store`'s pool checked out, so the supervisor's next store write
+        /// waits for one, as on a store too busy to answer.
+        fn wedge_store_on_open(&self, store: Arc<Store>) {
+            *self.wedge.lock() = Some(store);
+        }
+
+        /// Give back the connections a wedged open took.
+        fn unwedge_store(&self) {
+            self.wedged.lock().clear();
+        }
+
+        /// The clips of `camera_id` opened and not closed.
+        fn open_clips(&self, camera_id: CameraId) -> Vec<i64> {
+            let calls = self.calls_of(camera_id);
+            calls
+                .iter()
+                .filter_map(|c| match c {
+                    ClipCall::Open(id) if !calls.contains(&ClipCall::Close(*id)) => Some(*id),
+                    _ => None,
+                })
+                .collect()
+        }
+
         fn calls(&self) -> Vec<ClipCall> {
-            self.calls.lock().clone()
+            self.calls.lock().iter().map(|(_, call)| *call).collect()
+        }
+
+        fn calls_of(&self, camera_id: CameraId) -> Vec<ClipCall> {
+            self.calls
+                .lock()
+                .iter()
+                .filter(|(id, _)| *id == camera_id)
+                .map(|(_, call)| *call)
+                .collect()
         }
 
         fn opens(&self) -> usize {
@@ -1904,13 +2131,41 @@ mod tests {
                 .filter(|c| matches!(c, ClipCall::Open(_)))
                 .count()
         }
+
+        fn opens_of(&self, camera_id: CameraId) -> usize {
+            self.calls_of(camera_id)
+                .iter()
+                .filter(|c| matches!(c, ClipCall::Open(_)))
+                .count()
+        }
+
+        fn sources_built(&self, camera_id: CameraId) -> usize {
+            self.sources_built
+                .lock()
+                .get(&camera_id)
+                .copied()
+                .unwrap_or(0)
+        }
     }
 
     #[async_trait::async_trait]
     impl ClipRecorder for ClipLogRecorder {
         async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
-            let clip_id = self.opens() as i64 + 1;
-            self.calls.lock().push(ClipCall::Open(clip_id));
+            let clip_id = self.opens_of(args.camera_id) as i64 + 1;
+            let wedge = self.wedge.lock().take();
+            if let Some(store) = wedge {
+                for _ in 0..store.pool().options().get_max_connections() {
+                    let conn = store
+                        .pool()
+                        .acquire()
+                        .await
+                        .expect("check out a connection");
+                    self.wedged.lock().push(conn);
+                }
+            }
+            self.calls
+                .lock()
+                .push((args.camera_id, ClipCall::Open(clip_id)));
             Ok(ClipHandle {
                 clip_id,
                 camera_id: args.camera_id,
@@ -1921,7 +2176,12 @@ mod tests {
             handle: ClipHandle,
             _args: ClipFinal,
         ) -> Result<ClipMeta, RecorderError> {
-            self.calls.lock().push(ClipCall::Close(handle.clip_id));
+            self.calls
+                .lock()
+                .push((handle.camera_id, ClipCall::Close(handle.clip_id)));
+            if let Some(gate) = &self.close_gate {
+                gate.acquire().await.expect("gate is never closed").forget();
+            }
             Ok(ClipMeta {
                 clip_id: handle.clip_id,
                 camera_id: handle.camera_id,
@@ -1940,13 +2200,48 @@ mod tests {
         fn kind(&self) -> &'static str {
             "clip-log"
         }
-        fn remove_camera_ingester(&self, _camera_id: CameraId) {
-            self.calls.lock().push(ClipCall::IngesterRemoved);
+        async fn drain_camera(&self, camera_id: CameraId) -> Result<(), RecorderError> {
+            let next = self.drains.lock().pop_front();
+            match next {
+                Some(Drain::Stalls) => std::future::pending::<()>().await,
+                Some(Drain::Fails) => {
+                    return Err(RecorderError::Io(std::io::Error::other(
+                        "a clip could not be finalized",
+                    )))
+                }
+                Some(Drain::Until(mut done)) => {
+                    let _ = done.wait_for(|done| *done).await;
+                }
+                None => {}
+            }
+            for clip_id in self.open_clips(camera_id) {
+                self.calls
+                    .lock()
+                    .push((camera_id, ClipCall::Close(clip_id)));
+            }
+            Ok(())
+        }
+        fn remove_camera_ingester(&self, camera_id: CameraId) {
+            self.calls
+                .lock()
+                .push((camera_id, ClipCall::IngesterRemoved));
         }
         fn shared_frame_source(
             &self,
             camera_id: CameraId,
         ) -> Option<Box<dyn nexus_pipeline::FrameSource + Send>> {
+            let built = {
+                let mut counts = self.sources_built.lock();
+                let n = counts.entry(camera_id).or_insert(0);
+                *n += 1;
+                *n
+            };
+            if let Some(end) = self.end_first_source.as_ref().filter(|_| built == 1) {
+                return Some(Box::new(SourceUntil {
+                    camera_id,
+                    end: end.clone(),
+                }));
+            }
             Some(Box::new(nexus_pipeline::VirtualSource {
                 camera_id,
                 width: 512,
@@ -1954,6 +2249,191 @@ mod tests {
                 fps: 10,
             }))
         }
+    }
+
+    /// SPEC-088 review 8 — a supervisor that applied its zones and whose
+    /// source then ends with a clip open runs them no more from that moment,
+    /// not from when its final close returns, which can take as long as the
+    /// recorder's drain. Until then the read said applied, and the
+    /// reconciler's no-change guard, which asks the registry whether the
+    /// generation still runs, kept the camera. Once the close completes, a
+    /// pass restarts the camera as for any supervisor that ended on its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supervisor_ending_with_its_final_close_pending_stops_reading_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let end_source = Arc::new(tokio::sync::Notify::new());
+        let recorder = Arc::new(ClipLogRecorder {
+            close_gate: Some(tokio::sync::Semaphore::new(0)),
+            end_first_source: Some(end_source.clone()),
+            ..ClipLogRecorder::default()
+        });
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        let a = zone_revision(&[]);
+
+        reconcile(&args).await.expect("first pass");
+        wait_until(
+            "precondition: the supervisor applied A and holds an open clip",
+            || recorder.opens() == 1 && status(&args, &a).state == ZoneApplicationState::Applied,
+        )
+        .await;
+        let original = entry_of(&args.handles, 7);
+        end_source.notify_one();
+        wait_until("the supervisor's final close began", || {
+            recorder.calls_of(7) == [ClipCall::Open(1), ClipCall::Close(1)]
+        })
+        .await;
+        let pending = status(&args, &a);
+        let runs = args
+            .frame_stats
+            .zone_application()
+            .runs(7, original.zone_generation);
+        let ended_mid_close = original.task.is_finished();
+        recorder
+            .close_gate
+            .as_ref()
+            .expect("closes are gated")
+            .add_permits(1 << 16);
+        wait_until("the supervisor ended once its close completed", || {
+            original.task.is_finished()
+        })
+        .await;
+        reconcile(&args).await.expect("pass that restarts it");
+        wait_until("the replacement applied A", || {
+            let s = status(&args, &a);
+            s.state == ZoneApplicationState::Applied && s.generation > original.zone_generation
+        })
+        .await;
+        let replaced = !Arc::ptr_eq(&entry_of(&args.handles, 7).task, &original.task);
+        abort_all(&args.handles);
+
+        assert!(
+            !ended_mid_close,
+            "precondition: the close was still pending"
+        );
+        assert_eq!(
+            (pending.applied_revision, pending.state, pending.error_code),
+            (Some(a), ZoneApplicationState::Applying, None),
+            "an ended supervisor read applied while its final close was pending"
+        );
+        assert!(
+            !runs,
+            "the registry still counted the ended generation as running, so a pass would keep it"
+        );
+        assert!(
+            replaced,
+            "the pass after the close did not restart the camera"
+        );
+    }
+
+    /// SPEC-088 review 9 — the pass that finds an ended supervisor's
+    /// generation no longer running can come while that supervisor's final
+    /// close is still pending. It stops the camera the long way: it waits
+    /// out [`SUPERVISOR_STOP_TIMEOUT`], aborts the supervisor inside its
+    /// close and drains the camera. Until the drain succeeds no replacement
+    /// starts and A never reads applied.
+    #[tokio::test]
+    async fn a_pass_during_a_pending_final_close_aborts_and_drains_before_replacing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let end_source = Arc::new(tokio::sync::Notify::new());
+        let recorder = Arc::new(ClipLogRecorder {
+            close_gate: Some(tokio::sync::Semaphore::new(0)),
+            end_first_source: Some(end_source.clone()),
+            ..ClipLogRecorder::default()
+        });
+        let args = Arc::new(reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await);
+        let a = zone_revision(&[]);
+
+        reconcile(&args).await.expect("first pass");
+        wait_until(
+            "precondition: the supervisor applied A and holds an open clip",
+            || recorder.opens() == 1 && status(&args, &a).state == ZoneApplicationState::Applied,
+        )
+        .await;
+        let original = entry_of(&args.handles, 7);
+        let is_original = |h: &HandleMap| {
+            h.lock()
+                .get(&7)
+                .is_some_and(|e| Arc::ptr_eq(&e.task, &original.task))
+        };
+        end_source.notify_one();
+        wait_until("the supervisor's final close began", || {
+            recorder.calls_of(7) == [ClipCall::Open(1), ClipCall::Close(1)]
+        })
+        .await;
+        // The first drain does not finish within its bound.
+        recorder.drains.lock().push_back(Drain::Stalls);
+
+        // Both bounds elapse on the paused clock; every virtual second the
+        // test records what the camera reads as. The clock pauses only once
+        // the pass has asked the supervisor to stop: its store read before
+        // that runs on sqlx's connection thread, which a paused clock does
+        // not wait for, so a slow answer let it auto-advance past the pool's
+        // acquire timeout.
+        let began = tokio::time::Instant::now();
+        let pass = tokio::spawn({
+            let args = args.clone();
+            async move { reconcile(&args).await }
+        });
+        wait_until("the pass asked the supervisor to stop", || {
+            pass.is_finished() || *original.stop.borrow()
+        })
+        .await;
+        tokio::time::pause();
+        let mut seen = Vec::new();
+        while !pass.is_finished() {
+            seen.push((status(&args, &a).state, is_original(&args.handles)));
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        let waited = began.elapsed();
+        pass.await
+            .expect("pass task")
+            .expect("pass during the pending close");
+        tokio::time::resume();
+        let aborted_and_kept = original.task.is_finished() && is_original(&args.handles);
+        let before_drain = recorder.calls_of(7);
+        recorder
+            .close_gate
+            .as_ref()
+            .expect("closes are gated")
+            .add_permits(1 << 16);
+        reconcile(&args).await.expect("pass whose drain succeeds");
+        wait_until("the replacement applied A", || {
+            let s = status(&args, &a);
+            s.state == ZoneApplicationState::Applied && s.generation > original.zone_generation
+        })
+        .await;
+        let calls = recorder.calls_of(7);
+        abort_all(&args.handles);
+
+        assert!(
+            waited >= SUPERVISOR_STOP_TIMEOUT * 2,
+            "the pass did not wait out the stop and then the drain: {waited:?}"
+        );
+        assert!(
+            aborted_and_kept,
+            "the supervisor was not aborted in its close, or the camera left the map"
+        );
+        assert!(
+            seen.len() > 2
+                && seen
+                    .iter()
+                    .all(|&(state, original)| state != ZoneApplicationState::Applied && original),
+            "a replacement started or A read applied before the drain succeeded: {seen:?}"
+        );
+        assert_eq!(
+            before_drain,
+            [ClipCall::Open(1), ClipCall::Close(1)],
+            "the camera was torn down before its drain succeeded"
+        );
+        assert_eq!(
+            calls[..3],
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved
+            ],
+            "once the drain succeeded, one pass tears the camera down and replaces it"
+        );
     }
 
     /// BUG-285 review — the restart a behavior edit triggers used to abort
@@ -2016,6 +2496,1258 @@ mod tests {
             ],
             "the restart must close the old supervisor's open clip, while its ingester still \
              exists, before the replacement opens one: an aborted supervisor abandons the clip"
+        );
+    }
+
+    /// SPEC-088 Z-4 — the forced stop after the handoff. A supervisor holding
+    /// an open clip waits on the store (every pooled connection taken, as
+    /// when the store cannot answer) past [`SUPERVISOR_STOP_TIMEOUT`], and
+    /// `stop_camera` aborts it there, which skips its close. The clip must be
+    /// finalized, once, before the camera's ingester goes and before the
+    /// replacement opens one: left open, it keeps recording beside the
+    /// replacement's, with no end, until the process exits.
+    #[tokio::test]
+    async fn a_forced_stop_finalizes_the_clip_the_aborted_supervisor_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        recorder.wedge_store_on_open(args.store.clone());
+
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: the supervisor holds an open clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        let original = entry_of(&args.handles, 7);
+
+        // Nothing below waits on I/O, so the stop's timeout elapses on the
+        // runtime's paused clock while the supervisor waits on the store.
+        tokio::time::pause();
+        let stopped = stop_camera(&args, 7).await;
+        tokio::time::resume();
+        let ended = original.task.is_finished();
+        recorder.unwedge_store();
+        reconcile(&args)
+            .await
+            .expect("pass that starts the replacement");
+        wait_until("the replacement opened a clip", || recorder.opens() == 2).await;
+        abort_all(&args.handles);
+
+        assert!(stopped && ended, "the wedged supervisor was not stopped");
+        assert_eq!(
+            recorder.calls_of(7),
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved,
+                ClipCall::Open(2),
+            ],
+            "the clip the aborted supervisor held must be finalized once, while its ingester \
+             exists, before the replacement opens one"
+        );
+    }
+
+    /// SPEC-088 Z-4 — the supervisor has ended, but the recorder work it left
+    /// (an open yet to register its clip, a close that took one) is not done
+    /// within the stop's bound, or a clip could not be finalized. The camera
+    /// must stay stopping: entry kept, ingester kept, no replacement. Later
+    /// passes check again without waiting, and only a drain that succeeds
+    /// lets one pass tear the camera down and start one replacement.
+    #[tokio::test]
+    async fn a_camera_stays_stopping_until_its_recorder_drain_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: the supervisor opened a clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        let original = entry_of(&args.handles, 7);
+        let is_original = |h: &HandleMap| {
+            h.lock()
+                .get(&7)
+                .is_some_and(|e| Arc::ptr_eq(&e.task, &original.task))
+        };
+        recorder
+            .drains
+            .lock()
+            .extend([Drain::Stalls, Drain::Stalls, Drain::Fails]);
+
+        // The drain's bound elapses on the paused clock.
+        tokio::time::pause();
+        let stopped = stop_camera(&args, 7).await;
+        tokio::time::resume();
+        let kept = !stopped && is_original(&args.handles) && original.task.is_finished();
+        // Real time from here: a pass that waited for the drain again would
+        // take 20 s.
+        let stalled =
+            tokio::time::timeout(std::time::Duration::from_secs(5), reconcile(&args)).await;
+        let unreplaced_while_stalled = is_original(&args.handles);
+        reconcile(&args).await.expect("pass whose drain fails");
+        let unreplaced_after_failure = is_original(&args.handles);
+        let before_success = recorder.calls_of(7);
+        reconcile(&args).await.expect("pass whose drain succeeds");
+        wait_until("the replacement opened a clip", || recorder.opens() == 2).await;
+        let replacement = entry_of(&args.handles, 7);
+        abort_all(&args.handles);
+
+        assert!(kept, "a camera whose drain timed out left the map");
+        assert!(
+            matches!(stalled, Ok(Ok(()))),
+            "a later pass waited for the drain again"
+        );
+        assert!(
+            unreplaced_while_stalled && unreplaced_after_failure,
+            "a replacement started before the camera's drain succeeded"
+        );
+        assert_eq!(
+            before_success,
+            [ClipCall::Open(1), ClipCall::Close(1)],
+            "the camera was torn down before its drain succeeded"
+        );
+        assert!(!Arc::ptr_eq(&replacement.task, &original.task));
+        assert_eq!(
+            recorder.calls_of(7),
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved,
+                ClipCall::Open(2),
+            ],
+            "once the drain succeeded, one pass tears the camera down and starts one replacement"
+        );
+    }
+
+    /// PR #405 review: once a stop pass timed out on the camera's drain, a
+    /// later pass drains it with no wait. The recorder work runs on in the
+    /// recorder's own tasks meanwhile, so work that finishes shortly after
+    /// the timed-out pass lets the next pass tear the camera down and start
+    /// one replacement: the camera does not stay stopping.
+    #[tokio::test]
+    async fn a_drain_finishing_after_its_pass_timed_out_lets_the_next_pass_restart_the_camera() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: the supervisor opened a clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        let original = entry_of(&args.handles, 7);
+        let (finish, work) = tokio::sync::watch::channel(false);
+        recorder
+            .drains
+            .lock()
+            .extend([Drain::Until(work.clone()), Drain::Until(work)]);
+
+        // The drain's bound elapses on the paused clock.
+        tokio::time::pause();
+        let stopped = stop_camera(&args, 7).await;
+        tokio::time::resume();
+        finish.send_replace(true);
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), reconcile(&args)).await;
+        wait_until("the replacement opened a clip", || recorder.opens() == 2).await;
+        let replacement = entry_of(&args.handles, 7);
+        abort_all(&args.handles);
+
+        assert!(
+            !stopped,
+            "precondition: the first pass timed out on the drain"
+        );
+        assert!(
+            matches!(next, Ok(Ok(()))),
+            "the next pass waited on the drain"
+        );
+        assert!(!Arc::ptr_eq(&replacement.task, &original.task));
+        assert_eq!(
+            recorder.calls_of(7),
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved,
+                ClipCall::Open(2),
+            ],
+            "the next pass did not tear the camera down and start one replacement"
+        );
+    }
+
+    /// PR #405 review: work still in flight keeps the camera stopping across
+    /// every pass that checks it, none of them waiting on it. Once it ends
+    /// with a clip not finalized, the clip holds the camera stopping for its
+    /// remaining attempts (SPEC-088: three in all), and the drain that
+    /// releases it lets that pass restart the camera, once.
+    #[tokio::test]
+    async fn a_camera_stays_stopping_while_its_work_is_in_flight_and_its_clip_holds_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: the supervisor opened a clip", || {
+            recorder.opens() == 1
+        })
+        .await;
+        let original = entry_of(&args.handles, 7);
+        let is_original = |h: &HandleMap| {
+            h.lock()
+                .get(&7)
+                .is_some_and(|e| Arc::ptr_eq(&e.task, &original.task))
+        };
+        let (finish, work) = tokio::sync::watch::channel(false);
+        recorder.drains.lock().extend([
+            Drain::Until(work.clone()),
+            Drain::Until(work.clone()),
+            Drain::Until(work),
+            Drain::Fails,
+            Drain::Fails,
+        ]);
+
+        tokio::time::pause();
+        let stopped = stop_camera(&args, 7).await;
+        tokio::time::resume();
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            let pass =
+                tokio::time::timeout(std::time::Duration::from_secs(5), reconcile(&args)).await;
+            held.push(matches!(pass, Ok(Ok(()))) && is_original(&args.handles));
+        }
+        finish.send_replace(true);
+        for _ in 0..2 {
+            reconcile(&args).await.expect("pass whose drain fails");
+            held.push(is_original(&args.handles));
+        }
+        let before_release = recorder.calls_of(7);
+        reconcile(&args)
+            .await
+            .expect("pass whose drain releases the clip");
+        wait_until("the replacement opened a clip", || recorder.opens() == 2).await;
+        let replacement = entry_of(&args.handles, 7);
+        abort_all(&args.handles);
+
+        assert!(
+            !stopped,
+            "precondition: the first pass timed out on the drain"
+        );
+        assert_eq!(
+            held, [true; 4],
+            "a pass waited on the drain or replaced the camera before its drain succeeded"
+        );
+        assert_eq!(
+            before_release,
+            [ClipCall::Open(1), ClipCall::Close(1)],
+            "the camera was torn down before its drain succeeded"
+        );
+        assert!(!Arc::ptr_eq(&replacement.task, &original.task));
+        assert_eq!(
+            recorder.calls_of(7),
+            [
+                ClipCall::Open(1),
+                ClipCall::Close(1),
+                ClipCall::IngesterRemoved,
+                ClipCall::Open(2),
+            ],
+            "the releasing pass did not tear the camera down and start one replacement"
+        );
+    }
+
+    fn entry_of(handles: &HandleMap, camera_id: CameraId) -> RunningCameraEntry {
+        handles
+            .lock()
+            .get(&camera_id)
+            .cloned()
+            .expect("camera running")
+    }
+
+    /// One zone-only edit to a camera, and whether its next supervisor must
+    /// still see the mock detector's person, whose box centre sits near
+    /// (0.5, 0.65) of the frame: seen, it opens a clip; filtered out by the
+    /// zones, it never reaches the motion lifecycle.
+    type ZoneEdit = (&'static str, fn(&mut Vec<ZoneConfig>), bool);
+
+    /// SPEC-088 (#399) — `run_camera` reads `cfg.zones` once, and the key left
+    /// them out, so a saved zone edit published `config.changed`, the guard
+    /// matched, and the camera kept filtering with the zones it started with
+    /// until the engine restarted. Each edit changes one thing about camera
+    /// 7's zones; the person shows which zones the replacement runs. Camera 8
+    /// is the neighbour that must not notice.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zone_only_edit_restarts_only_affected_camera_and_finalizes_clip() {
+        const OVER_PERSON: [(f32, f32); 4] = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        const CORNER: [(f32, f32); 3] = [(0.0, 0.0), (0.2, 0.0), (0.0, 0.2)];
+        let edits: [ZoneEdit; 6] = [
+            (
+                "add an exclusion zone over the person",
+                |z| {
+                    z.push(ZoneConfig {
+                        id: "z1".into(),
+                        name: "Driveway".into(),
+                        polygon: OVER_PERSON.to_vec(),
+                        kind: ZoneKind::Exclusion,
+                        min_bbox_area_px_override: None,
+                    })
+                },
+                false,
+            ),
+            (
+                "change its kind to inclusion",
+                |z| z[0].kind = ZoneKind::Inclusion,
+                true,
+            ),
+            (
+                "give it a minimum area above the person's box",
+                |z| z[0].min_bbox_area_px_override = Some(u32::MAX),
+                false,
+            ),
+            (
+                "move its polygon off the person",
+                |z| z[0].polygon = CORNER.to_vec(),
+                true,
+            ),
+            ("rename it", |z| z[0].name = "Gate".into(), true),
+            ("remove it", Vec::clear, true),
+        ];
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = Arc::new(ClipLogRecorder::default());
+        let args =
+            reconciler_args(recorder.clone(), dir.path(), &[cam(None), cam_with_id(8)]).await;
+        // The frame of the current session the analysis loop last finished,
+        // zone filter included. A restart clears it.
+        let analysed = |camera_id| {
+            args.cache
+                .get(camera_id)
+                .and_then(|e| e.objects_frame_id)
+                .unwrap_or(0)
+        };
+
+        reconcile(&args).await.expect("initial pass");
+        wait_until("precondition: both cameras opened a clip", || {
+            recorder.opens_of(7) == 1 && recorder.opens_of(8) == 1
+        })
+        .await;
+        // A supervisor that sees the person opens its clip by this frame, so
+        // one that analyses well past it without opening one has filtered
+        // the person out.
+        let filtered_by = 3 * analysed(7) + 5;
+        let neighbour = entry_of(&args.handles, 8);
+        let mut camera = cam(None);
+
+        for (what, edit, sees_person) in edits {
+            let before = entry_of(&args.handles, 7);
+            let logged = recorder.calls_of(7).len();
+            let opens = recorder.opens_of(7) as i64;
+            let clip_open = recorder.calls_of(7).last() == Some(&ClipCall::Open(opens));
+            let sources = recorder.sources_built(7);
+            edit(&mut camera.zones);
+            args.store.upsert_camera(&camera).await.expect(what);
+            reconcile(&args).await.expect(what);
+
+            let now = entry_of(&args.handles, 7);
+            if Arc::ptr_eq(&now.task, &before.task) {
+                abort_all(&args.handles);
+                panic!(
+                    "{what}: the saved zones did not restart camera 7, so it keeps filtering \
+                     with the zones its supervisor started with until the engine restarts"
+                );
+            }
+            assert_eq!(
+                now.key.zones, camera.zones,
+                "{what}: the new supervisor is recorded as running exactly the saved zones"
+            );
+            if sees_person {
+                wait_until(&format!("{what}: the person must open a clip"), || {
+                    recorder.opens_of(7) as i64 == opens + 1
+                })
+                .await;
+            } else {
+                wait_until(&format!("{what}: the replacement must analyse"), || {
+                    analysed(7) > filtered_by
+                })
+                .await;
+                assert!(
+                    args.cache.get(7).is_some_and(|e| e.objects.is_empty()),
+                    "{what}: the zones must keep the person out of the frame's objects"
+                );
+            }
+            let want: Vec<ClipCall> = [
+                clip_open.then_some(ClipCall::Close(opens)),
+                Some(ClipCall::IngesterRemoved),
+                sees_person.then_some(ClipCall::Open(opens + 1)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            assert_eq!(
+                recorder.calls_of(7)[logged..],
+                want,
+                "{what}: one stop that finalizes the open clip once, while its ingester exists, \
+                 then one start that runs the saved zones"
+            );
+            assert_eq!(recorder.sources_built(7), sources + 1, "{what}: one start");
+        }
+
+        // Saving the same zones again is not an edit.
+        let before = entry_of(&args.handles, 7);
+        let logged = recorder.calls_of(7).len();
+        args.store
+            .upsert_camera(&camera)
+            .await
+            .expect("identical save");
+        reconcile(&args)
+            .await
+            .expect("pass after an identical save");
+        let unchanged = Arc::ptr_eq(&entry_of(&args.handles, 7).task, &before.task);
+        let now_neighbour = entry_of(&args.handles, 8);
+        abort_all(&args.handles);
+        assert!(unchanged, "an identical save restarted camera 7");
+        assert_eq!(
+            recorder.calls_of(7).len(),
+            logged,
+            "an identical save stopped or reopened camera 7's recording"
+        );
+        assert!(
+            Arc::ptr_eq(&now_neighbour.task, &neighbour.task),
+            "camera 7's zone edits restarted camera 8"
+        );
+        assert!(
+            !recorder.calls_of(8).contains(&ClipCall::IngesterRemoved)
+                && recorder.sources_built(8) == 1,
+            "camera 7's zone edits stopped or restarted camera 8's recording"
+        );
+    }
+
+    /// Camera `id`'s zone status as the stats read builds it: the revision
+    /// and enabled flag saved now against what its generations acknowledged.
+    async fn zones_status(
+        args: &ReconcilerArgs,
+        id: CameraId,
+        now: std::time::Instant,
+    ) -> Option<ZonesRuntime> {
+        let (cameras, _) = args
+            .store
+            .list_readable_cameras()
+            .await
+            .expect("read cameras");
+        let saved = cameras.into_iter().find(|c| c.id == id)?;
+        Some(args.frame_stats.zone_application().snapshot(
+            id,
+            &zone_revision(&saved.zones),
+            saved.ingest.enabled,
+            now,
+        ))
+    }
+
+    /// Camera 7's status, enabled with `desired` saved, read now.
+    fn status(args: &ReconcilerArgs, desired: &str) -> ZonesRuntime {
+        args.frame_stats
+            .zone_application()
+            .snapshot(7, desired, true, std::time::Instant::now())
+    }
+
+    /// What the API's camera save does: persist, then tell the registry,
+    /// under the registry's save lock.
+    async fn save(args: &ReconcilerArgs, camera: &CameraConfig) {
+        let _saving = args.frame_stats.zone_application().saves().write().await;
+        args.store.upsert_camera(camera).await.expect("save camera");
+        args.frame_stats.zone_application().request(
+            camera.id,
+            &zone_revision(&camera.zones),
+            camera.ingest.enabled,
+        );
+    }
+
+    fn corner() -> ZoneConfig {
+        ZoneConfig {
+            id: "z1".into(),
+            name: "Corner".into(),
+            polygon: vec![(0.0, 0.0), (0.2, 0.0), (0.0, 0.2)],
+            kind: ZoneKind::Exclusion,
+            min_bbox_area_px_override: None,
+        }
+    }
+
+    /// The time a stale acknowledgement claims, which no read may show.
+    const STALE: chrono::DateTime<chrono::Utc> = chrono::DateTime::<chrono::Utc>::UNIX_EPOCH;
+
+    /// SPEC-088 — a save is applied only once the generation started with it
+    /// has processed a frame: between the save and that frame the read says
+    /// applying with the saved revision, never the old generation's applied,
+    /// and the stopped generation can no longer acknowledge anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zone_save_reads_applying_until_its_generation_processes_a_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let registry = args.frame_stats.zone_application();
+        let applied = |desired: &str| status(&args, desired).state == ZoneApplicationState::Applied;
+        let unzoned = zone_revision(&[]);
+
+        reconcile(&args).await.expect("first pass");
+        let first = zones_status(&args, 7, std::time::Instant::now())
+            .await
+            .expect("a started camera reports its zones");
+        assert_eq!(first.desired_revision, unzoned);
+        wait_until("the first generation applied its zones", || {
+            applied(&unzoned)
+        })
+        .await;
+        let first_request = registry
+            .current_request(7, first.generation)
+            .expect("the first generation runs the saved zones");
+
+        let mut camera = cam(None);
+        camera.zones.push(ZoneConfig {
+            id: "z1".into(),
+            name: "Corner".into(),
+            polygon: vec![(0.0, 0.0), (0.2, 0.0), (0.0, 0.2)],
+            kind: ZoneKind::Exclusion,
+            min_bbox_area_px_override: None,
+        });
+        let zoned = zone_revision(&camera.zones);
+        args.store.upsert_camera(&camera).await.expect("save zones");
+        let saved = zones_status(&args, 7, std::time::Instant::now())
+            .await
+            .expect("still reported");
+        assert_eq!(
+            (
+                saved.desired_revision,
+                saved.applied_revision,
+                saved.generation,
+                saved.state
+            ),
+            (
+                zoned.clone(),
+                Some(unzoned.clone()),
+                first.generation,
+                ZoneApplicationState::Applying
+            ),
+            "a read after the save, before the restart, must not keep the old verdict"
+        );
+
+        reconcile(&args).await.expect("pass after the save");
+        let restarted = zones_status(&args, 7, std::time::Instant::now())
+            .await
+            .expect("still reported");
+        assert!(
+            restarted.generation > first.generation,
+            "the restart is a new generation"
+        );
+        assert!(
+            restarted.state != ZoneApplicationState::Applied
+                || restarted.applied_revision.as_deref() == Some(zoned.as_str()),
+            "only the saved revision can read applied: {restarted:?}"
+        );
+        wait_until("the new generation applied the saved zones", || {
+            applied(&zoned)
+        })
+        .await;
+        let now = status(&args, &zoned);
+        assert_eq!(
+            (
+                now.applied_revision.as_deref(),
+                now.generation,
+                now.applied_generation
+            ),
+            (
+                Some(zoned.as_str()),
+                restarted.generation,
+                Some(restarted.generation)
+            )
+        );
+        assert!(now.applied_at.is_some());
+
+        registry.acknowledge(7, first.generation, first_request, &unzoned, STALE);
+        let after_stale = status(&args, &zoned);
+        abort_all(&args.handles);
+        assert_eq!(
+            after_stale, now,
+            "the stopped generation's late acknowledgement must be ignored"
+        );
+    }
+
+    /// SPEC-088 review — the sequence the review found: A applied, B saved,
+    /// the generation running A stopped, and A saved again before the
+    /// replacement starts (it may be awaiting its codec probe or hydration).
+    /// No supervisor runs A, so the read must not say applied.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_generation_does_not_read_applied_before_its_replacement_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let a = zone_revision(&[]);
+        reconcile(&args).await.expect("first pass");
+        wait_until("the first generation applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+
+        let mut b = cam(None);
+        b.zones.push(ZoneConfig {
+            id: "z1".into(),
+            name: "Corner".into(),
+            polygon: vec![(0.0, 0.0), (0.2, 0.0), (0.0, 0.2)],
+            kind: ZoneKind::Exclusion,
+            min_bbox_area_px_override: None,
+        });
+        args.store.upsert_camera(&b).await.expect("save B");
+        assert!(stop_camera(&args, 7).await, "the supervisor stops");
+        args.store.upsert_camera(&cam(None)).await.expect("save A");
+        let read = zones_status(&args, 7, std::time::Instant::now())
+            .await
+            .expect("still reported");
+        abort_all(&args.handles);
+
+        assert_eq!(
+            (read.desired_revision, read.applied_revision, read.state),
+            (a.clone(), Some(a), ZoneApplicationState::Applying),
+            "a stopped generation's zones read applied"
+        );
+    }
+
+    /// Errs on every frame, counting them.
+    #[derive(Default)]
+    struct FailingDetector {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl nexus_inference::Detector for FailingDetector {
+        async fn detect(
+            &self,
+            _frame: &nexus_types::Frame,
+            _prompts: &[String],
+        ) -> Result<Vec<nexus_types::Detection>, nexus_inference::InferenceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(nexus_inference::InferenceError::Failed(
+                "every frame fails".into(),
+            ))
+        }
+
+        fn name(&self) -> &'static str {
+            "failing"
+        }
+    }
+
+    /// `spawn_supervisor`'s spawn of camera 7 with `detector` in place of the
+    /// router's.
+    fn spawn_with_detector(
+        args: &ReconcilerArgs,
+        detector: Arc<dyn nexus_inference::Detector>,
+    ) -> nexus_pipeline::CameraHandle {
+        spawn_camera(
+            cam(None),
+            detector,
+            None,
+            Arc::from(nexus_tracker::build_tracker(&args.tracker_cfg)),
+            args.annotator.clone(),
+            args.static_object.clone(),
+            args.clips.clone(),
+            args.state_dir.clone(),
+            args.evaluator.clone(),
+            args.store.clone(),
+            args.recorder.clone(),
+            args.bus.clone(),
+            args.cache.clone(),
+            args.frame_stats.clone(),
+            args.static_clear.clone(),
+            512,
+            288,
+            args.sighting_hook.clone(),
+            args.sighting_cfg,
+            Vec::new(),
+            args.sighting_persist.clone(),
+            None,
+            args.sink_router.clone(),
+            args.alert_clip_schedule_gate.clone(),
+        )
+    }
+
+    /// Parks every `detect` call until the test lets it through, counting
+    /// the calls begun, so a test can act while a frame is being processed.
+    struct GatedDetector {
+        calls: AtomicUsize,
+        gate: tokio::sync::Semaphore,
+    }
+
+    #[async_trait::async_trait]
+    impl nexus_inference::Detector for GatedDetector {
+        async fn detect(
+            &self,
+            _frame: &nexus_types::Frame,
+            _prompts: &[String],
+        ) -> Result<Vec<nexus_types::Detection>, nexus_inference::InferenceError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.gate
+                .acquire()
+                .await
+                .expect("gate is never closed")
+                .forget();
+            Ok(Vec::new())
+        }
+
+        fn name(&self) -> &'static str {
+            "gated"
+        }
+    }
+
+    /// SPEC-088 review 8 — a frame acknowledges the request current when it
+    /// began, never one saved while it was being processed. A→B→A saved
+    /// while a frame of the generation that applied A is in its detector is
+    /// a new request for A: that frame must not certify it; the next does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_landing_mid_frame_is_acknowledged_only_by_a_later_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let a = zone_revision(&[]);
+        let mut b_cam = cam(None);
+        b_cam.zones.push(corner());
+        let detector = Arc::new(GatedDetector {
+            calls: AtomicUsize::new(0),
+            gate: tokio::sync::Semaphore::new(0),
+        });
+        let handle = spawn_with_detector(&args, detector.clone());
+        let in_detector = |n: usize| {
+            let detector = detector.clone();
+            move || detector.calls.load(Ordering::SeqCst) >= n
+        };
+
+        wait_until("frame 1 is in the detector", in_detector(1)).await;
+        detector.gate.add_permits(1);
+        // The loop is sequential: frame 2 in the detector means frame 1 is done.
+        wait_until("frame 2 is in the detector", in_detector(2)).await;
+        let before = status(&args, &a);
+        save(&args, &b_cam).await;
+        save(&args, &cam(None)).await;
+        detector.gate.add_permits(1);
+        wait_until("frame 3 is in the detector", in_detector(3)).await;
+        let after_frame_2 = status(&args, &a);
+        detector.gate.add_permits(1 << 16);
+        wait_until("a later frame applied the new request for A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let _ = handle.stop.send(true);
+        handle.task.await.expect("supervisor stops");
+
+        assert_eq!(
+            before.state,
+            ZoneApplicationState::Applied,
+            "precondition: frame 1 applied A"
+        );
+        assert_eq!(
+            after_frame_2.state,
+            ZoneApplicationState::Applying,
+            "the frame in flight when A→B→A was saved acknowledged that newer request"
+        );
+    }
+
+    /// SPEC-088 — frames that never get through the detector never reach the
+    /// zone filters, so the generation stays unacknowledged: applying, then
+    /// failed once 30 s have passed since its start. A requested stop is not
+    /// a failure of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_detector_that_fails_every_frame_never_applies_the_zones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let detector = Arc::new(FailingDetector::default());
+        let handle = spawn_with_detector(&args, detector.clone());
+        wait_until("the detector failed on several frames", || {
+            detector.calls.load(Ordering::SeqCst) >= 5
+        })
+        .await;
+
+        let now = std::time::Instant::now();
+        let s = zones_status(&args, 7, now).await.expect("reported");
+        assert_eq!(
+            (s.applied_revision, s.state, s.error_code),
+            (None, ZoneApplicationState::Applying, None)
+        );
+        let late = zones_status(&args, 7, now + APPLICATION_TIMEOUT)
+            .await
+            .expect("reported");
+        assert_eq!(
+            (late.applied_revision, late.state, late.error_code),
+            (
+                None,
+                ZoneApplicationState::Failed,
+                Some(ZoneApplicationError::ApplicationTimeout)
+            )
+        );
+
+        let _ = handle.stop.send(true);
+        handle.task.await.expect("supervisor stops");
+        assert_eq!(
+            zones_status(&args, 7, now)
+                .await
+                .expect("reported")
+                .error_code,
+            None,
+            "a requested stop is not a supervisor that exited"
+        );
+    }
+
+    /// A supervisor that ends on its own before any frame reads failed at
+    /// once rather than applying until the timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supervisor_that_ends_before_its_first_frame_reads_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NoFrames)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+
+        reconcile(&args).await.expect("first pass");
+        wait_until("the supervisor ended", || {
+            supervisor_ended(&args.handles, 7)
+        })
+        .await;
+        let s = zones_status(&args, 7, std::time::Instant::now())
+            .await
+            .expect("reported");
+        abort_all(&args.handles);
+        assert_eq!(
+            (s.state, s.error_code),
+            (
+                ZoneApplicationState::Failed,
+                Some(ZoneApplicationError::SupervisorExited)
+            )
+        );
+    }
+
+    /// SPEC-088 Z-5 — a supervisor that applied its zones and then ends on
+    /// its own runs them no more: the read says applying from that moment,
+    /// failed once the timeout passes with no replacement, not applied until
+    /// the next reconcile pass. The replacement generation applies as usual.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_supervisor_that_ends_after_applying_its_zones_stops_reading_applied() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::EndsOnce)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let a = zone_revision(&[]);
+
+        reconcile(&args).await.expect("first pass");
+        wait_until("the supervisor ended", || {
+            supervisor_ended(&args.handles, 7)
+        })
+        .await;
+        let ended = std::time::Instant::now();
+        let exited = zones_status(&args, 7, ended).await.expect("reported");
+        let late = zones_status(&args, 7, ended + APPLICATION_TIMEOUT)
+            .await
+            .expect("reported");
+        reconcile(&args).await.expect("pass that restarts it");
+        wait_until("the replacement applied the zones", || {
+            let s = status(&args, &a);
+            s.state == ZoneApplicationState::Applied && s.generation > exited.generation
+        })
+        .await;
+        abort_all(&args.handles);
+
+        assert_eq!(
+            (exited.applied_revision, exited.state, exited.error_code),
+            (Some(a.clone()), ZoneApplicationState::Applying, None),
+            "a supervisor that applied its zones and ended on its own still reads applied"
+        );
+        assert_eq!(
+            (late.state, late.error_code),
+            (
+                ZoneApplicationState::Failed,
+                Some(ZoneApplicationError::ApplicationTimeout)
+            )
+        );
+    }
+
+    /// SPEC-088 — a restart with the same zones applies nothing until the
+    /// new generation processes a frame of its own, and the old generation's
+    /// late callbacks, carrying its token, count for nothing afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_same_zones_restart_reads_applying_until_the_new_generation_acknowledges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let registry = args.frame_stats.zone_application();
+        let a = zone_revision(&[]);
+        reconcile(&args).await.expect("first pass");
+        wait_until("the first generation applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let g1 = entry_of(&args.handles, 7).zone_generation;
+        let stale = registry.current_request(7, g1).expect("g1 runs A");
+
+        assert!(stop_camera(&args, 7).await, "the supervisor stops");
+        let stopped = status(&args, &a);
+        registry.acknowledge(7, g1, stale, &a, STALE);
+        let after_stale = status(&args, &a);
+        reconcile(&args).await.expect("pass that restarts it");
+        let g2 = entry_of(&args.handles, 7).zone_generation;
+        wait_until("the restarted generation applied A", || {
+            status(&args, &a).applied_generation == Some(g2)
+        })
+        .await;
+        let applied = status(&args, &a);
+        registry.acknowledge(7, g1, stale, &a, STALE);
+        registry.fail(7, g1, stale, ZoneApplicationError::SupervisorExited);
+        let after_late = status(&args, &a);
+        abort_all(&args.handles);
+
+        assert_eq!(
+            (
+                stopped.applied_revision.as_deref(),
+                stopped.generation,
+                stopped.applied_generation,
+                stopped.state
+            ),
+            (
+                Some(a.as_str()),
+                g1,
+                Some(g1),
+                ZoneApplicationState::Applying
+            ),
+            "a stopped generation still read applied"
+        );
+        assert_eq!(
+            after_stale, stopped,
+            "a stopped generation's acknowledgement counted"
+        );
+        assert!(g2 > g1, "the restart is a new generation");
+        assert_eq!(
+            (applied.generation, applied.state),
+            (g2, ZoneApplicationState::Applied)
+        );
+        assert_eq!(
+            after_late, applied,
+            "the old generation's late callbacks counted"
+        );
+    }
+
+    /// SPEC-088 — A→B→A through restarts: while the generation running B is
+    /// current, A saved again cannot be satisfied by A's earlier generation
+    /// or acknowledged by B's; only the replacement A generation applies it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_to_b_to_a_through_restarts_is_applied_only_by_the_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let registry = args.frame_stats.zone_application();
+        let a = zone_revision(&[]);
+        let mut b_cam = cam(None);
+        b_cam.zones.push(corner());
+        let b = zone_revision(&b_cam.zones);
+        reconcile(&args).await.expect("first pass");
+        wait_until("g1 applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let g1 = entry_of(&args.handles, 7).zone_generation;
+        let token_a = registry.current_request(7, g1).expect("g1 runs A");
+
+        save(&args, &b_cam).await;
+        reconcile(&args).await.expect("pass that starts B");
+        let g2 = entry_of(&args.handles, 7).zone_generation;
+        wait_until("g2 applied B", || {
+            status(&args, &b).applied_generation == Some(g2)
+        })
+        .await;
+        let token_b = registry.current_request(7, g2).expect("g2 runs B");
+
+        save(&args, &cam(None)).await;
+        let requested = status(&args, &a);
+        registry.acknowledge(7, g1, token_a, &a, STALE);
+        registry.acknowledge(7, g2, token_b, &b, STALE);
+        let after_stale = status(&args, &a);
+        reconcile(&args).await.expect("pass that starts A again");
+        let g3 = entry_of(&args.handles, 7).zone_generation;
+        wait_until("g3 applied A", || {
+            status(&args, &a).applied_generation == Some(g3)
+        })
+        .await;
+        let applied = status(&args, &a);
+        registry.acknowledge(7, g1, token_a, &a, STALE);
+        registry.acknowledge(7, g2, token_b, &b, STALE);
+        registry.fail(7, g1, token_a, ZoneApplicationError::SupervisorExited);
+        registry.fail(7, g2, token_b, ZoneApplicationError::SupervisorExited);
+        let after_late = status(&args, &a);
+        abort_all(&args.handles);
+
+        assert_eq!(
+            (
+                requested.applied_revision.as_deref(),
+                requested.generation,
+                requested.applied_generation,
+                requested.state
+            ),
+            (
+                Some(b.as_str()),
+                g2,
+                Some(g2),
+                ZoneApplicationState::Applying
+            ),
+            "A saved again read applied while B's generation runs"
+        );
+        assert_eq!(
+            after_stale, requested,
+            "A/g1 or B/g2 acknowledged the new A request"
+        );
+        assert!(g3 > g2 && g2 > g1);
+        assert_eq!(
+            (
+                applied.applied_revision.as_deref(),
+                applied.generation,
+                applied.state
+            ),
+            (Some(a.as_str()), g3, ZoneApplicationState::Applied)
+        );
+        assert_eq!(
+            after_late, applied,
+            "an earlier generation's late callback counted"
+        );
+    }
+
+    /// SPEC-088 — A→B→A saved between two passes, with the generation
+    /// running A never stopped: the acknowledgement taken before B no longer
+    /// counts, and that same generation's next frame applies A again,
+    /// without a restart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_to_b_to_a_between_passes_reapplies_on_the_running_generations_next_frame() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let registry = args.frame_stats.zone_application();
+        let a = zone_revision(&[]);
+        let mut b_cam = cam(None);
+        b_cam.zones.push(corner());
+        reconcile(&args).await.expect("first pass");
+        wait_until("g1 applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let before = entry_of(&args.handles, 7);
+        let g1 = before.zone_generation;
+        let first = registry.current_request(7, g1).expect("g1 runs A");
+
+        let saved_at = chrono::Utc::now();
+        save(&args, &b_cam).await;
+        save(&args, &cam(None)).await;
+        let again = registry.current_request(7, g1);
+        registry.acknowledge(7, g1, first, &a, STALE);
+        wait_until("g1's next frame applied the new request for A", || {
+            let s = status(&args, &a);
+            s.state == ZoneApplicationState::Applied && s.applied_at.is_some_and(|t| t >= saved_at)
+        })
+        .await;
+        let applied = status(&args, &a);
+        reconcile(&args).await.expect("pass after A→B→A");
+        let unchanged = Arc::ptr_eq(&entry_of(&args.handles, 7).task, &before.task);
+        abort_all(&args.handles);
+
+        assert!(
+            again.is_some_and(|t| t != first),
+            "A→B→A is not a new request: {again:?} after {first:?}"
+        );
+        assert_eq!(
+            (applied.generation, applied.applied_generation),
+            (g1, Some(g1)),
+            "a restart applied it, not the running generation"
+        );
+        assert!(unchanged, "A→B→A between passes restarted the camera");
+    }
+
+    /// SPEC-088 — disabled is inactive at once, from the saved flag a read
+    /// sees, with no deadline and no late callback able to change it; a save
+    /// while disabled starts nothing; enabling needs a fresh generation's
+    /// acknowledgement; deletion alone forgets the camera.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_disabled_camera_reads_inactive_and_enabling_needs_a_fresh_acknowledgement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let registry = args.frame_stats.zone_application();
+        let a = zone_revision(&[]);
+        let later = || std::time::Instant::now() + 2 * APPLICATION_TIMEOUT;
+        let read = |s: ZonesRuntime| {
+            (
+                s.desired_revision,
+                s.applied_revision,
+                s.generation,
+                s.applied_generation,
+                s.state,
+                s.error_code,
+            )
+        };
+        reconcile(&args).await.expect("first pass");
+        wait_until("g1 applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let g1 = entry_of(&args.handles, 7).zone_generation;
+        let token = registry.current_request(7, g1).expect("g1 runs A");
+        let inactive_a = (
+            a.clone(),
+            Some(a.clone()),
+            g1,
+            Some(g1),
+            ZoneApplicationState::Inactive,
+            None,
+        );
+
+        let mut disabled = cam(None);
+        disabled.ingest.enabled = false;
+        args.store.upsert_camera(&disabled).await.expect("disable");
+        let at_once = zones_status(&args, 7, std::time::Instant::now()).await;
+        registry.acknowledge(7, g1, token, &a, STALE);
+        registry.fail(7, g1, token, ZoneApplicationError::SupervisorExited);
+        let after_late = zones_status(&args, 7, std::time::Instant::now()).await;
+        reconcile(&args).await.expect("pass after the disable");
+        let stopped = !args.handles.lock().contains_key(&7);
+        let long_after = zones_status(&args, 7, later()).await;
+
+        let mut disabled_b = disabled.clone();
+        disabled_b.zones.push(corner());
+        let b = zone_revision(&disabled_b.zones);
+        save(&args, &disabled_b).await;
+        reconcile(&args)
+            .await
+            .expect("pass after a save while disabled");
+        let started = args.handles.lock().contains_key(&7);
+        let saved_disabled = zones_status(&args, 7, later()).await;
+
+        let mut enabled_b = disabled_b.clone();
+        enabled_b.ingest.enabled = true;
+        save(&args, &enabled_b).await;
+        let enabled = zones_status(&args, 7, std::time::Instant::now()).await;
+        reconcile(&args).await.expect("pass after the enable");
+        let g2 = entry_of(&args.handles, 7).zone_generation;
+        wait_until("g2 applied B", || {
+            status(&args, &b).applied_generation == Some(g2)
+        })
+        .await;
+        let applied = zones_status(&args, 7, std::time::Instant::now()).await;
+
+        args.store.delete_camera(7).await.expect("delete");
+        reconcile(&args).await.expect("pass after the delete");
+        let deleted = zones_status(&args, 7, std::time::Instant::now()).await;
+        args.store
+            .upsert_camera(&cam(None))
+            .await
+            .expect("re-create");
+        let recreated = zones_status(&args, 7, std::time::Instant::now()).await;
+        abort_all(&args.handles);
+
+        assert_eq!(
+            at_once.map(read),
+            Some(inactive_a.clone()),
+            "a disable read before the pass"
+        );
+        assert_eq!(
+            after_late.map(read),
+            Some(inactive_a.clone()),
+            "a late callback counted"
+        );
+        assert!(stopped, "the disabled camera still runs");
+        assert_eq!(
+            long_after.map(read),
+            Some(inactive_a),
+            "inactive is not timed out"
+        );
+        assert!(!started, "a save while disabled started a generation");
+        assert_eq!(
+            saved_disabled.map(read),
+            Some((
+                b.clone(),
+                Some(a.clone()),
+                g1,
+                Some(g1),
+                ZoneApplicationState::Inactive,
+                None
+            ))
+        );
+        assert_eq!(
+            enabled.map(|s| (s.state, s.error_code)),
+            Some((ZoneApplicationState::Applying, None)),
+            "an enable read applied or failed before any generation ran B"
+        );
+        assert!(g2 > g1);
+        assert_eq!(
+            applied.map(|s| (s.applied_revision, s.state)),
+            Some((Some(b), ZoneApplicationState::Applied))
+        );
+        assert_eq!(deleted, None, "a deleted camera is reported");
+        assert_eq!(
+            recreated.map(|s| (s.applied_revision, s.applied_generation)),
+            Some((None, None)),
+            "the deleted camera's history outlived it"
+        );
+    }
+
+    /// SPEC-088 — a pass is a request too: zones saved by a writer that
+    /// bypasses the API's save, and read by nobody, still let the generation
+    /// the pass starts for them acknowledge, rather than time out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pass_requests_the_zones_it_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let registry = args.frame_stats.zone_application();
+        reconcile(&args).await.expect("first pass");
+        wait_until("g1 applied A", || {
+            status(&args, &zone_revision(&[])).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let mut b_cam = cam(None);
+        b_cam.zones.push(corner());
+        args.store
+            .upsert_camera(&b_cam)
+            .await
+            .expect("save B behind the API");
+        reconcile(&args).await.expect("pass that starts B");
+        let g2 = entry_of(&args.handles, 7).zone_generation;
+        wait_until("g2 can acknowledge B with no read", || {
+            registry.current_request(7, g2).is_some()
+        })
+        .await;
+        abort_all(&args.handles);
+    }
+
+    /// SPEC-088 — a running camera deleted and re-created with the same id
+    /// and config before any pass saw the delete: the registry forgot the
+    /// running supervisor's generation, so the next pass restarts it rather
+    /// than keep a supervisor nothing it processes can acknowledge, and the
+    /// camera reads applied again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_camera_deleted_and_re_created_before_a_pass_applies_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let args = reconciler_args(recorder, dir.path(), &[cam(None)]).await;
+        let a = zone_revision(&[]);
+        reconcile(&args).await.expect("first pass");
+        wait_until("g1 applied A", || {
+            status(&args, &a).state == ZoneApplicationState::Applied
+        })
+        .await;
+        let g1 = entry_of(&args.handles, 7).zone_generation;
+
+        // What the API's delete does, then the same row saved again.
+        args.store.delete_camera(7).await.expect("delete");
+        args.frame_stats.zone_application().remove(7);
+        save(&args, &cam(None)).await;
+        reconcile(&args).await.expect("pass after the re-create");
+        let g2 = entry_of(&args.handles, 7).zone_generation;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while status(&args, &a).state != ZoneApplicationState::Applied
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let read = status(&args, &a);
+        abort_all(&args.handles);
+
+        assert!(g2 > g1, "the pass kept the supervisor the registry forgot");
+        assert_eq!(
+            (read.state, read.generation, read.applied_generation),
+            (ZoneApplicationState::Applied, g2, Some(g2)),
+            "the re-created camera never applied its zones"
         );
     }
 
@@ -2198,6 +3930,132 @@ mod tests {
         );
     }
 
+    /// SPEC-088 Z-4 — the forced stop. A supervisor parked inside
+    /// `recorder.open` cannot honour a stop, so after
+    /// [`SUPERVISOR_STOP_TIMEOUT`] `stop_camera` aborts it. The abort lands at
+    /// the supervisor's next await, and its entry used to leave the map at
+    /// once, out of shutdown's sweep while a supervisor still mid-poll could
+    /// finish that open. `stop_camera` must return only once the aborted
+    /// supervisor has ended, and its open must never complete.
+    #[tokio::test]
+    async fn a_forced_stop_ends_the_supervisor_before_it_leaves_the_map() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = GatedOpenRecorder::new();
+        let args = reconciler_args(recorder.clone(), dir.path(), &[cam(None)]).await;
+
+        reconcile(&args).await.expect("initial pass");
+        wait_until(
+            "precondition: the supervisor is blocked inside recorder.open",
+            || recorder.calls() == [GateCall::OpenBlocked],
+        )
+        .await;
+        let original = entry_of(&args.handles, 7);
+
+        // Nothing below waits on I/O, so the stop's timeout can elapse on the
+        // runtime's paused clock.
+        tokio::time::pause();
+        stop_camera(&args, 7).await;
+        let ended = original.task.is_finished();
+        let in_map = args.handles.lock().contains_key(&7);
+        recorder.release();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        assert!(
+            ended,
+            "stop_camera returned before the supervisor it aborted had ended"
+        );
+        assert!(!in_map, "a stopped camera stays out of the map");
+        assert_eq!(
+            recorder.calls(),
+            [GateCall::OpenBlocked],
+            "the aborted supervisor's open completed after its stop"
+        );
+    }
+
+    /// SPEC-088 review — a supervisor wedged in synchronous code (blocking
+    /// storage work, say) outlives both of `stop_camera`'s waits, its abort
+    /// included. It must stay in the map, where shutdown's sweep finds it,
+    /// with no replacement started beside it, and later passes must not wait
+    /// for it again; once it has ended, one pass starts exactly one
+    /// replacement.
+    #[tokio::test]
+    async fn a_supervisor_that_outlives_its_abort_stays_tracked_and_unreplaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let recorder = ScriptedRecorder::new(&[(7, SourceScript::NeverEnds)]);
+        let mut toggled = cam(None);
+        toggled.behavior.parking_lot_mode = true;
+        let args = reconciler_args(recorder, dir.path(), &[toggled]).await;
+        // Started for the camera before the toggle, on a runtime of its own so
+        // it can block a thread where no abort lands until the test lets it go.
+        let wedge_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("runtime");
+        let (stop, stop_rx) = tokio::sync::watch::channel(false);
+        let (unwedge, wedged) = std::sync::mpsc::channel::<()>();
+        let (entering, entered) = std::sync::mpsc::channel::<()>();
+        let original = RunningCameraEntry {
+            task: Arc::new(wedge_rt.spawn(async move {
+                let _stop_rx = stop_rx;
+                let _ = entering.send(());
+                let _ = wedged.recv();
+                std::future::pending::<()>().await
+            })),
+            stop: Arc::new(stop),
+            key: EntryKey::wanted(&args, &cam(None)),
+            sessions: Sessions {
+                main_pending: None,
+                analysis: None,
+            },
+            zone_generation: 0,
+        };
+        args.handles.lock().insert(7, original.clone());
+        let is_original = |h: &HandleMap| {
+            h.lock()
+                .get(&7)
+                .is_some_and(|e| Arc::ptr_eq(&e.task, &original.task))
+        };
+
+        // No await is left between its signal and its block: an abort sent
+        // from here cannot land before it.
+        entered
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the supervisor never reached its blocking receive");
+        // Both waits elapse on the paused clock; the abort cannot land.
+        tokio::time::pause();
+        let stopped = stop_camera(&args, 7).await;
+        tokio::time::resume();
+        let kept = !stopped && is_original(&args.handles);
+        // Real time from here: a pass that waited for it again would take 40 s.
+        let pass = tokio::time::timeout(std::time::Duration::from_secs(5), reconcile(&args)).await;
+        let unreplaced = is_original(&args.handles);
+
+        unwedge.send(()).expect("wedged task waits");
+        wait_until("the aborted supervisor ended", || {
+            original.task.is_finished()
+        })
+        .await;
+        reconcile(&args).await.expect("pass after it ended");
+        let replacement = entry_of(&args.handles, 7);
+        reconcile(&args).await.expect("pass with nothing to change");
+        let after = entry_of(&args.handles, 7);
+        abort_all(&args.handles);
+        wedge_rt.shutdown_background();
+
+        assert!(kept, "a supervisor that outlived its abort left the map");
+        assert!(
+            matches!(pass, Ok(Ok(()))),
+            "a later pass waited for the aborted supervisor again"
+        );
+        assert!(unreplaced, "a replacement started beside a live supervisor");
+        assert!(
+            !Arc::ptr_eq(&replacement.task, &original.task)
+                && !replacement.task.is_finished()
+                && Arc::ptr_eq(&after.task, &replacement.task),
+            "once it ended, exactly one replacement must start"
+        );
+    }
+
     /// One named `CameraBehavior` edit, for the tables below.
     type BehaviorMutation = (&'static str, fn(&mut CameraBehavior));
 
@@ -2212,6 +4070,7 @@ mod tests {
             analysis_url: None,
             score_threshold: None,
             behavior: behavior.clone(),
+            zones: vec![],
         }
     }
 

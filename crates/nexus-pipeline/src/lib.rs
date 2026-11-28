@@ -39,6 +39,7 @@ pub mod stats;
 pub mod supervisor;
 pub mod tile;
 pub mod tile_executor;
+pub mod zone_application;
 
 #[cfg(feature = "gstreamer")]
 pub mod gst_clip_recorder;

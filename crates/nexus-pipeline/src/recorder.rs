@@ -337,6 +337,25 @@ pub trait ClipRecorder: Send + Sync {
     /// nothing muxable) doesn't have to opt in.
     async fn shutdown(&self) {}
 
+    /// [`Self::shutdown`]'s drain for one camera: finalize, once each, the
+    /// clips still registered for `camera_id`, wait for the camera's opens
+    /// and closes still in flight (an open yet to register its clip, a close
+    /// that already took one), and return when all of it is done; `Err`
+    /// while a clip of the camera could not be finalized, by this drain or
+    /// by any earlier close, until a retry completes it or it has failed
+    /// three times (it then retries on its own and stays in
+    /// [`Self::recording_degradations`] until it is finalized). The
+    /// engine calls it once a camera's supervisor has ended and starts no
+    /// replacement, nor removes
+    /// the camera's ingester, until it returns `Ok`: an aborted supervisor
+    /// never reaches the close of a clip it held, which would otherwise keep
+    /// recording beside the replacement's (SPEC-088 Z-4). Default no-op, as
+    /// for `shutdown`.
+    #[allow(unused_variables)]
+    async fn drain_camera(&self, camera_id: CameraId) -> Result<(), RecorderError> {
+        Ok(())
+    }
+
     /// Feed one gated frame's tracked-object boxes into the per-camera
     /// alert-clip box timeline (M-Alert-Clip). The supervisor calls
     /// this only while `clips.alert_clips.enabled`, so the default

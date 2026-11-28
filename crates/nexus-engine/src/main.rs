@@ -787,6 +787,11 @@ async fn run(mut cfg: Config, cli: Cli) -> Result<()> {
     // layer (reader: `GET /v1/cameras/:id/stats` and the merged
     // health column on `GET /api/v1/cameras`).
     let frame_stats = Arc::new(FrameStatsRegistry::new());
+    // SPEC-088: before any supervisor starts, so zone generations stay above
+    // the previous boot's even if the clock stepped back across the restart.
+    frame_stats
+        .zone_application()
+        .load_generation_floor(cfg.runtime.state_dir.join("zone_generation_floor"));
     // BUG-071: per-camera decode health, written by each pre-roll ingester's
     // GStreamer threads on either side of the decoder. Separate from
     // `frame_stats` because that one is written by the supervisor, downstream

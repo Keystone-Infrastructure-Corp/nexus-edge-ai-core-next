@@ -813,6 +813,35 @@ export interface ZoneConfig {
   kind: ZoneKind;
 }
 
+// SPEC-088 zone application, hand-mirrored from `CameraConfigSnapshot`
+// (crates/nexus-engine/src/api.rs) and `ZonesRuntime`
+// (crates/nexus-pipeline/src/zone_application.rs).
+
+/**
+ * `GET /admin/cameras/{id}/config-snapshot`: the saved zones and the
+ * engine's revision of exactly them. Read-only: never a `CameraConfig` and
+ * never a PUT body.
+ */
+export interface CameraConfigSnapshot {
+  schema_version: 1;
+  camera_id: number;
+  settings: { zones: ZoneConfig[] };
+  zones_revision: string;
+}
+
+/** The optional `zones_runtime` receipt on a camera-stats read. */
+export interface ZonesRuntime {
+  schema_version: 1;
+  desired_revision: string;
+  applied_revision: string | null;
+  generation: number;
+  /** Absent from receipts that predate it: such a receipt is never verified. */
+  applied_generation?: number | null;
+  state: "inactive" | "applying" | "applied" | "failed";
+  applied_at: string | null;
+  error_code: string | null;
+}
+
 // ---------------------------------------------------------------------------
 // Motion events + histogram (hand-mirrored from nexus-store / motion handler).
 // ---------------------------------------------------------------------------

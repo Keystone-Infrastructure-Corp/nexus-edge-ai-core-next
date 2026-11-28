@@ -399,6 +399,10 @@ impl CameraConfig {
     /// console's, fails. Every write that takes a camera from outside checks
     /// this first: the config file at load, and the admin API's and fleet
     /// apply's camera writes.
+    ///
+    /// The same writes also refuse a zone polygon the supervisor cannot apply
+    /// as saved (SPEC-088): a vertex outside the normalized frame, or fewer
+    /// than three vertices. It is refused, never clamped or reordered.
     pub fn validate_finite(&self) -> Result<(), String> {
         for zone in &self.zones {
             if zone
@@ -411,6 +415,23 @@ impl CameraConfig {
                     zone.id
                 ));
             }
+            if zone
+                .polygon
+                .iter()
+                .any(|(x, y)| !(0.0..=1.0).contains(x) || !(0.0..=1.0).contains(y))
+            {
+                return Err(format!(
+                    "zone '{}' has a polygon vertex outside the frame (0..1)",
+                    zone.id
+                ));
+            }
+            if zone.polygon.len() < 3 {
+                return Err(format!(
+                    "zone '{}' needs at least 3 polygon vertices, got {}",
+                    zone.id,
+                    zone.polygon.len()
+                ));
+            }
         }
         match &self.detector.model_override {
             Some(model) => model
@@ -421,7 +442,7 @@ impl CameraConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZoneConfig {
     pub id: String,
@@ -450,4 +471,73 @@ pub enum ZoneKind {
     Inclusion,
     Exclusion,
     Dwell,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zone_equality_includes_area_override() {
+        let a = ZoneConfig {
+            id: "z1".into(),
+            name: "Excluded".into(),
+            polygon: vec![(0.0, 0.0), (1.0, 0.0), (0.0, 1.0)],
+            kind: ZoneKind::Exclusion,
+            min_bbox_area_px_override: None,
+        };
+        let mut b = a.clone();
+        b.min_bbox_area_px_override = Some(40);
+        assert_ne!(a, b);
+    }
+
+    /// Every outside camera write (config load, the admin API's PUT and POST)
+    /// calls `validate_finite`, so a polygon it refuses never reaches the
+    /// store or a supervisor.
+    #[test]
+    fn a_zone_polygon_the_supervisor_cannot_apply_is_refused() {
+        let camera = |polygon: Vec<(f32, f32)>| -> CameraConfig {
+            let mut cam: CameraConfig =
+                toml::from_str("name = \"c1\"\nurl = \"rtsp://example/cam\"").unwrap();
+            cam.zones = vec![ZoneConfig {
+                id: "z1".into(),
+                name: "door".into(),
+                polygon,
+                kind: ZoneKind::Exclusion,
+                min_bbox_area_px_override: None,
+            }];
+            cam
+        };
+        assert_eq!(
+            camera(vec![(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)]).validate_finite(),
+            Ok(())
+        );
+        assert_eq!(
+            camera(vec![(0.0, 0.0), (1.0, 0.0), (1.0, 1.0)]).validate_finite(),
+            Ok(()),
+            "the frame's own corners are inside it"
+        );
+        for (what, polygon, refusal) in [
+            (
+                "x beyond the frame",
+                vec![(1.01, 0.1), (0.9, 0.1), (0.5, 0.9)],
+                "outside the frame",
+            ),
+            (
+                "negative y",
+                vec![(0.1, -0.01), (0.9, 0.1), (0.5, 0.9)],
+                "outside the frame",
+            ),
+            (
+                "NaN",
+                vec![(f32::NAN, 0.1), (0.9, 0.1), (0.5, 0.9)],
+                "finite",
+            ),
+            ("two vertices", vec![(0.1, 0.1), (0.9, 0.9)], "at least 3"),
+            ("no vertices", vec![], "at least 3"),
+        ] {
+            let why = camera(polygon).validate_finite().expect_err(what);
+            assert!(why.contains(refusal), "{what}: {why}");
+        }
+    }
 }

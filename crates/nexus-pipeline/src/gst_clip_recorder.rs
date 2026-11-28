@@ -99,7 +99,7 @@
 //! in (e.g. ingester build error) still triggers a `Refused` with a
 //! one-shot warn log at `open()` time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -111,12 +111,12 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app::{AppSrc, AppStreamType};
 use nexus_config::AlertClipsConfig;
-use nexus_store::{AlertClipId, ClipClose, ClipId, NewAlertClip, NewClip, Store};
+use nexus_store::{AlertClipId, ClipClose, ClipDamage, ClipId, NewAlertClip, NewClip, Store};
 use nexus_types::{CameraId, CodecKind};
 use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use tokio::fs;
-use tokio::sync::{broadcast, oneshot, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
-use tracing::{debug, info, warn};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tracing::{debug, error, info, warn};
 
 use crate::alert_clip::{
     alert_clip_inflight_path, alert_clip_rel_path, encode_alert_clip, trim_preroll, BoxFrame,
@@ -134,6 +134,33 @@ use crate::source::gst_init;
 /// EOS at close time. 5s is generous; in practice mp4mux flushes in
 /// well under a second once it sees EOS at the appsrc head.
 const EOS_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often `shutdown` looks for a clip an in-flight open registered while
+/// another owned task is still running.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
+
+/// How long `shutdown` gives its last attempt at the clips it could not
+/// finalize, inside the engine's 15 s recorder shutdown budget.
+const SHUTDOWN_FINALIZE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Failed attempts at finalizing a clip, its close included, for which
+/// [`ClipRecorder::drain_camera`] keeps its camera stopping (SPEC-088).
+const FINALIZE_DRAINS: u32 = 3;
+
+/// A clip whose close could not finalize it retries on its own after this
+/// delay, doubled after each failed attempt up to [`FINALIZE_RETRY_MAX`].
+const FINALIZE_RETRY_MIN: Duration = Duration::from_secs(5);
+const FINALIZE_RETRY_MAX: Duration = Duration::from_secs(300);
+
+/// The delays before each of a clip's own retries, endless.
+fn finalize_retry_delays() -> impl Iterator<Item = Duration> {
+    std::iter::successors(Some(FINALIZE_RETRY_MIN), |d| {
+        Some((*d * 2).min(FINALIZE_RETRY_MAX))
+    })
+}
+
+/// Recording-health reason of a clip whose close did not finish.
+const UNFINALIZED: &str = "recording could not be finalized";
 
 /// Container stamped on every row this recorder writes.
 const CONTAINER: &str = "mp4";
@@ -173,12 +200,25 @@ pub struct GstClipRecorder {
     panic: PlMutex<bool>,
     /// Per-clip GStreamer + pump state. Held under a tokio Mutex
     /// because the close path awaits on the pump shutdown and the
-    /// bus drain.
-    open: Mutex<HashMap<ClipId, OpenState>>,
+    /// bus drain. Shared with the open/close tasks (see [`Writers`]).
+    open: Arc<Mutex<HashMap<ClipId, OpenState>>>,
     /// Per open clip, set by its live pump when a sample of another
     /// stream epoch ended the clip's media (#375/#376). Kept out of
     /// [`Self::open`] because the supervisor reads it on every frame.
-    epoch_ended: PlRwLock<HashMap<ClipId, Arc<AtomicBool>>>,
+    epoch_ended: Arc<PlRwLock<HashMap<ClipId, Arc<AtomicBool>>>>,
+    /// Clips whose writer was finalized but whose row step failed, kept
+    /// until a retry completes it, whoever awaited the close (SPEC-088).
+    unfinalized: Arc<PlMutex<HashMap<ClipId, Unfinalized>>>,
+    /// Every running open/close task holds a receiver; `shutdown` waits
+    /// on `closed()` until none is left (SPEC-088 Z-4).
+    in_flight: watch::Sender<()>,
+    /// [`Self::in_flight`] per camera: every running open/close task of the
+    /// camera holds a receiver too, and `drain_camera` waits on `closed()`
+    /// until none is left (SPEC-088 Z-4).
+    camera_in_flight: PlMutex<HashMap<CameraId, watch::Sender<()>>>,
+    /// Set when `shutdown` begins. Every open checks it before its writer
+    /// starts, so none starts that shutdown cannot see (SPEC-088 Z-4).
+    shutting_down: Arc<PlMutex<bool>>,
     /// M2.2: optional bus for publishing `CLIP_CLOSED` so the cold
     /// replicator can pick up new clips event-driven instead of
     /// waiting on its 5-min polling backstop. None in tests that
@@ -317,6 +357,37 @@ struct PumpStats {
 // gst::Pipeline / AppSrc are Send + Sync by GObject contract, so
 // OpenState is auto-Send + auto-Sync.
 
+/// The row step a close could not complete, retried as recorded: the
+/// clip's writer is already finalized and is never reopened.
+#[derive(Clone)]
+enum FinalStep {
+    /// A damaged clip's close carries its damage, written with it.
+    Close(ClipClose, Option<ClipDamage>),
+    Discard,
+}
+
+impl FinalStep {
+    async fn run(&self, store: &Store, clip_id: ClipId) -> Result<(), nexus_store::StoreError> {
+        match self {
+            FinalStep::Close(close, None) => store.close_clip(clip_id, close).await,
+            FinalStep::Close(close, Some(damage)) => {
+                store.close_damaged_clip(clip_id, close, damage).await
+            }
+            FinalStep::Discard => store.discard_clip_metadata(clip_id).await,
+        }
+    }
+}
+
+struct Unfinalized {
+    camera_id: CameraId,
+    step: FinalStep,
+    /// Failed attempts, the close's included.
+    attempts: u32,
+    /// A drain's retry is running.
+    retrying: bool,
+    error: String,
+}
+
 /// Per-camera in-flight alert clip, for burst coalescing (M-Alert-Clip).
 /// While one exists and its `deadline` hasn't passed, a new alert on the
 /// same camera coalesces into it (bumping the deadline) instead of
@@ -374,8 +445,12 @@ impl GstClipRecorder {
             ingesters: Arc::new(PlRwLock::new(ingesters)),
             analysis_ingesters: Arc::new(PlRwLock::new(HashMap::new())),
             panic: PlMutex::new(false),
-            open: Mutex::new(HashMap::new()),
-            epoch_ended: PlRwLock::new(HashMap::new()),
+            open: Arc::new(Mutex::new(HashMap::new())),
+            epoch_ended: Arc::new(PlRwLock::new(HashMap::new())),
+            unfinalized: Arc::new(PlMutex::new(HashMap::new())),
+            in_flight: watch::channel(()).0,
+            camera_in_flight: PlMutex::new(HashMap::new()),
+            shutting_down: Arc::new(PlMutex::new(false)),
             bus: None,
             usb_resolver: None,
             preferred_usb_label: crate::recorder::PreferredUsbLabel::default(),
@@ -710,272 +785,218 @@ impl GstClipRecorder {
     }
 }
 
-#[async_trait]
-impl ClipRecorder for GstClipRecorder {
-    async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
-        let health = self
-            .recording_health
-            .begin(args.camera_id, RecordingKind::Motion);
-        let failure = health.guard("recording could not be opened");
-        if *self.panic.lock() {
-            return Err(RecorderError::Refused);
+/// What starting and finalizing a clip needs, owned so the work runs in a
+/// task that a cancelled `open`/`close` caller cannot drop (SPEC-088 Z-4).
+#[derive(Clone)]
+struct Writers {
+    store: Arc<Store>,
+    clips_dir: PathBuf,
+    bus: Option<Arc<dyn nexus_bus::Bus>>,
+    open: Arc<Mutex<HashMap<ClipId, OpenState>>>,
+    epoch_ended: Arc<PlRwLock<HashMap<ClipId, Arc<AtomicBool>>>>,
+    unfinalized: Arc<PlMutex<HashMap<ClipId, Unfinalized>>>,
+    in_flight: watch::Sender<()>,
+    shutting_down: Arc<PlMutex<bool>>,
+}
+
+impl GstClipRecorder {
+    fn writers(&self) -> Writers {
+        Writers {
+            store: self.store.clone(),
+            clips_dir: self.clips_dir.clone(),
+            bus: self.bus.clone(),
+            open: self.open.clone(),
+            epoch_ended: self.epoch_ended.clone(),
+            unfinalized: self.unfinalized.clone(),
+            in_flight: self.in_flight.clone(),
+            shutting_down: self.shutting_down.clone(),
         }
-        let ingester = match self.ingesters.read().get(&args.camera_id) {
-            Some(i) => i.clone(),
-            None => {
-                warn!(
-                    camera_id = args.camera_id,
-                    "GstClipRecorder: no PreRollIngester for this camera; refusing open. \
-                     The engine's config.changed reconciler should have built one — \
-                     check the engine log for `failed to start pre-roll ingester` warnings."
-                );
-                return Err(RecorderError::Refused);
-            }
-        };
-        let codec = ingester.stream_codec();
+    }
 
-        // Resolve USB hot-tier routing once at open(). The choice
-        // is captured into `OpenState` so close() finishes the clip
-        // in the same dir even if the volume detaches mid-recording.
-        // `preferred_usb_label.get()` reads the *current* admin
-        // setting; an in-flight clip ignores subsequent PUTs.
-        let preferred = self.preferred_usb_label.get();
-        let (effective_dir, hot_handle) = crate::recorder::effective_clips_dir(
-            &self.clips_dir,
-            preferred.as_deref(),
-            self.usb_resolver
-                .as_deref()
-                .map(|r| r as &dyn crate::recorder::UsbResolver),
-        );
-
-        let path =
-            crate::recorder::inflight_clip_path(&effective_dir, args.camera_id, args.started_at);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-
-        let (pipeline, appsrc) = Self::build_pipeline(&path, codec)?;
-        // set_state(Playing) returns Async; appsrc starts accepting
-        // pushes immediately. We push the pre-roll snapshot before
-        // even waiting for the state change to complete — the queue
-        // inside appsrc absorbs them.
-        if let Err(e) = pipeline.set_state(gst::State::Playing) {
-            let _ = pipeline.set_state(gst::State::Null);
-            let _ = fs::remove_file(&path).await;
-            return Err(RecorderError::Io(std::io::Error::other(format!(
-                "set Playing: {e}"
-            ))));
-        }
-
-        // Snapshot the ring buffer + subscribe to live BEFORE either
-        // path can race the other. The subscribe happens-before any
-        // sample produced after `subscribe()` returns, so we won't
-        // double-count samples that straddle the snapshot boundary
-        // (the snapshot is a copy of what's *already* buffered, the
-        // broadcast carries everything from this moment forward).
-        // There is a small overlap: a sample currently in the ring
-        // buffer might also arrive on the broadcast a few moments
-        // later. That's fine — we de-dup by PTS in the pump (skip
-        // anything <= last_pushed_pts).
-        let snapshot = ingester.snapshot();
-        let live_rx = ingester.subscribe();
-
-        // Determine the rebase anchor. mp4mux wants PTS to start at
-        // (or near) zero for a sane track timeline. The first sample
-        // is guaranteed to be a keyframe (ring buffer invariant) but
-        // may have no PTS during stream startup; fall back to
-        // Duration::ZERO in that case.
-        let base_pts = snapshot
-            .iter()
-            .find_map(|s| s.pts)
-            .unwrap_or(Duration::ZERO);
-
-        // Push the snapshot synchronously so close()-immediately-after-open()
-        // still produces a file with the pre-roll content. Wrapped
-        // in spawn_blocking because appsrc.push_buffer() with
-        // block=true can stall briefly on filesink/disk pressure
-        // (and we MUST NOT block the tokio worker on a GStreamer
-        // synchronous call).
-        //
-        // Pre-pass: coalesce any consecutive samples sharing a PTS
-        // into one combined sample so the recorder's h264parse sees
-        // a complete AU per push. See `coalesce_same_pts` for why
-        // the InSight cameras need this.
-        let snapshot_tail_pts = snapshot.iter().filter_map(|s| s.pts).next_back();
-        // The clip's stream epoch (#375/#376). A ring snapshot holds exactly
-        // one; when it is empty the pump adopts the first live keyframe's.
-        let clip_epoch = snapshot.first().map(|s| s.epoch);
-        let snapshot_for_blocking: Vec<NalSample> = {
-            let mut pending: Option<NalSample> = None;
-            let mut out: Vec<NalSample> = Vec::with_capacity(snapshot.len());
-            for s in snapshot {
-                if let Some(flushed) = coalesce_same_pts(&mut pending, s, codec) {
-                    out.push(flushed);
+    /// Retry `clip_id`'s failed row step once, as the camera's work, which
+    /// its drain waits for.
+    fn spawn_finalize_retry(&self, clip_id: ClipId, camera_id: CameraId, step: FinalStep) {
+        let store = self.store.clone();
+        let unfinalized = self.unfinalized.clone();
+        self.spawn_owned(camera_id, async move {
+            if !retry_finalize(&store, &unfinalized, clip_id, camera_id, &step).await {
+                if let Some(u) = unfinalized.lock().get_mut(&clip_id) {
+                    u.retrying = false;
                 }
             }
-            // Drain any tail. If it's a header-only stub (no slice
-            // NAL), drop it — pushing it would just create the
-            // 35-byte "missing picture" pathology we're guarding
-            // against.
-            if let Some(last) = pending.take() {
-                if contains_slice_nal(&last.data, codec) {
-                    out.push(last);
-                } else {
-                    debug!(
-                        camera_id = args.camera_id,
-                        size = last.data.len(),
-                        "dropping snapshot tail: header-only stub (no slice NAL)"
-                    );
-                }
-            }
-            out
-        };
-        // Live pump: forwards every new broadcast sample into appsrc
-        // until close() signals stop.
-        //
-        // SPAWNED BEFORE the pre-roll prepend and the `motion_clips`
-        // INSERT, on purpose. `live_rx` was subscribed at the top of
-        // this function, and tokio's broadcast silently overwrites the
-        // OLDEST buffered sample once its 512-slot ring wraps (~8 s at
-        // 30 fps). The oldest sample is the GOP's IDR, so anything that
-        // keeps this task from polling `live_rx` costs the recording
-        // every keyframe from that point on -- which is exactly what
-        // the serial pre-roll push plus the SQLite INSERT below used to
-        // do: clips played back fine for the pre-roll window and then
-        // decayed into a keyframe-less, undecodable tail. The pump now
-        // drains from t=0 and buffers what it reads until `gate_tx`
-        // hands it the clip id and the pre-roll's PTS cursor.
-        let (gate_tx, gate_rx) = oneshot::channel::<PumpGate>();
-        let (pump_stop_tx, pump_stop_rx) = oneshot::channel();
-        let epoch_ended = Arc::new(AtomicBool::new(false));
-        let pump_handle = tokio::spawn(run_live_pump(
-            args.camera_id,
-            codec,
-            appsrc.clone(),
-            live_rx,
-            // An empty prepend leaves the pump to start the clip on its
-            // first keyframe and rebase there.
-            (!snapshot_for_blocking.is_empty()).then_some(base_pts),
-            gate_rx,
-            pump_stop_rx,
-            clip_epoch,
-            epoch_ended.clone(),
-        ));
-
-        let appsrc_for_blocking = appsrc.clone();
-        let (preroll_count, preroll_last_written_pts_ns) =
-            match tokio::task::spawn_blocking(move || {
-                let mut n = 0usize;
-                let mut last_written: Option<u64> = None;
-                for sample in &snapshot_for_blocking {
-                    let written = push_sample(
-                        &appsrc_for_blocking,
-                        sample,
-                        base_pts,
-                        last_written,
-                        FALLBACK_FRAME_INTERVAL_NS,
-                    )
-                    .map_err(|e| {
-                        RecorderError::Io(std::io::Error::other(format!(
-                            "push pre-roll sample: {e}"
-                        )))
-                    })?;
-                    last_written = Some(written);
-                    n += 1;
-                }
-                Ok::<(usize, Option<u64>), RecorderError>((n, last_written))
-            })
-            .await
-            {
-                Ok(Ok((n, last))) => (n, last),
-                Ok(Err(e)) => {
-                    pump_handle.abort();
-                    let _ = pipeline.set_state(gst::State::Null);
-                    let _ = fs::remove_file(&path).await;
-                    return Err(e);
-                }
-                Err(join_err) => {
-                    pump_handle.abort();
-                    let _ = pipeline.set_state(gst::State::Null);
-                    let _ = fs::remove_file(&path).await;
-                    return Err(RecorderError::Io(std::io::Error::other(format!(
-                        "preroll spawn_blocking: {join_err}"
-                    ))));
-                }
-            };
-
-        let rel = crate::recorder::clip_rel_path(&self.clips_dir, &path);
-        let new = NewClip {
-            camera_id: args.camera_id,
-            started_at: args.started_at,
-            hot_path: rel,
-            codec: codec.base().into(),
-            container: CONTAINER.into(),
-            // M2.2: "local" or "usb-<label>" depending on the hot
-            // tier resolution above. Cold pointer is left null for
-            // the replicator to fill in after the close-time hash.
-            hot_handle: hot_handle.clone(),
-            frame_width: args.frame_width,
-            frame_height: args.frame_height,
-        };
-        let clip_id = match self.store.open_clip(&new).await {
-            Ok(id) => id,
-            Err(e) => {
-                pump_handle.abort();
-                let _ = pipeline.set_state(gst::State::Null);
-                let _ = fs::remove_file(&path).await;
-                return Err(e.into());
-            }
-        };
-
-        // Open the gate. The pump flushes whatever it buffered while
-        // the prepend + INSERT ran, then streams normally.
-        let _ = gate_tx.send(PumpGate {
-            clip_id,
-            last_pushed_pts: snapshot_tail_pts,
-            last_written_pts_ns: preroll_last_written_pts_ns,
         });
+    }
 
-        self.epoch_ended.write().insert(clip_id, epoch_ended);
-        self.open.lock().await.insert(
-            clip_id,
-            OpenState {
-                health,
-                camera_id: args.camera_id,
-                started_at: args.started_at,
-                path,
-                effective_dir,
-                hot_handle,
-                codec,
-                pipeline,
-                appsrc,
-                pump_stop: Some(pump_stop_tx),
-                pump_handle: Some(pump_handle),
-                preroll_last_written_pts_ns,
-            },
-        );
-        info!(
-            camera_id = args.camera_id,
-            clip_id,
-            preroll_samples = preroll_count,
-            "gst recorder opened clip (pre-roll prepended)"
-        );
-        failure.complete();
-        Ok(ClipHandle {
-            clip_id,
-            camera_id: args.camera_id,
+    /// Finalize `handle` in an owned task for a drain ([`ClipRecorder::shutdown`],
+    /// [`ClipRecorder::drain_camera`]), through the full `close()` path (EOS →
+    /// moov flush → rename → row stamp). A concurrent supervisor close of the
+    /// same clip is safe: whichever calls `open.remove()` first wins, the
+    /// loser gets `UnknownClip`, which is swallowed.
+    fn spawn_drain_close(
+        &self,
+        handle: ClipHandle,
+    ) -> tokio::task::JoinHandle<Result<(), RecorderError>> {
+        let writers = self.writers();
+        self.spawn_owned(handle.camera_id, async move {
+            let ended_at = Utc::now();
+            match writers.close(handle, ClipFinal { ended_at }).await {
+                Ok(_) | Err(RecorderError::UnknownClip(_)) => Ok(()),
+                Err(e) => {
+                    warn!(
+                        clip_id = handle.clip_id,
+                        camera_id = handle.camera_id,
+                        error = %e,
+                        "gst recorder: failed to finalise clip during drain"
+                    );
+                    Err(e)
+                }
+            }
         })
     }
 
+    fn camera_in_flight(&self, camera_id: CameraId) -> watch::Sender<()> {
+        self.camera_in_flight
+            .lock()
+            .entry(camera_id)
+            .or_insert_with(|| watch::channel(()).0)
+            .clone()
+    }
+
+    /// Spawn `fut`, recorder work of `camera_id`, as a task `shutdown` and
+    /// `drain_camera` wait for.
+    fn spawn_owned<T: Send + 'static>(
+        &self,
+        camera_id: CameraId,
+        fut: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> tokio::task::JoinHandle<T> {
+        let in_flight = (
+            self.in_flight.subscribe(),
+            self.camera_in_flight(camera_id).subscribe(),
+        );
+        tokio::spawn(async move {
+            let _in_flight = in_flight;
+            fut.await
+        })
+    }
+}
+
+/// One attempt at `clip_id`'s failed row step; `true` once it is finalized.
+async fn retry_finalize(
+    store: &Store,
+    unfinalized: &PlMutex<HashMap<ClipId, Unfinalized>>,
+    clip_id: ClipId,
+    camera_id: CameraId,
+    step: &FinalStep,
+) -> bool {
+    // Another retry finalized it already.
+    if !unfinalized.lock().contains_key(&clip_id) {
+        return true;
+    }
+    let retried = step.run(store, clip_id).await;
+    let mut unfinalized = unfinalized.lock();
+    match retried {
+        Ok(()) => info!(
+            clip_id,
+            camera_id, "gst recorder: finalized a clip on retry"
+        ),
+        Err(e) if row_gone(&e, clip_id, camera_id) => {}
+        Err(e) => {
+            warn!(
+                clip_id,
+                camera_id,
+                error = %e,
+                "gst recorder: clip finalization retry failed"
+            );
+            if let Some(u) = unfinalized.get_mut(&clip_id) {
+                u.attempts += 1;
+                u.error = e.to_string();
+            }
+            return false;
+        }
+    }
+    unfinalized.remove(&clip_id);
+    true
+}
+
+/// Whether `e` says `clip_id`'s row is gone: deleting its camera cascades
+/// its clip rows, so nothing is left to finalize. The step is done, neither
+/// retained nor reported in recording health (SPEC-088).
+fn row_gone(e: &nexus_store::StoreError, clip_id: ClipId, camera_id: CameraId) -> bool {
+    let gone = matches!(e, nexus_store::StoreError::NotFound(_));
+    if gone {
+        warn!(
+            clip_id,
+            camera_id,
+            "gst recorder: clip row is gone, as when its camera was deleted; nothing left \
+             to finalize"
+        );
+    }
+    gone
+}
+
+impl Writers {
+    /// Keep `step`'s failure for the camera's later drains, and retry it on
+    /// its own until it is finalized. Recording health reports the clip from
+    /// here until then, not from its close's failure guard, which the caller
+    /// completes: the retry that finalizes the clip clears what it caused.
+    fn unfinalized(
+        &self,
+        handle: ClipHandle,
+        step: FinalStep,
+        e: nexus_store::StoreError,
+    ) -> RecorderError {
+        self.unfinalized.lock().insert(
+            handle.clip_id,
+            Unfinalized {
+                camera_id: handle.camera_id,
+                step: step.clone(),
+                attempts: 1,
+                retrying: false,
+                error: e.to_string(),
+            },
+        );
+        self.spawn_finalize_schedule(handle, step);
+        e.into()
+    }
+
+    /// Retry `handle`'s failed row step, backing off, until it is finalized:
+    /// a camera that keeps recording, or that its drains released, may never
+    /// be drained again. Shutdown waits for an attempt under way, not for
+    /// the schedule, which makes none once shutdown began: shutdown makes
+    /// the last one itself (SPEC-088).
+    fn spawn_finalize_schedule(&self, handle: ClipHandle, step: FinalStep) {
+        let store = self.store.clone();
+        let unfinalized = self.unfinalized.clone();
+        let in_flight = self.in_flight.clone();
+        let shutting_down = self.shutting_down.clone();
+        tokio::spawn(async move {
+            for delay in finalize_retry_delays() {
+                tokio::time::sleep(delay).await;
+                let _attempt = in_flight.subscribe();
+                // As an open does: either shutdown's idle check sees this
+                // attempt, or this sees shutdown begun.
+                if *shutting_down.lock() {
+                    return;
+                }
+                let (clip_id, camera_id) = (handle.clip_id, handle.camera_id);
+                if retry_finalize(&store, &unfinalized, clip_id, camera_id, &step).await {
+                    return;
+                }
+            }
+        });
+    }
+
     async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError> {
-        let epoch_ended = self.epoch_ended.write().remove(&handle.clip_id);
         let mut state = self
             .open
             .lock()
             .await
             .remove(&handle.clip_id)
             .ok_or(RecorderError::UnknownClip(handle.clip_id))?;
-        let failure = state.health.guard("recording could not be finalized");
+        // Taken only by the close that won the clip: a racing close of the
+        // same clip (shutdown's drain) must not take its epoch flag.
+        let epoch_ended = self.epoch_ended.write().remove(&handle.clip_id);
+        let failure = state.health.guard(UNFINALIZED);
 
         // Step 1: signal the live pump to stop and wait for it. Once
         // the pump returns we know no more push_buffer() calls are
@@ -1145,7 +1166,12 @@ impl ClipRecorder for GstClipRecorder {
                     );
                 }
             }
-            self.store.discard_clip_metadata(handle.clip_id).await?;
+            if let Err(e) = self.store.discard_clip_metadata(handle.clip_id).await {
+                if !row_gone(&e, handle.clip_id, handle.camera_id) {
+                    failure.complete();
+                    return Err(self.unfinalized(handle, FinalStep::Discard, e));
+                }
+            }
             failure.complete();
             return Ok(ClipMeta {
                 clip_id: handle.clip_id,
@@ -1253,53 +1279,44 @@ impl ClipRecorder for GstClipRecorder {
                  marked degraded, not replicated"
             );
         }
-        if pump_stats.dropped > 0 || layout_fault.is_some() {
+        let damage = if pump_stats.dropped > 0 || layout_fault.is_some() {
             state
                 .health
                 .fail("recording has missing samples or a damaged media layout");
-            if let Err(e) = self
-                .store
-                .mark_clip_degraded(handle.clip_id, pump_stats.dropped as i64)
-                .await
-            {
-                warn!(
-                    clip_id = handle.clip_id,
-                    error = %e,
-                    "gst recorder: failed to stamp degraded clip"
-                );
-            }
-        }
-        // Before `close_clip`, which makes the row eligible for upload.
-        if let Some(reason) = layout_fault {
-            if let Err(e) = self
-                .store
-                .quarantine_clip(
-                    handle.clip_id,
-                    Utc::now(),
-                    &format!("clip layout: {reason}"),
-                )
-                .await
-            {
-                warn!(
-                    clip_id = handle.clip_id,
-                    error = %e,
-                    "gst recorder: failed to quarantine damaged clip"
-                );
-            }
+            Some(ClipDamage {
+                dropped_samples: pump_stats.dropped as i64,
+                quarantine: layout_fault.map(|reason| format!("clip layout: {reason}")),
+            })
+        } else {
+            None
+        };
+
+        // Before the row step, which a retry may complete in its stead.
+        let verified = hash_succeeded
+            && inspected_head.is_ok()
+            && size_bytes >= MIN_PLAYABLE_CLIP_BYTES as i64;
+        if !verified {
+            state
+                .health
+                .fail("finalized recording could not be verified");
         }
 
-        self.store
-            .close_clip(
-                handle.clip_id,
-                &ClipClose {
-                    ended_at: args.ended_at,
-                    duration_ms,
-                    size_bytes,
-                    hot_path: Some(rel),
-                    sha256,
-                },
-            )
-            .await?;
+        let close = ClipClose {
+            ended_at: args.ended_at,
+            duration_ms,
+            size_bytes,
+            hot_path: Some(rel),
+            sha256,
+        };
+        let step = FinalStep::Close(close, damage);
+        let gone = match step.run(&self.store, handle.clip_id).await {
+            Ok(()) => false,
+            Err(e) if row_gone(&e, handle.clip_id, handle.camera_id) => true,
+            Err(e) => {
+                failure.complete();
+                return Err(self.unfinalized(handle, step, e));
+            }
+        };
 
         debug!(
             camera_id = state.camera_id,
@@ -1312,8 +1329,9 @@ impl ClipRecorder for GstClipRecorder {
         // M2.2: notify the cold replicator. Best-effort — a missing
         // bus, a serialize failure, or zero subscribers MUST NOT
         // fail the close (the row is already on disk and the 5-min
-        // polling backstop will pick it up regardless).
-        if let Some(bus) = &self.bus {
+        // polling backstop will pick it up regardless). A gone row is no
+        // clip to announce.
+        if let Some(bus) = self.bus.as_ref().filter(|_| !gone) {
             let payload = serde_json::json!({
                 "clip_id": handle.clip_id,
                 "camera_id": state.camera_id,
@@ -1332,12 +1350,7 @@ impl ClipRecorder for GstClipRecorder {
             }
         }
 
-        if !hash_succeeded || inspected_head.is_err() || size_bytes < MIN_PLAYABLE_CLIP_BYTES as i64
-        {
-            state
-                .health
-                .fail("finalized recording could not be verified");
-        } else if pump_stats.dropped == 0 && layout_fault.is_none() {
+        if verified && pump_stats.dropped == 0 && layout_fault.is_none() {
             state.health.succeed();
         }
         failure.complete();
@@ -1351,6 +1364,329 @@ impl ClipRecorder for GstClipRecorder {
             container: CONTAINER.into(),
             discarded: false,
         })
+    }
+}
+
+#[async_trait]
+impl ClipRecorder for GstClipRecorder {
+    async fn open(&self, args: OpenClip) -> Result<ClipHandle, RecorderError> {
+        if *self.shutting_down.lock() {
+            return Err(RecorderError::Refused);
+        }
+        let health = self
+            .recording_health
+            .begin(args.camera_id, RecordingKind::Motion);
+        let failure = health.guard("recording could not be opened");
+        if *self.panic.lock() {
+            return Err(RecorderError::Refused);
+        }
+        let ingester = match self.ingesters.read().get(&args.camera_id) {
+            Some(i) => i.clone(),
+            None => {
+                warn!(
+                    camera_id = args.camera_id,
+                    "GstClipRecorder: no PreRollIngester for this camera; refusing open. \
+                     The engine's config.changed reconciler should have built one — \
+                     check the engine log for `failed to start pre-roll ingester` warnings."
+                );
+                return Err(RecorderError::Refused);
+            }
+        };
+        let codec = ingester.stream_codec();
+
+        // Resolve USB hot-tier routing once at open(). The choice
+        // is captured into `OpenState` so close() finishes the clip
+        // in the same dir even if the volume detaches mid-recording.
+        // `preferred_usb_label.get()` reads the *current* admin
+        // setting; an in-flight clip ignores subsequent PUTs.
+        let preferred = self.preferred_usb_label.get();
+        let (effective_dir, hot_handle) = crate::recorder::effective_clips_dir(
+            &self.clips_dir,
+            preferred.as_deref(),
+            self.usb_resolver
+                .as_deref()
+                .map(|r| r as &dyn crate::recorder::UsbResolver),
+        );
+
+        let path =
+            crate::recorder::inflight_clip_path(&effective_dir, args.camera_id, args.started_at);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+
+        let (pipeline, appsrc) = Self::build_pipeline(&path, codec)?;
+        // From PLAYING on there is a writer, so the rest runs in a task the
+        // caller's cancellation cannot drop: the clip ends up handed over,
+        // finalized, or never started (SPEC-088 Z-4).
+        let writers = self.writers();
+        let closer = writers.clone();
+        let shutting_down = self.shutting_down.clone();
+        let start = async move {
+            // Again in the task `spawn_owned` already counted: under this
+            // lock, either the task sees shutdown begun or shutdown's idle
+            // check sees the task (SPEC-088 Z-4).
+            if *shutting_down.lock() {
+                return Err(RecorderError::Refused);
+            }
+            // set_state(Playing) returns Async; appsrc starts accepting
+            // pushes immediately. We push the pre-roll snapshot before
+            // even waiting for the state change to complete — the queue
+            // inside appsrc absorbs them.
+            if let Err(e) = pipeline.set_state(gst::State::Playing) {
+                let _ = pipeline.set_state(gst::State::Null);
+                let _ = fs::remove_file(&path).await;
+                return Err(RecorderError::Io(std::io::Error::other(format!(
+                    "set Playing: {e}"
+                ))));
+            }
+
+            // Snapshot the ring buffer + subscribe to live BEFORE either
+            // path can race the other. The subscribe happens-before any
+            // sample produced after `subscribe()` returns, so we won't
+            // double-count samples that straddle the snapshot boundary
+            // (the snapshot is a copy of what's *already* buffered, the
+            // broadcast carries everything from this moment forward).
+            // There is a small overlap: a sample currently in the ring
+            // buffer might also arrive on the broadcast a few moments
+            // later. That's fine — we de-dup by PTS in the pump (skip
+            // anything <= last_pushed_pts).
+            let snapshot = ingester.snapshot();
+            let live_rx = ingester.subscribe();
+
+            // Determine the rebase anchor. mp4mux wants PTS to start at
+            // (or near) zero for a sane track timeline. The first sample
+            // is guaranteed to be a keyframe (ring buffer invariant) but
+            // may have no PTS during stream startup; fall back to
+            // Duration::ZERO in that case.
+            let base_pts = snapshot
+                .iter()
+                .find_map(|s| s.pts)
+                .unwrap_or(Duration::ZERO);
+
+            // Push the snapshot synchronously so close()-immediately-after-open()
+            // still produces a file with the pre-roll content. Wrapped
+            // in spawn_blocking because appsrc.push_buffer() with
+            // block=true can stall briefly on filesink/disk pressure
+            // (and we MUST NOT block the tokio worker on a GStreamer
+            // synchronous call).
+            //
+            // Pre-pass: coalesce any consecutive samples sharing a PTS
+            // into one combined sample so the recorder's h264parse sees
+            // a complete AU per push. See `coalesce_same_pts` for why
+            // the InSight cameras need this.
+            let snapshot_tail_pts = snapshot.iter().filter_map(|s| s.pts).next_back();
+            // The clip's stream epoch (#375/#376). A ring snapshot holds exactly
+            // one; when it is empty the pump adopts the first live keyframe's.
+            let clip_epoch = snapshot.first().map(|s| s.epoch);
+            let snapshot_for_blocking: Vec<NalSample> = {
+                let mut pending: Option<NalSample> = None;
+                let mut out: Vec<NalSample> = Vec::with_capacity(snapshot.len());
+                for s in snapshot {
+                    if let Some(flushed) = coalesce_same_pts(&mut pending, s, codec) {
+                        out.push(flushed);
+                    }
+                }
+                // Drain any tail. If it's a header-only stub (no slice
+                // NAL), drop it — pushing it would just create the
+                // 35-byte "missing picture" pathology we're guarding
+                // against.
+                if let Some(last) = pending.take() {
+                    if contains_slice_nal(&last.data, codec) {
+                        out.push(last);
+                    } else {
+                        debug!(
+                            camera_id = args.camera_id,
+                            size = last.data.len(),
+                            "dropping snapshot tail: header-only stub (no slice NAL)"
+                        );
+                    }
+                }
+                out
+            };
+            // Live pump: forwards every new broadcast sample into appsrc
+            // until close() signals stop.
+            //
+            // SPAWNED BEFORE the pre-roll prepend and the `motion_clips`
+            // INSERT, on purpose. `live_rx` was subscribed at the top of
+            // this function, and tokio's broadcast silently overwrites the
+            // OLDEST buffered sample once its 512-slot ring wraps (~8 s at
+            // 30 fps). The oldest sample is the GOP's IDR, so anything that
+            // keeps this task from polling `live_rx` costs the recording
+            // every keyframe from that point on -- which is exactly what
+            // the serial pre-roll push plus the SQLite INSERT below used to
+            // do: clips played back fine for the pre-roll window and then
+            // decayed into a keyframe-less, undecodable tail. The pump now
+            // drains from t=0 and buffers what it reads until `gate_tx`
+            // hands it the clip id and the pre-roll's PTS cursor.
+            let (gate_tx, gate_rx) = oneshot::channel::<PumpGate>();
+            let (pump_stop_tx, pump_stop_rx) = oneshot::channel();
+            let epoch_ended = Arc::new(AtomicBool::new(false));
+            let pump_handle = tokio::spawn(run_live_pump(
+                args.camera_id,
+                codec,
+                appsrc.clone(),
+                live_rx,
+                // An empty prepend leaves the pump to start the clip on its
+                // first keyframe and rebase there.
+                (!snapshot_for_blocking.is_empty()).then_some(base_pts),
+                gate_rx,
+                pump_stop_rx,
+                clip_epoch,
+                epoch_ended.clone(),
+            ));
+
+            let appsrc_for_blocking = appsrc.clone();
+            let (preroll_count, preroll_last_written_pts_ns) =
+                match tokio::task::spawn_blocking(move || {
+                    let mut n = 0usize;
+                    let mut last_written: Option<u64> = None;
+                    for sample in &snapshot_for_blocking {
+                        let written = push_sample(
+                            &appsrc_for_blocking,
+                            sample,
+                            base_pts,
+                            last_written,
+                            FALLBACK_FRAME_INTERVAL_NS,
+                        )
+                        .map_err(|e| {
+                            RecorderError::Io(std::io::Error::other(format!(
+                                "push pre-roll sample: {e}"
+                            )))
+                        })?;
+                        last_written = Some(written);
+                        n += 1;
+                    }
+                    Ok::<(usize, Option<u64>), RecorderError>((n, last_written))
+                })
+                .await
+                {
+                    Ok(Ok((n, last))) => (n, last),
+                    Ok(Err(e)) => {
+                        pump_handle.abort();
+                        let _ = pipeline.set_state(gst::State::Null);
+                        let _ = fs::remove_file(&path).await;
+                        return Err(e);
+                    }
+                    Err(join_err) => {
+                        pump_handle.abort();
+                        let _ = pipeline.set_state(gst::State::Null);
+                        let _ = fs::remove_file(&path).await;
+                        return Err(RecorderError::Io(std::io::Error::other(format!(
+                            "preroll spawn_blocking: {join_err}"
+                        ))));
+                    }
+                };
+
+            let rel = crate::recorder::clip_rel_path(&writers.clips_dir, &path);
+            let new = NewClip {
+                camera_id: args.camera_id,
+                started_at: args.started_at,
+                hot_path: rel,
+                codec: codec.base().into(),
+                container: CONTAINER.into(),
+                // M2.2: "local" or "usb-<label>" depending on the hot
+                // tier resolution above. Cold pointer is left null for
+                // the replicator to fill in after the close-time hash.
+                hot_handle: hot_handle.clone(),
+                frame_width: args.frame_width,
+                frame_height: args.frame_height,
+            };
+            let clip_id = match writers.store.open_clip(&new).await {
+                Ok(id) => id,
+                Err(e) => {
+                    pump_handle.abort();
+                    let _ = pipeline.set_state(gst::State::Null);
+                    let _ = fs::remove_file(&path).await;
+                    return Err(e.into());
+                }
+            };
+
+            // Open the gate. The pump flushes whatever it buffered while
+            // the prepend + INSERT ran, then streams normally.
+            let _ = gate_tx.send(PumpGate {
+                clip_id,
+                last_pushed_pts: snapshot_tail_pts,
+                last_written_pts_ns: preroll_last_written_pts_ns,
+            });
+
+            writers.epoch_ended.write().insert(clip_id, epoch_ended);
+            writers.open.lock().await.insert(
+                clip_id,
+                OpenState {
+                    health,
+                    camera_id: args.camera_id,
+                    started_at: args.started_at,
+                    path,
+                    effective_dir,
+                    hot_handle,
+                    codec,
+                    pipeline,
+                    appsrc,
+                    pump_stop: Some(pump_stop_tx),
+                    pump_handle: Some(pump_handle),
+                    preroll_last_written_pts_ns,
+                },
+            );
+            info!(
+                camera_id = args.camera_id,
+                clip_id,
+                preroll_samples = preroll_count,
+                "gst recorder opened clip (pre-roll prepended)"
+            );
+            failure.complete();
+            Ok(ClipHandle {
+                clip_id,
+                camera_id: args.camera_id,
+            })
+        };
+        let (started_tx, started_rx) = oneshot::channel();
+        let (taken_tx, taken_rx) = oneshot::channel::<()>();
+        self.spawn_owned(args.camera_id, async move {
+            let handle = match start.await {
+                Ok(handle) => handle,
+                Err(e) => {
+                    let _ = started_tx.send(Err(e));
+                    return;
+                }
+            };
+            let _ = started_tx.send(Ok(handle));
+            // The caller was cancelled before it took the clip.
+            if taken_rx.await.is_err() {
+                match closer
+                    .close(
+                        handle,
+                        ClipFinal {
+                            ended_at: Utc::now(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(_) | Err(RecorderError::UnknownClip(_)) => {}
+                    Err(e) => warn!(
+                        clip_id = handle.clip_id,
+                        camera_id = handle.camera_id,
+                        error = %e,
+                        "gst recorder: failed to finalise a clip whose open was cancelled"
+                    ),
+                }
+            }
+        });
+        let started = started_rx
+            .await
+            .map_err(|_| RecorderError::Io(std::io::Error::other("clip open task failed")))?;
+        let _ = taken_tx.send(());
+        started
+    }
+
+    async fn close(&self, handle: ClipHandle, args: ClipFinal) -> Result<ClipMeta, RecorderError> {
+        // Spawned so a cancelled caller cannot abandon a clip it already
+        // took out of `open` (SPEC-088 Z-4).
+        let writers = self.writers();
+        self.spawn_owned(handle.camera_id, async move {
+            writers.close(handle, args).await
+        })
+        .await
+        .map_err(|e| RecorderError::Io(std::io::Error::other(format!("clip close task: {e}"))))?
     }
 
     async fn inflight_size_bytes(&self, handle: ClipHandle) -> Option<u64> {
@@ -1369,43 +1705,153 @@ impl ClipRecorder for GstClipRecorder {
     }
 
     async fn shutdown(&self) {
-        // Snapshot the (clip_id, camera_id) of every in-flight clip
-        // under one lock, then release it so `close()` can re-lock
-        // and `remove()` each one. Cloning the keys avoids holding
-        // the lock across the per-clip EOS drain (which awaits the
-        // bus for up to `EOS_DRAIN_TIMEOUT`).
-        let handles: Vec<ClipHandle> = {
-            let open = self.open.lock().await;
-            open.iter()
-                .map(|(clip_id, st)| ClipHandle {
-                    clip_id: *clip_id,
-                    camera_id: st.camera_id,
-                })
-                .collect()
-        };
-        if handles.is_empty() {
-            return;
-        }
-        info!(
-            count = handles.len(),
-            "gst recorder: draining in-flight clips on shutdown (EOS + moov flush)"
-        );
-        let ended_at = Utc::now();
-        for handle in handles {
-            // Reuse the full `close()` finalise path (EOS → moov
-            // flush → rename → row stamp). A concurrent supervisor
-            // close of the same clip is safe: whichever calls
-            // `open.remove()` first wins, the loser gets
-            // `UnknownClip` which we swallow.
-            match self.close(handle, ClipFinal { ended_at }).await {
-                Ok(_) | Err(RecorderError::UnknownClip(_)) => {}
-                Err(e) => warn!(
-                    clip_id = handle.clip_id,
-                    camera_id = handle.camera_id,
-                    error = %e,
-                    "gst recorder: failed to finalise clip during shutdown drain"
-                ),
+        // Every registered clip is finalized in an owned task of its own, at
+        // once, so one stalled writer or owned open/close cannot hold back
+        // another camera's clip. An open still in flight registers its clip
+        // (or finalizes it itself) later, so keep picking up new clips until
+        // no owned task is left (SPEC-088 Z-4). No open starts a writer after
+        // this, so none can start once the loop below has seen it idle.
+        *self.shutting_down.lock() = true;
+        let mut draining = HashSet::new();
+        loop {
+            // Read before the snapshot: once idle, every open that was in
+            // flight has registered its clip.
+            let idle = self.in_flight.is_closed();
+            // Cloning the keys avoids holding the lock across a close.
+            let handles: Vec<ClipHandle> = {
+                let open = self.open.lock().await;
+                open.iter()
+                    .filter(|(clip_id, _)| !draining.contains(*clip_id))
+                    .map(|(clip_id, st)| ClipHandle {
+                        clip_id: *clip_id,
+                        camera_id: st.camera_id,
+                    })
+                    .collect()
+            };
+            // And after it: a close registered since may have taken the
+            // last clip out of `open` and still own its writer.
+            if handles.is_empty() && idle && self.in_flight.is_closed() {
+                break;
             }
+            if !handles.is_empty() {
+                info!(
+                    count = handles.len(),
+                    "gst recorder: draining in-flight clips on shutdown (EOS + moov flush)"
+                );
+            }
+            for handle in handles {
+                draining.insert(handle.clip_id);
+                self.spawn_drain_close(handle);
+            }
+            let _ = tokio::time::timeout(SHUTDOWN_POLL, self.in_flight.closed()).await;
+        }
+        // A retained clip's own retries end with shutdown, and no boot step
+        // closes its row, which then never replicates: try every retained
+        // step once more, bounded, before the process goes (SPEC-088).
+        let retained: Vec<(ClipId, CameraId, FinalStep)> = self
+            .unfinalized
+            .lock()
+            .iter()
+            .map(|(&clip_id, u)| (clip_id, u.camera_id, u.step.clone()))
+            .collect();
+        let last_attempts = retained.iter().map(|(clip_id, camera_id, step)| {
+            retry_finalize(&self.store, &self.unfinalized, *clip_id, *camera_id, step)
+        });
+        let ended = tokio::time::timeout(
+            SHUTDOWN_FINALIZE_TIMEOUT,
+            futures::future::join_all(last_attempts),
+        )
+        .await;
+        if ended.is_err() {
+            warn!(
+                count = retained.len(),
+                "gst recorder: shutdown's last attempt at clips not finalized timed out; their \
+                 rows stay unclosed"
+            );
+        }
+    }
+
+    async fn drain_camera(&self, camera_id: CameraId) -> Result<(), RecorderError> {
+        // A clip a close could not finalize, whoever awaited it, is retried
+        // at its failed row step. After `FINALIZE_DRAINS` failed attempts it
+        // no longer holds the camera stopping, so recording resumes, but it
+        // retries on its own and stays in recording health until a retry
+        // completes it (SPEC-088).
+        let mut released = HashSet::new();
+        let mut retries = Vec::new();
+        for (&clip_id, u) in self.unfinalized.lock().iter_mut() {
+            if u.camera_id != camera_id {
+                continue;
+            }
+            if u.attempts >= FINALIZE_DRAINS {
+                released.insert(clip_id);
+                error!(
+                    clip_id,
+                    camera_id,
+                    attempts = u.attempts,
+                    error = %u.error,
+                    "gst recorder: clip still not finalized; no longer holding its camera \
+                     stopping, retrying in the background and reporting it in recording health"
+                );
+            } else if !std::mem::replace(&mut u.retrying, true) {
+                retries.push((clip_id, u.step.clone()));
+            }
+        }
+        for (clip_id, step) in retries {
+            self.spawn_finalize_retry(clip_id, camera_id, step);
+        }
+        // `shutdown`'s loop for one camera: an open still in flight registers
+        // its clip (or finalizes it itself) later, and a close in flight may
+        // have taken its clip already; both are the camera's work too.
+        let in_flight = self.camera_in_flight(camera_id);
+        let mut closes = Vec::new();
+        let mut draining = HashSet::new();
+        loop {
+            let idle = in_flight.is_closed();
+            let handles: Vec<ClipHandle> = {
+                let open = self.open.lock().await;
+                open.iter()
+                    .filter(|(clip_id, st)| {
+                        st.camera_id == camera_id && !draining.contains(*clip_id)
+                    })
+                    .map(|(clip_id, _)| ClipHandle {
+                        clip_id: *clip_id,
+                        camera_id,
+                    })
+                    .collect()
+            };
+            if handles.is_empty() && idle && in_flight.is_closed() {
+                break;
+            }
+            if !handles.is_empty() {
+                info!(
+                    camera_id,
+                    count = handles.len(),
+                    "gst recorder: finalizing clips a stopped supervisor left open (EOS + moov flush)"
+                );
+            }
+            for handle in handles {
+                draining.insert(handle.clip_id);
+                closes.push(self.spawn_drain_close(handle));
+            }
+            let _ = tokio::time::timeout(SHUTDOWN_POLL, in_flight.closed()).await;
+        }
+        // Each of these has ended: it was in flight for the camera.
+        for close in closes {
+            close.await.map_err(|e| {
+                RecorderError::Io(std::io::Error::other(format!("clip drain task: {e}")))
+            })??;
+        }
+        let unfinalized = self.unfinalized.lock();
+        match unfinalized
+            .iter()
+            .find(|(clip_id, u)| u.camera_id == camera_id && !released.contains(*clip_id))
+        {
+            Some((clip_id, u)) => Err(RecorderError::Io(std::io::Error::other(format!(
+                "clip {clip_id} not finalized after {} attempts: {}",
+                u.attempts, u.error
+            )))),
+            None => Ok(()),
         }
     }
 
@@ -1429,6 +1875,17 @@ impl ClipRecorder for GstClipRecorder {
         let mut issues = self.recording_health.degradations();
         if !self.alert_clips_active() {
             issues.retain(|issue| issue.kind != RecordingKind::Alert);
+        }
+        // Outlives the camera's ingester: the clip is the old session's.
+        for u in self.unfinalized.lock().values() {
+            let issue = RecordingDegradation {
+                camera_id: u.camera_id,
+                kind: RecordingKind::Motion,
+                reason: UNFINALIZED.into(),
+            };
+            if !issues.contains(&issue) {
+                issues.push(issue);
+            }
         }
         for (&camera_id, ingester) in self.ingesters.read().iter() {
             let Some(codec_pin) = ingester.codec_pin() else {
@@ -3231,6 +3688,142 @@ mod tests {
             .recording_degradations()
             .iter()
             .any(|d| d.kind == RecordingKind::Motion));
+    }
+
+    /// SPEC-088 Z-4: the reconciler's forced stop aborts a supervisor while
+    /// `open` is pending. Once the writer is PLAYING and its row exists the
+    /// clip must still end up finalized, and `shutdown` must wait for that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_cancelled_after_its_writer_started_still_finalizes_the_clip() {
+        gst_init::ensure().unwrap();
+        for name in ["appsrc", "h264parse", "mp4mux", "filesink"] {
+            assert!(
+                gst::ElementFactory::find(name).is_some(),
+                "required GStreamer plugin missing: {name}"
+            );
+        }
+        let (store, _dir, clips_dir) = fixture().await;
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264).unwrap();
+        ing.shutdown();
+        let rec = Arc::new(
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap(),
+        );
+        let started_at = Utc::now();
+        // Holding the open map parks `open` at its last await, after the
+        // pipeline went PLAYING and the row was inserted.
+        let held = rec.open.lock().await;
+        let opener = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                rec.open(OpenClip {
+                    camera_id: 1,
+                    started_at,
+                    frame_width: 512,
+                    frame_height: 288,
+                })
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store.get_clip(1).await.unwrap().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "open never inserted its row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        opener.abort();
+        assert!(opener.await.unwrap_err().is_cancelled());
+        drop(held);
+        rec.shutdown().await;
+
+        assert!(rec.open.lock().await.is_empty(), "clip left registered");
+        assert!(
+            store
+                .get_clip(1)
+                .await
+                .unwrap()
+                .is_none_or(|row| row.ended_at.is_some()),
+            "clip row left without an end"
+        );
+        assert!(
+            !rec.clip_path(1, started_at).exists(),
+            "an untracked writer's file was left behind"
+        );
+    }
+
+    /// SPEC-088 Z-4: an aborted supervisor still mid-poll can call `open`
+    /// while, or after, `shutdown` runs. An open whose writer task starts
+    /// after shutdown began, and any open after shutdown returned, must be
+    /// refused before a writer, row or file exists: nothing would finalize it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn opens_racing_or_after_shutdown_are_refused() {
+        gst_init::ensure().unwrap();
+        let (store, _dir, clips_dir) = fixture().await;
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264).unwrap();
+        ing.shutdown();
+        let rec =
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap();
+        let open = |started_at| {
+            rec.open(OpenClip {
+                camera_id: 1,
+                started_at,
+                frame_width: 512,
+                frame_height: 288,
+            })
+        };
+        let (raced_at, late_at) = (Utc::now(), Utc::now() + chrono::Duration::seconds(5));
+
+        // On this one thread, drive the open until it hands its writer to a
+        // task of its own, which cannot run before this test yields.
+        let mut racing = std::pin::pin!(open(raced_at));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while rec.in_flight.is_closed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "open never started its writer task"
+            );
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(racing.as_mut(), cx))
+            })
+            .await;
+            assert!(polled.is_pending(), "open returned before its writer task");
+            if rec.in_flight.is_closed() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        // Shutdown begins before that task's first poll.
+        let mut shutdown = std::pin::pin!(rec.shutdown());
+        let begun = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx))
+        })
+        .await;
+        assert!(begun.is_pending(), "shutdown ended with an open in flight");
+        let raced = tokio::time::timeout(Duration::from_secs(10), racing)
+            .await
+            .expect("the racing open returns");
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("shutdown returns");
+        let late = open(late_at).await;
+
+        assert!(
+            matches!(raced, Err(RecorderError::Refused)),
+            "an open whose writer task started after shutdown began: {raced:?}"
+        );
+        assert!(
+            matches!(late, Err(RecorderError::Refused)),
+            "an open after shutdown returned: {late:?}"
+        );
+        assert!(rec.open.lock().await.is_empty(), "a clip left registered");
+        assert!(rec.in_flight.is_closed(), "a writer task outlived shutdown");
+        assert!(
+            store.get_clip(1).await.unwrap().is_none(),
+            "a refused open wrote a row"
+        );
+        for at in [raced_at, late_at] {
+            assert!(!rec.clip_path(1, at).exists(), "a refused open left a file");
+        }
     }
 
     #[tokio::test]
@@ -5478,6 +6071,7 @@ mod epoch_tests {
         );
     }
 
+    /// A store with cameras 1, 2 and 3.
     async fn store_with_camera(dir: &Path) -> Arc<Store> {
         let store = Arc::new(
             Store::open(&StoreConfig {
@@ -5489,26 +6083,1484 @@ mod epoch_tests {
             .await
             .unwrap(),
         );
+        for id in 1..=3 {
+            store
+                .upsert_camera(&CameraConfig {
+                    id,
+                    name: "front".into(),
+                    ingest: nexus_config::CameraIngest {
+                        url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
+                        analysis_url: None,
+                        enabled: true,
+                        max_fps: 0,
+                        codec: None,
+                    },
+                    detector: nexus_config::CameraDetector::default(),
+                    behavior: nexus_config::CameraBehavior::default(),
+                    onvif: Default::default(),
+                    talk_down: Default::default(),
+                    zones: vec![],
+                })
+                .await
+                .unwrap();
+        }
         store
-            .upsert_camera(&CameraConfig {
-                id: 1,
-                name: "front".into(),
-                ingest: nexus_config::CameraIngest {
-                    url: url::Url::parse("rtsp://127.0.0.1/stream").unwrap(),
-                    analysis_url: None,
-                    enabled: true,
-                    max_fps: 0,
-                    codec: None,
-                },
-                detector: nexus_config::CameraDetector::default(),
-                behavior: nexus_config::CameraBehavior::default(),
-                onvif: Default::default(),
-                talk_down: Default::default(),
-                zones: vec![],
+    }
+
+    /// Register a clip of `camera_id` holding four seconds of media, the way
+    /// `open` leaves one, with `pump_handle` as its live pump. Returns its
+    /// handle, in-flight path and writer.
+    async fn register_clip(
+        rec: &GstClipRecorder,
+        store: &Store,
+        clips_dir: &Path,
+        camera_id: CameraId,
+        started_at: DateTime<Utc>,
+        pump_handle: Option<tokio::task::JoinHandle<PumpStats>>,
+    ) -> (ClipHandle, PathBuf, gst::Pipeline) {
+        let samples = encode(15, "main", 60, Duration::ZERO);
+        register_samples(
+            rec,
+            store,
+            clips_dir,
+            camera_id,
+            started_at,
+            pump_handle,
+            &samples,
+        )
+        .await
+    }
+
+    /// [`register_clip`] holding `samples`.
+    async fn register_samples(
+        rec: &GstClipRecorder,
+        store: &Store,
+        clips_dir: &Path,
+        camera_id: CameraId,
+        started_at: DateTime<Utc>,
+        pump_handle: Option<tokio::task::JoinHandle<PumpStats>>,
+        samples: &[NalSample],
+    ) -> (ClipHandle, PathBuf, gst::Pipeline) {
+        let path = crate::recorder::inflight_clip_path(clips_dir, camera_id, started_at);
+        fs::create_dir_all(path.parent().unwrap()).await.unwrap();
+        let clip_id = store
+            .open_clip(&NewClip {
+                camera_id,
+                started_at,
+                hot_path: crate::recorder::clip_rel_path(clips_dir, &path),
+                codec: "h264".into(),
+                container: CONTAINER.into(),
+                hot_handle: "local".into(),
+                frame_width: 320,
+                frame_height: 240,
             })
             .await
             .unwrap();
+        let (pipeline, appsrc) = GstClipRecorder::build_pipeline(&path, CodecKind::H264).unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut last = None;
+        for s in samples {
+            last = Some(
+                push_sample(&appsrc, s, Duration::ZERO, last, FALLBACK_FRAME_INTERVAL_NS).unwrap(),
+            );
+        }
+        let writer = pipeline.clone();
+        rec.open.lock().await.insert(
+            clip_id,
+            OpenState {
+                health: rec.recording_health.begin(camera_id, RecordingKind::Motion),
+                camera_id,
+                started_at,
+                path: path.clone(),
+                effective_dir: clips_dir.to_path_buf(),
+                hot_handle: "local".into(),
+                codec: CodecKind::H264,
+                pipeline,
+                appsrc,
+                pump_stop: None,
+                pump_handle,
+                preroll_last_written_pts_ns: last,
+            },
+        );
+        (ClipHandle { clip_id, camera_id }, path, writer)
+    }
+
+    /// Whether `clip_id`'s row is closed and its final file decodes.
+    async fn finalized_playable(store: &Store, clips_dir: &Path, clip_id: ClipId) -> bool {
+        let row = store.get_clip(clip_id).await.unwrap().unwrap();
+        row.ended_at.is_some() && row.hot_path.is_some_and(|p| decodes(&clips_dir.join(p)))
+    }
+
+    /// Wait up to 10 s for `clip_id`'s row to be closed.
+    async fn wait_until_closed(store: &Store, clip_id: ClipId) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store
+            .get_clip(clip_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .ended_at
+            .is_none()
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "clip {clip_id} never closed"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Start closing `handle` from a caller that is then aborted, not joined,
+    /// as `main` aborts supervisors, once the close took the clip.
+    async fn close_then_abort_caller(rec: &Arc<GstClipRecorder>, handle: ClipHandle) {
+        let closer = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                rec.close(
+                    handle,
+                    ClipFinal {
+                        ended_at: Utc::now(),
+                    },
+                )
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while rec.open.lock().await.contains_key(&handle.clip_id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "close never took the clip"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        closer.abort();
+    }
+
+    /// SPEC-088 Z-4: `main` gives shutdown 15 s. A close stalled on its
+    /// writer (here its pump, which never stops) must not hold back another
+    /// camera's clip: that one is finalized while the stalled close runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_close_does_not_hold_back_another_cameras_clip_at_shutdown() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec =
+            Arc::new(GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap());
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (stalled, _, stalled_writer) = register_clip(
+            &rec,
+            &store,
+            &clips_dir,
+            1,
+            started_at,
+            Some(tokio::spawn(std::future::pending::<PumpStats>())),
+        )
+        .await;
+        let (healthy, _, _) = register_clip(&rec, &store, &clips_dir, 2, started_at, None).await;
+        close_then_abort_caller(&rec, stalled).await;
+
+        let shutdown = tokio::spawn({
+            let rec = rec.clone();
+            async move { rec.shutdown().await }
+        });
+        wait_until_closed(&store, healthy.clip_id).await;
+        assert_eq!(
+            stalled_writer.current_state(),
+            gst::State::Playing,
+            "camera 2's clip waited for camera 1's stalled close"
+        );
+        shutdown.await.unwrap();
+
+        assert_eq!(stalled_writer.current_state(), gst::State::Null);
+        assert!(finalized_playable(&store, &clips_dir, healthy.clip_id).await);
+        assert!(finalized_playable(&store, &clips_dir, stalled.clip_id).await);
+    }
+
+    /// SPEC-088 Z-4: shutdown reads `idle` before its snapshot. An aborted
+    /// supervisor's close registered after that read can take the last clip
+    /// out of `open` before the snapshot; the snapshot is then empty while
+    /// that close still owns the writer, and shutdown must wait for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_waits_for_a_close_that_took_its_clip_after_the_idle_read() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec =
+            Arc::new(GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap());
+        // The late close waits at its pump until the test lets it finish.
+        let (finish, pump_gate) = oneshot::channel::<()>();
+        let pump = tokio::spawn(async move {
+            let _ = pump_gate.await;
+            PumpStats::default()
+        });
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, writer) =
+            register_clip(&rec, &store, &clips_dir, 1, started_at, Some(pump)).await;
+
+        // With this poll's coop budget spent, shutdown's map lock yields
+        // without queueing: shutdown stops after reading `idle`, before its
+        // snapshot.
+        let mut shutdown = std::pin::pin!(rec.shutdown());
+        let begun = std::future::poll_fn(|cx| {
+            for _ in 0..1024 {
+                let spend = std::pin::pin!(tokio::task::consume_budget());
+                if std::future::Future::poll(spend, cx).is_pending() {
+                    break;
+                }
+            }
+            std::task::Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx))
+        })
+        .await;
+        assert!(begun.is_pending() && *rec.shutting_down.lock());
+        assert!(
+            rec.in_flight.is_closed() && rec.open.lock().await.contains_key(&clip.clip_id),
+            "shutdown took its snapshot before the late close began"
+        );
+
+        close_then_abort_caller(&rec, clip).await;
+        let returned = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(shutdown.as_mut(), cx))
+        })
+        .await
+        .is_ready();
+        let _ = finish.send(());
+        assert!(
+            !returned,
+            "shutdown returned while the late close still owned the writer"
+        );
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("shutdown returns");
+
+        assert_eq!(writer.current_state(), gst::State::Null);
+        assert!(finalized_playable(&store, &clips_dir, clip.clip_id).await);
+    }
+
+    /// SPEC-088 Z-4: an open cancelled after its writer started, with four
+    /// seconds of pre-roll in the ring, keeps that footage: its clip is
+    /// closed, finalized and plays back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_cancelled_after_its_writer_started_keeps_its_preroll_playable() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 10, CodecKind::H264).unwrap();
+        ing.shutdown();
+        for sample in encode(15, "main", 60, Duration::ZERO) {
+            ing.push_preroll_for_test(sample);
+        }
+        let rec = Arc::new(
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap(),
+        );
+        let started_at = Utc::now();
+        // Holding the open map parks `open` at its last await, after the
+        // pre-roll was pushed and the row was inserted.
+        let held = rec.open.lock().await;
+        let opener = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                rec.open(OpenClip {
+                    camera_id: 1,
+                    started_at,
+                    frame_width: 320,
+                    frame_height: 240,
+                })
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while store.get_clip(1).await.unwrap().is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "open never inserted its row"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        opener.abort();
+        assert!(opener.await.unwrap_err().is_cancelled());
+        drop(held);
+        rec.shutdown().await;
+
+        assert!(rec.open.lock().await.is_empty(), "clip left registered");
+        assert!(
+            store.get_clip(1).await.unwrap().is_some(),
+            "the cancelled open discarded its pre-roll"
+        );
+        assert!(
+            !rec.clip_path(1, started_at).exists(),
+            "the in-flight file was left behind"
+        );
+        assert!(finalized_playable(&store, &clips_dir, 1).await);
+    }
+
+    /// SPEC-088 Z-4: a supervisor aborted while it held an open clip (wedged
+    /// in a store write past the reconciler's stop deadline) never closes it.
+    /// Before the camera's ingester goes and a replacement opens, the
+    /// reconciler drains the camera: its clip is finalized once (row ended,
+    /// file renamed, playable) and no longer recording, while another
+    /// camera's clip stays open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_camera_finalizes_the_clip_its_aborted_supervisor_held() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 10, CodecKind::H264).unwrap();
+        ing.shutdown();
+        for sample in encode(15, "main", 60, Duration::ZERO) {
+            ing.push_preroll_for_test(sample);
+        }
+        let rec = Arc::new(
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap(),
+        );
+        let started_at = Utc::now();
+        let held = rec
+            .open(OpenClip {
+                camera_id: 1,
+                started_at,
+                frame_width: 320,
+                frame_height: 240,
+            })
+            .await
+            .expect("the supervisor took its clip");
+        let (other, _, _) = register_clip(&rec, &store, &clips_dir, 2, started_at, None).await;
+
+        tokio::time::timeout(Duration::from_secs(15), rec.drain_camera(1))
+            .await
+            .expect("the drain returns")
+            .expect("the drain succeeds");
+
+        let open = rec.open.lock().await.keys().copied().collect::<Vec<_>>();
+        assert_eq!(open, [other.clip_id], "only camera 1's clip is drained");
+        assert!(
+            finalized_playable(&store, &clips_dir, held.clip_id).await,
+            "the held clip was not finalized playable"
+        );
+        assert!(
+            !rec.clip_path(1, started_at).exists(),
+            "the in-flight file was left behind"
+        );
+        let late = rec
+            .close(
+                held,
+                ClipFinal {
+                    ended_at: Utc::now(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(late, Err(RecorderError::UnknownClip(_))),
+            "the clip was closed twice: {late:?}"
+        );
+        rec.shutdown().await;
+    }
+
+    /// SPEC-088 Z-4: the supervisor is aborted at the stop deadline while its
+    /// open, writer already started, waits on the store to insert the row.
+    /// Nothing is registered yet, but that open is the camera's recorder
+    /// work: the drain must wait for it and for its clip to be finalized.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_camera_waits_for_an_open_yet_to_register_its_clip() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let ing = PreRollIngester::new(1, "rtsp://127.0.0.1:1/main", 10, CodecKind::H264).unwrap();
+        ing.shutdown();
+        for sample in encode(15, "main", 60, Duration::ZERO) {
+            ing.push_preroll_for_test(sample);
+        }
+        let rec = Arc::new(
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(1, ing)])).unwrap(),
+        );
+        // Every pooled connection taken: the open's row insert waits.
+        let mut held = Vec::new();
+        for _ in 0..store.pool().options().get_max_connections() {
+            held.push(store.pool().acquire().await.unwrap());
+        }
+        let started_at = Utc::now();
+        let opener = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                rec.open(OpenClip {
+                    camera_id: 1,
+                    started_at,
+                    frame_width: 320,
+                    frame_height: 240,
+                })
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !rec.clip_path(1, started_at).exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "open never started its writer"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        opener.abort();
+        assert!(opener.await.unwrap_err().is_cancelled());
+
+        let drain = tokio::spawn({
+            let rec = rec.clone();
+            async move { rec.drain_camera(1).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let returned_early = drain.is_finished();
+        let registered_early = !rec.open.lock().await.is_empty();
+        drop(held);
+        let drained = tokio::time::timeout(Duration::from_secs(15), drain)
+            .await
+            .expect("the drain returns")
+            .unwrap();
+
+        assert!(
+            !registered_early,
+            "precondition: the open had not registered"
+        );
+        assert!(
+            !returned_early,
+            "the drain returned while the open still owned its writer"
+        );
+        assert!(drained.is_ok(), "{drained:?}");
+        assert!(rec.open.lock().await.is_empty(), "clip left registered");
+        assert!(
+            finalized_playable(&store, &clips_dir, 1).await,
+            "the open's clip was not finalized before the drain returned"
+        );
+        assert!(
+            !rec.clip_path(1, started_at).exists(),
+            "the in-flight file was left behind"
+        );
+    }
+
+    /// SPEC-088 Z-4: the supervisor is aborted while its close, which already
+    /// took the clip out of `open`, waits on its writer. The drain must not
+    /// return before that close has finalized the clip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_camera_waits_for_a_close_that_took_its_clip() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec =
+            Arc::new(GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap());
+        // The close waits at its pump until the test lets it finish.
+        let (finish, pump_gate) = oneshot::channel::<()>();
+        let pump = tokio::spawn(async move {
+            let _ = pump_gate.await;
+            PumpStats::default()
+        });
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, writer) =
+            register_clip(&rec, &store, &clips_dir, 1, started_at, Some(pump)).await;
+        close_then_abort_caller(&rec, clip).await;
+
+        let drain = tokio::spawn({
+            let rec = rec.clone();
+            async move { rec.drain_camera(1).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let returned_early = drain.is_finished();
+        let _ = finish.send(());
+        let drained = tokio::time::timeout(Duration::from_secs(15), drain)
+            .await
+            .expect("the drain returns")
+            .unwrap();
+
+        assert!(
+            !returned_early,
+            "the drain returned while the close still owned the writer"
+        );
+        assert!(drained.is_ok(), "{drained:?}");
+        assert_eq!(writer.current_state(), gst::State::Null);
+        assert!(finalized_playable(&store, &clips_dir, clip.clip_id).await);
+    }
+
+    /// SPEC-088 Z-4: a clip the drain could not finalize (here the store
+    /// rejects its row) is reported, so the engine does not
+    /// count the camera as drained; its writer is stopped all the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn draining_a_camera_reports_a_clip_it_could_not_finalize() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (_, _, writer) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        fail_clip_writes(&store).await;
+
+        let drained = tokio::time::timeout(Duration::from_secs(15), rec.drain_camera(1))
+            .await
+            .expect("the drain returns");
+
+        assert!(
+            matches!(drained, Err(RecorderError::Store(_))),
+            "the failed finalization was not reported: {drained:?}"
+        );
+        assert_eq!(writer.current_state(), gst::State::Null);
+        assert!(rec.open.lock().await.is_empty(), "clip left registered");
+    }
+
+    /// SPEC-088 review 9: a clip whose row could not be stamped (another
+    /// writer held the store) keeps its camera stopping: the next drain
+    /// retries the stamp, never the writer, and fails while the store is
+    /// still held. Once a retry stamps the row the drain succeeds, the
+    /// reconciler may start a replacement and nothing stays reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_finalization_holds_its_camera_until_a_retry_stamps_the_row() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, writer) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        // Every row write fails once SQLite's busy timeout runs out.
+        let held = store.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+
+        let first = rec.drain_camera(1).await;
+        let second = rec.drain_camera(1).await;
+        held.rollback().await.unwrap();
+        let third = rec.drain_camera(1).await;
+        rec.remove_camera_ingester(1);
+
+        assert!(first.is_err(), "the failed close was not reported");
+        assert!(second.is_err(), "the next drain forgot the failed close");
+        assert!(third.is_ok(), "a retry that stamped the row: {third:?}");
+        assert_eq!(writer.current_state(), gst::State::Null);
+        assert!(
+            finalized_playable(&store, &clips_dir, clip.clip_id).await,
+            "the retry did not stamp the row with the close's final file"
+        );
+        assert!(
+            rec.recording_degradations().is_empty(),
+            "a recovered clip is still reported: {:?}",
+            rec.recording_degradations()
+        );
+    }
+
+    /// SPEC-088 review 9: a clip that stays unfinalizable (the store rejects
+    /// its row) holds its camera stopping for three drains, the fourth
+    /// releases it so recording resumes, and recording health keeps reporting
+    /// it after the reconciler removed the camera's ingester. The same holds
+    /// for the reconciler's later passes, which poll a drain once and do not
+    /// wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_persistent_finalization_failure_releases_its_camera_after_three_drains() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        for camera_id in [1, 2] {
+            register_clip(&rec, &store, &clips_dir, camera_id, started_at, None).await;
+        }
+        fail_clip_writes(&store).await;
+
+        let mut drained = Vec::new();
+        for _ in 0..4 {
+            drained.push(rec.drain_camera(1).await.is_ok());
+        }
+        let mut passes = vec![rec.drain_camera(2).await.is_ok()];
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let pass = tokio::time::timeout(Duration::ZERO, rec.drain_camera(2)).await;
+            passes.push(matches!(pass, Ok(Ok(()))));
+        }
+        rec.remove_camera_ingester(1);
+        rec.remove_camera_ingester(2);
+
+        assert_eq!(
+            drained,
+            [false, false, false, true],
+            "drains 1-3 must hold the camera stopping, the fourth release it"
+        );
+        assert_eq!(
+            passes,
+            [false, false, false, true],
+            "unwaited passes must release the camera after three failed attempts too"
+        );
+        for camera_id in [1, 2] {
+            assert!(
+                rec.recording_degradations()
+                    .iter()
+                    .any(|d| d.camera_id == camera_id && d.kind == RecordingKind::Motion),
+                "camera {camera_id}'s unfinalized clip vanished from recording health"
+            );
+        }
+    }
+
+    /// SPEC-088 review 9: the close's caller is aborted and the drain waiting
+    /// for that close runs out of time before the close fails. The failure
+    /// lives in the recorder, not in either future, so the next drain still
+    /// reports it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_finalization_failing_after_its_drain_timed_out_reaches_the_next_drain() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec =
+            Arc::new(GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap());
+        // The close waits at its pump until the test lets it finish.
+        let (finish, pump_gate) = oneshot::channel::<()>();
+        let pump = tokio::spawn(async move {
+            let _ = pump_gate.await;
+            PumpStats::default()
+        });
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, Some(pump)).await;
+        fail_clip_writes(&store).await;
+        close_then_abort_caller(&rec, clip).await;
+
+        let timed_out = tokio::time::timeout(Duration::from_millis(300), rec.drain_camera(1))
+            .await
+            .is_err();
+        let _ = finish.send(());
+        let next = tokio::time::timeout(Duration::from_secs(15), rec.drain_camera(1))
+            .await
+            .expect("the drain returns");
+
+        assert!(timed_out, "precondition: the first drain timed out");
+        assert!(next.is_err(), "the failed close was lost: {next:?}");
+    }
+
+    /// Make every update or delete of a clip row fail at once, as a store
+    /// that rejects writes does, until [`restore_clip_writes`]. This crate
+    /// has no `sqlx`: a custom BEGIN statement runs the DDL in its own
+    /// transaction.
+    async fn fail_clip_writes(store: &Store) {
+        for op in ["UPDATE", "DELETE"] {
+            let ddl = format!(
+                "BEGIN; CREATE TRIGGER fail_clip_{op} BEFORE {op} ON motion_clips \
+                 BEGIN SELECT RAISE(ABORT, 'storage unavailable'); END;"
+            );
+            store
+                .pool()
+                .begin_with(ddl)
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn restore_clip_writes(store: &Store) {
+        for op in ["UPDATE", "DELETE"] {
+            let ddl = format!("BEGIN; DROP TRIGGER fail_clip_{op};");
+            store
+                .pool()
+                .begin_with(ddl)
+                .await
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Poll `done` for at most `limit`; whether it held.
+    async fn wait_for(limit: Duration, done: impl Fn() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        while !done() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
+    /// Register a clip of camera 1, make its row writes fail and drain the
+    /// camera until the fourth drain releases it, as the reconciler's passes
+    /// do, then tear the camera down as the reconciler does before starting
+    /// its replacement. No drain of the camera comes after.
+    async fn release_an_unfinalized_clip(
+        rec: &GstClipRecorder,
+        store: &Store,
+        clips_dir: &Path,
+    ) -> ClipHandle {
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, _) = register_clip(rec, store, clips_dir, 1, started_at, None).await;
+        fail_clip_writes(store).await;
+        let mut drained = Vec::new();
+        for _ in 0..4 {
+            drained.push(rec.drain_camera(1).await.is_ok());
+        }
+        rec.remove_camera_ingester(1);
+        assert_eq!(
+            drained,
+            [false, false, false, true],
+            "precondition: the fourth drain released the camera"
+        );
+        clip
+    }
+
+    fn attempts(rec: &GstClipRecorder, clip: ClipHandle) -> Option<u32> {
+        rec.unfinalized
+            .lock()
+            .get(&clip.clip_id)
+            .map(|u| u.attempts)
+    }
+
+    /// SPEC-088 review 10: once its camera is released no drain retries a
+    /// clip, so it retries on its own, 5 s after its close failed and then
+    /// backing off. The first of those fails too; once the store recovers,
+    /// the next one, not at once and not never, stamps the row with no drain
+    /// called, and recording health, which reported the clip until then,
+    /// clears.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_released_clip_finalizes_on_its_own_once_the_store_recovers() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let clip = release_an_unfinalized_clip(&rec, &store, &clips_dir).await;
+
+        let retried_on_its_own =
+            wait_for(Duration::from_secs(10), || attempts(&rec, clip) == Some(4)).await;
+        let failed = tokio::time::Instant::now();
+        let reported = rec.recording_degradations();
+        restore_clip_writes(&store).await;
+        let settled = wait_for(Duration::from_secs(20), || attempts(&rec, clip).is_none()).await;
+        let waited = failed.elapsed();
+
+        assert!(
+            retried_on_its_own,
+            "precondition: the released clip's own retry failed"
+        );
+        assert!(
+            reported
+                .iter()
+                .any(|d| d.camera_id == 1 && d.reason == UNFINALIZED),
+            "the unfinalized clip vanished from recording health: {reported:?}"
+        );
+        assert!(
+            settled,
+            "no retry finalized the clip once the store recovered"
+        );
+        assert!(
+            waited >= Duration::from_secs(4),
+            "the schedule retried without backing off: {waited:?}"
+        );
+        assert!(
+            finalized_playable(&store, &clips_dir, clip.clip_id).await,
+            "the retry did not stamp the row with the close's final file"
+        );
+        assert!(
+            rec.recording_degradations().is_empty(),
+            "a recovered clip is still reported: {:?}",
+            rec.recording_degradations()
+        );
+    }
+
+    /// SPEC-088 review 10: a close the supervisor runs while its camera keeps
+    /// recording (a rotation) is never followed by a drain; its failure
+    /// retries on its own once the store recovers. Review 13: recording
+    /// health reports the clip until then, and not after.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_close_of_a_recording_camera_retries_on_its_own() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        fail_clip_writes(&store).await;
+
+        let closed = rec
+            .close(
+                clip,
+                ClipFinal {
+                    ended_at: Utc::now(),
+                },
+            )
+            .await;
+        let reported = rec.recording_degradations();
+        restore_clip_writes(&store).await;
+        let settled = wait_for(Duration::from_secs(10), || attempts(&rec, clip).is_none()).await;
+
+        assert!(closed.is_err(), "precondition: the close failed");
+        assert!(
+            reported
+                .iter()
+                .any(|d| d.camera_id == 1 && d.reason == UNFINALIZED),
+            "the unfinalized clip is missing from recording health: {reported:?}"
+        );
+        assert!(settled, "no retry finalized the clip");
+        assert!(
+            finalized_playable(&store, &clips_dir, clip.clip_id).await,
+            "the retry did not stamp the row with the close's final file"
+        );
+        assert!(
+            rec.recording_degradations().is_empty(),
+            "a recovered clip is still reported: {:?}",
+            rec.recording_degradations()
+        );
+    }
+
+    /// SPEC-088 review 13: the store rejected every write of a damaged
+    /// (#376) clip's close, its quarantine's too. The retry once the store
+    /// recovers closes the clip quarantined, never eligible for cold upload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_damaged_clips_retried_close_keeps_it_out_of_cold_upload() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        // Two SPS in one file: the layout the damaged-clip fixture records.
+        let mut mixed = encode(15, "main", 60, Duration::ZERO);
+        mixed.extend(encode(20, "main", 60, Duration::from_secs(4)));
+        let (clip, _, _) =
+            register_samples(&rec, &store, &clips_dir, 1, started_at, None, &mixed).await;
+        fail_clip_writes(&store).await;
+
+        let closed = rec
+            .close(
+                clip,
+                ClipFinal {
+                    ended_at: started_at + chrono::Duration::seconds(8),
+                },
+            )
+            .await;
+        restore_clip_writes(&store).await;
+        let settled = wait_for(Duration::from_secs(10), || attempts(&rec, clip).is_none()).await;
+        let row = store.get_clip(clip.clip_id).await.unwrap().unwrap();
+        let pending: Vec<ClipId> = store
+            .clips_pending_cold_upload(10, None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|c| c.id)
+            .collect();
+
+        assert!(closed.is_err(), "precondition: the close failed");
+        assert!(settled, "no retry finalized the clip");
+        assert!(
+            row.ended_at.is_some() && row.sha256.is_some(),
+            "the retry did not close the clip"
+        );
+        assert!(
+            row.cold_quarantined,
+            "the retry dropped the clip's quarantine"
+        );
+        assert_eq!(
+            row.cold_last_error.as_deref(),
+            Some("clip layout: box after moov is not moof")
+        );
+        assert!(
+            pending.is_empty(),
+            "damaged footage is upload-eligible: {pending:?}"
+        );
+        // The retry clears the clip's finalization failure, not its damage.
+        let reasons: Vec<String> = rec
+            .recording_degradations()
+            .into_iter()
+            .map(|d| d.reason)
+            .collect();
+        assert_eq!(
+            reasons,
+            ["recording has missing samples or a damaged media layout"]
+        );
+    }
+
+    /// SPEC-088 review 10: shutdown does not wait out a retry schedule, and
+    /// the schedule makes no attempt after it; shutdown makes one last
+    /// attempt itself, which fails on the store still rejecting writes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_ends_a_released_clips_retry_schedule() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let clip = release_an_unfinalized_clip(&rec, &store, &clips_dir).await;
+
+        let shut = tokio::time::timeout(Duration::from_secs(1), rec.shutdown())
+            .await
+            .is_ok();
+        // Past the schedule's first delay.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        assert!(
+            shut,
+            "shutdown waited for a retry schedule between attempts"
+        );
+        assert_eq!(
+            attempts(&rec, clip),
+            Some(4),
+            "shutdown made no last attempt, or the schedule retried after it"
+        );
+    }
+
+    /// SPEC-088 review 11: a clip's own retries come 5 s after its close
+    /// failed, then twice as far apart after each failed attempt, and never
+    /// more than five minutes apart.
+    #[test]
+    fn a_clips_own_retries_double_up_to_five_minutes_apart() {
+        let secs: Vec<u64> = finalize_retry_delays()
+            .take(9)
+            .map(|d| d.as_secs())
+            .collect();
+        assert_eq!(secs, [5, 10, 20, 40, 80, 160, 300, 300, 300]);
+    }
+
+    /// SPEC-088 review 11: shutdown waits for a scheduled attempt under way,
+    /// here blocked on a store with no free connection, and once it ended
+    /// the schedule makes no other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_a_blocked_scheduled_attempt_and_ends_the_schedule() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let clip = release_an_unfinalized_clip(&rec, &store, &clips_dir).await;
+        let idle = rec.in_flight.is_closed();
+        // Every connection held: the schedule's first attempt, 5 s on, blocks.
+        let mut held = Vec::new();
+        for _ in 0..store.pool().options().get_max_connections() {
+            held.push(store.pool().acquire().await.unwrap());
+        }
+
+        let under_way = wait_for(Duration::from_secs(10), || !rec.in_flight.is_closed()).await;
+        // Past the attempt's shutdown check, into the store.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let early = tokio::time::timeout(Duration::from_millis(500), rec.shutdown())
+            .await
+            .is_ok();
+        drop(held);
+        let shut = tokio::time::timeout(Duration::from_secs(10), rec.shutdown())
+            .await
+            .is_ok();
+        let attempted = attempts(&rec, clip);
+        // Past the schedule's next delay.
+        tokio::time::sleep(Duration::from_secs(11)).await;
+
+        assert!(
+            idle,
+            "precondition: nothing was in flight after the release"
+        );
+        assert!(under_way, "precondition: the schedule's attempt began");
+        assert!(
+            !early,
+            "shutdown returned while a scheduled attempt was under way"
+        );
+        assert!(shut, "shutdown did not return once the attempt ended");
+        // The blocked attempt ran to its end, then shutdown's last one.
+        assert_eq!(
+            attempted,
+            Some(5),
+            "the blocked attempt did not run to its end before shutdown's last one"
+        );
+        assert_eq!(
+            attempts(&rec, clip),
+            Some(5),
+            "the schedule retried after shutdown"
+        );
+    }
+
+    /// PR #405 review: a clip whose close failed at its row step retries 5 s
+    /// on, and a restart before then (an OTA) must not lose it: no boot step
+    /// closes the row, and an unclosed row never replicates. Shutdown makes a
+    /// last attempt at every retained step, so both rows close, the damaged
+    /// clip's quarantined with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_finalizes_retained_clips_before_their_retry_is_due() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (plain, _, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        // Two SPS in one file: the layout the damaged-clip fixture records.
+        let mut mixed = encode(15, "main", 60, Duration::ZERO);
+        mixed.extend(encode(20, "main", 60, Duration::from_secs(4)));
+        let (damaged, _, _) =
+            register_samples(&rec, &store, &clips_dir, 2, started_at, None, &mixed).await;
+        fail_clip_writes(&store).await;
+        let ended_at = started_at + chrono::Duration::seconds(8);
+        let failed = [
+            rec.close(plain, ClipFinal { ended_at }).await.is_err(),
+            rec.close(damaged, ClipFinal { ended_at }).await.is_err(),
+        ];
+        restore_clip_writes(&store).await;
+
+        let shut = tokio::time::timeout(Duration::from_secs(4), rec.shutdown())
+            .await
+            .is_ok();
+        let row = store.get_clip(damaged.clip_id).await.unwrap().unwrap();
+        let pending = store.clips_pending_cold_upload(10, None).await.unwrap();
+
+        assert_eq!(failed, [true, true], "precondition: both closes failed");
+        assert!(shut, "shutdown did not return within its budget");
+        assert!(
+            finalized_playable(&store, &clips_dir, plain.clip_id).await,
+            "shutdown returned with a retained clip's row unclosed"
+        );
+        assert!(
+            row.ended_at.is_some() && row.sha256.is_some(),
+            "shutdown returned with a retained damaged clip's row unclosed"
+        );
+        assert!(
+            row.cold_quarantined,
+            "the last attempt dropped the quarantine"
+        );
+        assert!(
+            pending.iter().all(|c| c.id != damaged.clip_id),
+            "damaged footage is upload-eligible"
+        );
+        assert!(
+            rec.unfinalized.lock().is_empty(),
+            "a clip is still retained"
+        );
+    }
+
+    /// PR #405 review: shutdown's last attempt is bounded. On a store with no
+    /// free connection, whose acquire waits 30 s, shutdown still returns well
+    /// inside the engine's 15 s budget, the clip still retained.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdowns_last_attempt_at_a_retained_clip_is_bounded() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, _, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        fail_clip_writes(&store).await;
+        let ended_at = started_at + chrono::Duration::seconds(8);
+        let closed = rec.close(clip, ClipFinal { ended_at }).await;
+        let mut held = Vec::new();
+        for _ in 0..store.pool().options().get_max_connections() {
+            held.push(store.pool().acquire().await.unwrap());
+        }
+
+        let began = tokio::time::Instant::now();
+        let shut = tokio::time::timeout(Duration::from_secs(15), rec.shutdown())
+            .await
+            .is_ok();
+        let took = began.elapsed();
+        drop(held);
+
+        assert!(closed.is_err(), "precondition: the close failed");
+        assert!(
+            shut && took < Duration::from_secs(10),
+            "shutdown waited {took:?} on its last attempt"
+        );
+        assert_eq!(
+            attempts(&rec, clip),
+            Some(1),
+            "the clip is no longer retained"
+        );
+    }
+
+    /// Time out a drain of camera 1, as a reconciler stop pass does, on its
+    /// clip's close blocked at the row step on a store with no free
+    /// connection, then free the store. Each later pass drains the camera
+    /// with no wait, polled once: do so every 50 ms, at most 100 times, until
+    /// one succeeds. Whether the first drain timed out, and the answers.
+    async fn zero_bound_drains_after_a_timed_out_one(
+        rec: &GstClipRecorder,
+        store: &Store,
+        clips_dir: &Path,
+    ) -> (bool, Vec<bool>) {
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        register_clip(rec, store, clips_dir, 1, started_at, None).await;
+        let mut held = Vec::new();
+        for _ in 0..store.pool().options().get_max_connections() {
+            held.push(store.pool().acquire().await.unwrap());
+        }
+        let timed_out = tokio::time::timeout(Duration::from_millis(500), rec.drain_camera(1))
+            .await
+            .is_err();
+        drop(held);
+        let mut answers = Vec::new();
+        for _ in 0..100 {
+            let drained = tokio::time::timeout(Duration::ZERO, rec.drain_camera(1)).await;
+            answers.push(matches!(drained, Ok(Ok(()))));
+            if answers.last() == Some(&true) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        (timed_out, answers)
+    }
+
+    /// PR #405 review (reconciler): the close that timed a drain out ends
+    /// shortly after, and finalizes the clip; the next zero-bound drain
+    /// succeeds, so the camera does not stay stopping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zero_bound_drain_succeeds_once_the_timed_out_close_ends() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+
+        let (timed_out, answers) =
+            zero_bound_drains_after_a_timed_out_one(&rec, &store, &clips_dir).await;
+
+        assert!(timed_out, "precondition: the first drain timed out");
+        assert_eq!(
+            answers.last(),
+            Some(&true),
+            "no drain succeeded: {answers:?}"
+        );
+        assert!(rec.unfinalized.lock().is_empty(), "the clip is retained");
+    }
+
+    /// PR #405 review (reconciler): the close that timed a drain out fails at
+    /// its row step, the store rejecting writes. Zero-bound drains keep the
+    /// camera stopping while the clip has failed fewer than `FINALIZE_DRAINS`
+    /// attempts, each starting the clip's next retry, and the drain that
+    /// releases it succeeds: the hold ends, polled once per pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn zero_bound_drains_hold_a_failed_clip_for_its_attempts_then_release_it() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        fail_clip_writes(&store).await;
+
+        let (timed_out, answers) =
+            zero_bound_drains_after_a_timed_out_one(&rec, &store, &clips_dir).await;
+        let attempted: Vec<u32> = rec
+            .unfinalized
+            .lock()
+            .values()
+            .map(|u| u.attempts)
+            .collect();
+
+        assert!(timed_out, "precondition: the first drain timed out");
+        assert!(
+            answers.len() > 1 && answers.last() == Some(&true),
+            "the clip did not hold the camera, or never released it: {answers:?}"
+        );
+        assert!(
+            matches!(attempted[..], [n] if n >= FINALIZE_DRAINS),
+            "released after {attempted:?} attempts"
+        );
+    }
+
+    /// SPEC-088 review 10: deleting a recording camera cascades its clip rows
+    /// before the reconciler stops it, so its clip's close, the supervisor's
+    /// or the drain's, finds no row to stamp, nor to discard (camera 3's clip
+    /// recorded nothing). Nothing is left to finalize: every stop succeeds,
+    /// no clip is retained and no camera reads unfinalized, however many
+    /// cameras are deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deleting_recording_cameras_leaves_nothing_unfinalized() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+
+        for camera_id in 1..=3 {
+            let (clip, path, _) =
+                register_clip(&rec, &store, &clips_dir, camera_id, started_at, None).await;
+            if camera_id == 3 {
+                fs::remove_file(&path).await.unwrap();
+            }
+            store.delete_camera(camera_id).await.unwrap();
+            let closed = if camera_id == 1 {
+                rec.close(
+                    clip,
+                    ClipFinal {
+                        ended_at: Utc::now(),
+                    },
+                )
+                .await
+                .map(|_| ())
+            } else {
+                Ok(())
+            };
+            let drained = rec.drain_camera(camera_id).await;
+            let degraded = rec.recording_degradations();
+            rec.remove_camera_ingester(camera_id);
+
+            assert!(closed.is_ok(), "camera {camera_id}'s close: {closed:?}");
+            assert!(drained.is_ok(), "camera {camera_id}'s drain: {drained:?}");
+            assert!(
+                !degraded.iter().any(|d| d.reason == UNFINALIZED),
+                "deleting camera {camera_id} left it unfinalized: {degraded:?}"
+            );
+        }
+        assert!(
+            rec.unfinalized.lock().is_empty(),
+            "a deleted camera's clip is retained"
+        );
+    }
+
+    /// SPEC-088 review 10: a clip retained for a store error whose camera is
+    /// deleted next is not kept for good: its next retry finds no row, so
+    /// nothing is left to finalize, and the drain lets the camera go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retained_clip_of_a_deleted_camera_is_let_go() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        fail_clip_writes(&store).await;
+
+        let failed = rec.drain_camera(1).await;
+        restore_clip_writes(&store).await;
+        store.delete_camera(1).await.unwrap();
+        let drained = rec.drain_camera(1).await;
+        rec.remove_camera_ingester(1);
+
+        assert!(failed.is_err(), "precondition: the close failed");
+        assert!(drained.is_ok(), "the deleted camera's drain: {drained:?}");
+        assert!(
+            rec.unfinalized.lock().is_empty(),
+            "a deleted camera's clip is retained"
+        );
+        assert!(
+            rec.recording_degradations().is_empty(),
+            "a deleted camera is still reported: {:?}",
+            rec.recording_degradations()
+        );
+    }
+
+    /// SPEC-088 review 10: a clip that recorded nothing is discarded, its
+    /// alerts detached rather than deleted with it. When the store rejects
+    /// that discard the clip is retained at its discard step, and the retry
+    /// that completes it still keeps the alert and its undelivered outbox
+    /// row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_retried_discard_keeps_the_clips_alerts() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux"]),
+            "required GStreamer plugins missing: x264enc/mp4mux"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec = GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap();
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (clip, path, _) = register_clip(&rec, &store, &clips_dir, 1, started_at, None).await;
+        let alert = nexus_types::AlertEvent {
+            event_id: uuid::Uuid::now_v7(),
+            camera_id: 1,
+            rule_id: "r1".into(),
+            track_id: Some(7),
+            label: "person".into(),
+            severity: nexus_types::Severity::High,
+            bbox: None,
+            frame_id: 1,
+            captured_at: Utc::now(),
+            trace_id: "trace".into(),
+            artifacts: nexus_types::Artifacts::default(),
+            context: serde_json::Map::new(),
+            frame_w: 0,
+            frame_h: 0,
+        };
+        let event_id = alert.event_id.to_string();
         store
+            .record_event_and_enqueue(&alert, &["webhook:slack"])
+            .await
+            .unwrap();
+        store
+            .link_event_to_clip(&event_id, clip.clip_id)
+            .await
+            .unwrap();
+        // The clip recorded nothing, so its close discards it.
+        fs::remove_file(&path).await.unwrap();
+        fail_clip_writes(&store).await;
+
+        let failed = rec.drain_camera(1).await;
+        let retained_step = rec
+            .unfinalized
+            .lock()
+            .get(&clip.clip_id)
+            .map(|u| matches!(u.step, FinalStep::Discard));
+        let linked_meanwhile = store.get_event_clip_id(&event_id).await.unwrap();
+        restore_clip_writes(&store).await;
+        let drained = rec.drain_camera(1).await;
+
+        assert!(failed.is_err(), "precondition: the discard failed");
+        assert_eq!(
+            retained_step,
+            Some(true),
+            "the failed discard was not retained at its discard step"
+        );
+        assert_eq!(
+            linked_meanwhile,
+            Some(clip.clip_id),
+            "the failed discard detached the alert from a clip it kept"
+        );
+        assert!(drained.is_ok(), "the retried discard: {drained:?}");
+        assert!(
+            store.get_clip(clip.clip_id).await.unwrap().is_none(),
+            "the retry did not discard the clip's row"
+        );
+        assert!(
+            store.get_event(&event_id).await.unwrap().is_some(),
+            "the alert went with its discarded clip"
+        );
+        assert_eq!(store.get_event_clip_id(&event_id).await.unwrap(), None);
+        assert_eq!(
+            store.outbox_for_event(&event_id).await.unwrap().len(),
+            1,
+            "the alert's undelivered outbox row went with its discarded clip"
+        );
+    }
+
+    /// SPEC-088 Z-4 in `main`'s order: every supervisor is aborted, none is
+    /// joined, then the recorder shuts down. One was closing (stalled on its
+    /// pump), one held a clip, and one still mid-poll starts an open after
+    /// the drain began, which is refused. Shutdown must outlast the others
+    /// and leave no writer and no in-flight file behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_after_mains_aborts_leaves_no_writer_behind() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let ing = PreRollIngester::new(3, "rtsp://127.0.0.1:1/main", 0, CodecKind::H264).unwrap();
+        ing.shutdown();
+        let rec = Arc::new(
+            GstClipRecorder::new(store.clone(), &clips_dir, HashMap::from([(3, ing)])).unwrap(),
+        );
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        let (stalled, _, stalled_writer) = register_clip(
+            &rec,
+            &store,
+            &clips_dir,
+            1,
+            started_at,
+            Some(tokio::spawn(std::future::pending::<PumpStats>())),
+        )
+        .await;
+        let (held, _, _) = register_clip(&rec, &store, &clips_dir, 2, started_at, None).await;
+        close_then_abort_caller(&rec, stalled).await;
+
+        let shutdown = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(15), rec.shutdown())
+                    .await
+                    .is_ok()
+            }
+        });
+        wait_until_closed(&store, held.clip_id).await;
+        // The drain is under way and the stalled close keeps it going.
+        let late_at = Utc::now();
+        let late = rec
+            .open(OpenClip {
+                camera_id: 3,
+                started_at: late_at,
+                frame_width: 512,
+                frame_height: 288,
+            })
+            .await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown ended before the late open"
+        );
+        assert!(shutdown.await.unwrap(), "shutdown overran main's 15 s");
+
+        assert!(rec.open.lock().await.is_empty(), "a clip left registered");
+        assert_eq!(stalled_writer.current_state(), gst::State::Null);
+        assert!(finalized_playable(&store, &clips_dir, held.clip_id).await);
+        assert!(finalized_playable(&store, &clips_dir, stalled.clip_id).await);
+        assert!(
+            matches!(late, Err(RecorderError::Refused)),
+            "an open after the drain began: {late:?}"
+        );
+        assert!(
+            store.get_clip(held.clip_id + 1).await.unwrap().is_none(),
+            "the late open wrote a row"
+        );
+        assert!(
+            !rec.clip_path(3, late_at).exists(),
+            "the late open's writer was left behind"
+        );
     }
 
     /// #376 at close: muxing two SPS into one file makes mp4mux rewrite a
@@ -5641,6 +7693,69 @@ mod epoch_tests {
             pending,
             [*clean, closed[2].0, closed[3].0, closed[4].0],
             "only clean clips are replicated"
+        );
+    }
+
+    /// SPEC-088 Z-4: the reconciler's forced stop aborts a supervisor while
+    /// `close` waits on its writer, after the clip left the open map. The
+    /// close must still finish, and `shutdown` must wait for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_cancelled_after_it_took_the_clip_still_finalizes_it() {
+        assert!(
+            has_elements(&["x264enc", "mp4mux", "avdec_h264"]),
+            "required GStreamer plugins missing: x264enc/mp4mux/avdec_h264"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_with_camera(dir.path()).await;
+        let clips_dir = dir.path().join("clips");
+        let rec =
+            Arc::new(GstClipRecorder::new(store.clone(), &clips_dir, HashMap::new()).unwrap());
+        let started_at = Utc::now() - chrono::Duration::seconds(30);
+        // A pump that never stops parks `close` in its 2 s pump wait, after
+        // it took the clip out of the open map.
+        let (handle, path, writer) = register_clip(
+            &rec,
+            &store,
+            &clips_dir,
+            1,
+            started_at,
+            Some(tokio::spawn(std::future::pending::<PumpStats>())),
+        )
+        .await;
+        let clip_id = handle.clip_id;
+        let closer = tokio::spawn({
+            let rec = rec.clone();
+            async move {
+                rec.close(
+                    handle,
+                    ClipFinal {
+                        ended_at: started_at + chrono::Duration::seconds(8),
+                    },
+                )
+                .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !rec.open.lock().await.is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "close never took the clip"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        closer.abort();
+        assert!(closer.await.unwrap_err().is_cancelled());
+        rec.shutdown().await;
+
+        assert_eq!(
+            writer.current_state(),
+            gst::State::Null,
+            "writer left running"
+        );
+        assert!(!path.exists(), "in-flight file never finalized");
+        assert!(
+            finalized_playable(&store, &clips_dir, clip_id).await,
+            "the finalized clip does not decode"
         );
     }
 

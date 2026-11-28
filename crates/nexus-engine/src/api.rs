@@ -593,6 +593,12 @@ pub fn router(state: ApiState) -> Router {
             "/v1/admin/cameras/{id}",
             put(upsert_camera).delete(delete_camera),
         )
+        // SPEC-088 — the camera's zones bound to their revision, read-only,
+        // behind the same gate as the camera list.
+        .route(
+            "/v1/admin/cameras/{camera_id}/config-snapshot",
+            get(get_camera_config_snapshot),
+        )
         // ADR-091 — IP speakers and each camera's talk-down speaker. Same
         // gate as the camera routes above; see `crate::speakers_admin`.
         .route(
@@ -1334,6 +1340,55 @@ async fn list_cameras(State(s): State<ApiState>) -> Result<Json<Vec<CameraConfig
     Ok(Json(s.store.list_cameras().await?))
 }
 
+/// SPEC-088 — `GET /v1/admin/cameras/{camera_id}/config-snapshot`. The
+/// revision metadata sits beside `settings`, never inside it. No `parking` or
+/// `parking_revision`: this build reports no parking, and a reader takes
+/// their absence as unsupported, never as a default.
+#[derive(serde::Serialize)]
+struct CameraConfigSnapshot {
+    schema_version: u32,
+    camera_id: CameraId,
+    settings: CameraZoneSettingsView,
+    zones_revision: String,
+}
+
+/// The settings the snapshot binds to a revision, copied field by field: no
+/// stream URL, ONVIF or talk-down field, credential or other camera config.
+#[derive(serde::Serialize)]
+struct CameraZoneSettingsView {
+    zones: Vec<nexus_config::ZoneConfig>,
+}
+
+/// The camera's zones and the revision hashed from them, both taken from the
+/// one stored row this read decodes, so a save racing the read cannot pair
+/// one write's zones with another's revision. A row this build cannot decode
+/// answers a generic error, never the decode error, which can quote the row.
+async fn get_camera_config_snapshot(
+    State(s): State<ApiState>,
+    Path(id): Path<CameraId>,
+) -> Result<Json<CameraConfigSnapshot>, ApiError> {
+    let (cameras, unreadable) = s.store.list_readable_cameras().await?;
+    let Some(camera) = cameras.into_iter().find(|c| c.id == id) else {
+        return Err(if unreadable.contains(&id) {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "camera config unreadable".into(),
+            )
+        } else {
+            ApiError(StatusCode::NOT_FOUND, "camera not found".into())
+        });
+    };
+    let zones_revision = nexus_pipeline::zone_application::zone_revision(&camera.zones);
+    Ok(Json(CameraConfigSnapshot {
+        schema_version: 1,
+        camera_id: id,
+        settings: CameraZoneSettingsView {
+            zones: camera.zones,
+        },
+        zones_revision,
+    }))
+}
+
 /// Body for `POST /v1/admin/cameras/reprobe`. An absent list means
 /// every enabled camera.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -1384,7 +1439,10 @@ async fn reprobe_apply(
     let probed = run_reprobe(&s, Some(&ids)).await?;
     // One read for the whole batch. Re-reading inside the loop made this
     // 53 full table scans on a 53-camera core, and opened a
-    // read-modify-write race with any concurrent camera edit.
+    // read-modify-write race with any concurrent camera edit. SPEC-088 —
+    // read and written inside the save boundary, as `upsert_camera`, so a
+    // zone save cannot land between the read and the write and be set back.
+    let saving = s.frame_stats.zone_application().saves().write().await;
     let mut cams = s.store.list_cameras().await?;
     let mut out = Vec::with_capacity(probed.len());
     let mut applied_any = false;
@@ -1416,11 +1474,19 @@ async fn reprobe_apply(
                 )
                 .await?;
                 nexus_store::Store::commit_tx(tx).await?;
+                // SPEC-088 — the row written back carries zones and the
+                // enabled flag too: a save like any other.
+                s.frame_stats.zone_application().request(
+                    cam.id,
+                    &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+                    cam.ingest.enabled,
+                );
                 applied_any = true;
             }
         }
         out.push(proposal);
     }
+    drop(saving);
     // The reconciler is the only thing that starts an analysis session on a
     // live engine, and it is driven purely by this event. Without the
     // publish the rows change, the console reports "applied", and not one
@@ -1567,14 +1633,25 @@ fn validate_analysis_url(ingest: &nexus_config::CameraIngest) -> Result<(), ApiE
     Ok(())
 }
 
+/// Query of `PUT /cameras/{id}`.
+#[derive(Debug, serde::Deserialize)]
+struct UpsertCameraQuery {
+    /// SPEC-088 — save only while the stored zones still have this revision
+    /// (the config snapshot's `zones_revision`); otherwise answer 409
+    /// `zones_revision_conflict` with the current one and write nothing.
+    /// Absent, the save is unconditional, as before.
+    expected_zones_revision: Option<String>,
+}
+
 async fn upsert_camera(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
+    Query(q): Query<UpsertCameraQuery>,
     headers: HeaderMap,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     session: Option<crate::auth::require_role::SessionContext>,
     Json(mut cam): Json<CameraConfig>,
-) -> Result<Json<CameraConfig>, ApiError> {
+) -> Result<Response, ApiError> {
     cam.id = id;
     validate_analysis_url(&cam.ingest)?;
     cam.validate_finite()
@@ -1594,6 +1671,28 @@ async fn upsert_camera(
     let after_str = camera_audit_json(&cam);
     let before_str = before.as_ref().and_then(camera_audit_json);
     let resource_id = id.to_string();
+    // SPEC-088 — no other save commits, and no read requests, between this
+    // commit and the request below, so the registry sees saves in order.
+    let saving = s.frame_stats.zone_application().saves().write().await;
+    // Read under the lock every row writer holds, so no save lands between
+    // this check and the commit. A missing or unreadable row never matches.
+    if let Some(expected) = q.expected_zones_revision {
+        let current = s
+            .store
+            .list_readable_cameras()
+            .await?
+            .0
+            .into_iter()
+            .find(|c| c.id == id)
+            .map(|c| nexus_pipeline::zone_application::zone_revision(&c.zones));
+        if current.as_deref() != Some(expected.as_str()) {
+            let body = serde_json::json!({
+                "error": "zones_revision_conflict",
+                "zones_revision": current,
+            });
+            return Ok((StatusCode::CONFLICT, Json(body)).into_response());
+        }
+    }
     // M6 Phase 4 Step 4.1 (tx-merge) — the domain mutation
     // and the success audit row commit together in one SQLite
     // tx. If the audit write fails, the tx drops and the camera
@@ -1637,6 +1736,14 @@ async fn upsert_camera(
         .await;
         return Err(e.into());
     }
+    // SPEC-088 — every save is a request, so A→B→A saved before the next
+    // reconcile pass or read still needs a new acknowledgement.
+    s.frame_stats.zone_application().request(
+        id,
+        &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+        cam.ingest.enabled,
+    );
+    drop(saving);
     // Fire-and-forget: the engine's `config.changed` reconciler
     // listens for this and hot-starts a supervisor + pre-roll
     // ingester for the new (or modified) camera. `action` lets the
@@ -1648,7 +1755,7 @@ async fn upsert_camera(
             &serde_json::json!({ "kind": "camera", "action": "upsert", "camera_id": id }),
         )
         .await;
-    Ok(Json(cam))
+    Ok(Json(cam).into_response())
 }
 
 /// `POST /cameras` — create a new camera with a server-assigned
@@ -1703,6 +1810,8 @@ async fn create_camera(
             }
         }
     }
+    // SPEC-088 — as `upsert_camera`.
+    let saving = s.frame_stats.zone_application().saves().write().await;
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
         s.store.create_camera_tx(&mut tx, &mut cam).await?;
@@ -1746,6 +1855,13 @@ async fn create_camera(
         .await;
         return Err(e.into());
     }
+    // SPEC-088 — as `upsert_camera`.
+    s.frame_stats.zone_application().request(
+        cam.id,
+        &nexus_pipeline::zone_application::zone_revision(&cam.zones),
+        cam.ingest.enabled,
+    );
+    drop(saving);
     let _ = s
         .bus
         .publish(
@@ -1775,6 +1891,9 @@ async fn delete_camera(
         .and_then(|(all, _)| all.into_iter().find(|c| c.id == id));
     let before_str = before.as_ref().and_then(camera_audit_json);
     let resource_id = id.to_string();
+    // SPEC-088 — as `upsert_camera`: a re-create cannot commit before the
+    // registry forgot this camera.
+    let saving = s.frame_stats.zone_application().saves().write().await;
     // M6 Phase 4 Step 4.1 (tx-merge) — see upsert_camera.
     let tx_res: Result<(), nexus_store::StoreError> = async {
         let mut tx = s.store.begin_tx().await?;
@@ -1814,6 +1933,9 @@ async fn delete_camera(
     }
     // The delete cascaded its speaker assignment; its stop would now 404.
     s.talkdown.stop_where(|_, camera, _| camera == Some(id));
+    // SPEC-088 — a deleted camera has no zone application left to report.
+    s.frame_stats.zone_application().remove(id);
+    drop(saving);
     // Same channel as upsert — the reconciler diffs the live set
     // against the DB and stops the supervisor for any removed id.
     let _ = s
@@ -2908,18 +3030,102 @@ struct CameraFrameStatsView {
     /// right now (substream vs. mainstream fallback) and at what geometry
     /// / rate. `null` if this camera has no supervisor spawned yet.
     analysis_stream: Option<nexus_pipeline::AnalysisStreamStatus>,
+    /// SPEC-088 — the zone revision and enabled flag saved now against what
+    /// the camera's supervisor generations acknowledged. Absent only for a
+    /// camera that is not saved, which a reader takes as "not reported",
+    /// never as applied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zones_runtime: Option<ZonesReceipt>,
 }
 
+/// SPEC-088 — a camera's `zones_runtime`: its receipt, or `read_error` with
+/// every other key but the schema version `null` when its saved zones could
+/// not be read (the store failed, or this build cannot read its row). A
+/// reader takes that for a failed read, neither applied nor an engine that
+/// does not report zone application, and keeps reading.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum ZonesReceipt {
+    Read(nexus_pipeline::zone_application::ZonesRuntime),
+    ReadError {
+        schema_version: u32,
+        desired_revision: (),
+        applied_revision: (),
+        generation: (),
+        applied_generation: (),
+        state: &'static str,
+        applied_at: (),
+        error_code: (),
+    },
+}
+
+const ZONES_READ_ERROR: ZonesReceipt = ZonesReceipt::ReadError {
+    schema_version: 1,
+    desired_revision: (),
+    applied_revision: (),
+    generation: (),
+    applied_generation: (),
+    state: "read_error",
+    applied_at: (),
+    error_code: (),
+};
+
+/// SPEC-088 — each saved camera's zone application status, its desired
+/// revision hashed from the zones in the store now and its enabled flag read
+/// with them, so a read straight after a save already reports the saved
+/// zones, never the running ones as applied. `None` when the saved cameras
+/// could not be read: then no camera's status is known, and each reads
+/// [`ZONES_READ_ERROR`].
+async fn zones_runtime(
+    s: &ApiState,
+    now: std::time::Instant,
+) -> Option<std::collections::HashMap<CameraId, ZonesReceipt>> {
+    let registry = s.frame_stats.zone_application();
+    // No save commits between this read and the requests it makes.
+    let _reading = registry.saves().read().await;
+    let (cameras, unreadable) = match s.store.list_readable_cameras().await {
+        Ok(read) => read,
+        Err(e) => {
+            tracing::warn!(error = %e, "camera stats: saved zones unreadable; zone application reported as a read error");
+            return None;
+        }
+    };
+    let receipts = cameras.iter().map(|cam| {
+        let desired = nexus_pipeline::zone_application::zone_revision(&cam.zones);
+        let receipt = registry.snapshot(cam.id, &desired, cam.ingest.enabled, now);
+        (cam.id, ZonesReceipt::Read(receipt))
+    });
+    Some(
+        receipts
+            .chain(unreadable.into_iter().map(|id| (id, ZONES_READ_ERROR)))
+            .collect(),
+    )
+}
+
+/// 404 only when there is nothing to report: no frame since the supervisor
+/// last (re)started, and no saved camera to report zone application for (a
+/// failed read of the saved cameras cannot tell, so it reports that). A
+/// restarting camera reads as no frame yet, with its zone status, rather than
+/// as missing.
 async fn get_camera_stats(
     State(s): State<ApiState>,
     Path(id): Path<CameraId>,
 ) -> Result<Json<CameraFrameStatsView>, ApiError> {
-    let snap = s
-        .frame_stats
-        .snapshot(id)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no stats for camera".into()))?;
     let now = std::time::Instant::now();
-    Ok(Json(build_camera_stats_view(&s, id, &snap, now)))
+    let zones = zones_runtime(&s, now)
+        .await
+        .map_or(Some(ZONES_READ_ERROR), |mut zones| zones.remove(&id));
+    let snap = match (s.frame_stats.snapshot(id), &zones) {
+        (Some(snap), _) => snap,
+        (None, Some(_)) => nexus_pipeline::CameraFrameStats::default(),
+        (None, None) => {
+            return Err(ApiError(
+                StatusCode::NOT_FOUND,
+                "no stats for camera".into(),
+            ))
+        }
+    };
+    Ok(Json(build_camera_stats_view(&s, id, &snap, now, zones)))
 }
 
 /// Shared by `GET /v1/cameras/:id/stats` and the batch
@@ -2930,6 +3136,7 @@ fn build_camera_stats_view(
     id: CameraId,
     snap: &nexus_pipeline::CameraFrameStats,
     now: std::time::Instant,
+    zones_runtime: Option<ZonesReceipt>,
 ) -> CameraFrameStatsView {
     // Absent (camera has no RGB tap, or none of its frames have reached the
     // loop guard yet) reads as all-zero rather than 404 — the caller asked
@@ -2978,22 +3185,31 @@ fn build_camera_stats_view(
         decode_summary: summary,
         decode_ceiling_fps,
         analysis_stream: analysis,
+        zones_runtime,
     }
 }
 
 /// SPEC-069 Phase 1 (P2) — batch counterpart to `GET /v1/cameras/:id/stats`.
-/// Returns every camera the frame-stats registry has ever seen a frame
-/// from, in the same shape, so a fleet-wide decode-capacity dashboard
-/// doesn't have to make one request per camera.
+/// Returns every camera the single read answers for, in the same shape, so a
+/// fleet-wide decode-capacity dashboard doesn't have to make one request per
+/// camera.
 async fn get_all_camera_stats(
     State(s): State<ApiState>,
 ) -> Result<Json<Vec<CameraFrameStatsView>>, ApiError> {
     let now = std::time::Instant::now();
-    let views = s
-        .frame_stats
-        .snapshot_all()
+    let mut zones = zones_runtime(&s, now).await;
+    let mut stats = s.frame_stats.snapshot_all();
+    for id in zones.iter().flat_map(|zones| zones.keys()) {
+        stats.entry(*id).or_default();
+    }
+    let views = stats
         .into_iter()
-        .map(|(id, snap)| build_camera_stats_view(&s, id, &snap, now))
+        .map(|(id, snap)| {
+            let receipt = zones
+                .as_mut()
+                .map_or(Some(ZONES_READ_ERROR), |zones| zones.remove(&id));
+            build_camera_stats_view(&s, id, &snap, now, receipt)
+        })
         .collect();
     Ok(Json(views))
 }
@@ -7011,6 +7227,146 @@ mod tests {
         ));
     }
 
+    /// SPEC-088 — a camera edit (new ONVIF credentials and endpoint path)
+    /// that lands after the dangerous write first loads the camera but
+    /// before its lockstep persist is kept, host-rewritten, by that
+    /// persist; the re-probe must then use the persisted camera, not the
+    /// stale first load. The stub makes that edit while answering
+    /// `SetNetworkInterfaces`, and answers the `GetSystemDateAndTime`
+    /// re-probe only at the new path with a WS-Security digest of the new
+    /// credentials — a probe built from the first load gets `401`s, `502`.
+    #[tokio::test]
+    async fn network_dangerous_write_reprobes_with_the_persisted_camera() {
+        use axum::extract::State;
+        use axum::response::IntoResponse;
+        use base64::Engine as _;
+
+        fn between<'a>(s: &'a str, open: &str, close: &str) -> &'a str {
+            s.split_once(open)
+                .and_then(|(_, rest)| rest.split_once(close))
+                .map_or("", |(v, _)| v)
+        }
+
+        async fn onvif_stub(
+            State((store, edited)): State<(Arc<Store>, nexus_config::CameraConfig)>,
+            uri: axum::http::Uri,
+            body: String,
+        ) -> axum::response::Response {
+            if body.contains("SetNetworkInterfaces") {
+                store.upsert_camera(&edited).await.unwrap();
+                let soap = r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" xmlns:tds="http://www.onvif.org/ver10/device/wsdl"><s:Body><tds:SetNetworkInterfacesResponse><tds:RebootNeeded>false</tds:RebootNeeded></tds:SetNetworkInterfacesResponse></s:Body></s:Envelope>"#;
+                return (StatusCode::OK, soap).into_response();
+            }
+            if body.contains("GetSystemDateAndTime") {
+                let nonce = base64::engine::general_purpose::STANDARD
+                    .decode(between(&body, "Base64Binary\">", "</wsse:Nonce>"))
+                    .unwrap_or_default();
+                let created = between(&body, "<wsu:Created>", "</wsu:Created>");
+                let digest = crate::discovery::onvif_soap::compute_password_digest(
+                    &nonce,
+                    created,
+                    edited.onvif.password.as_deref().unwrap(),
+                );
+                let accepted = uri.path() == "/onvif/v2/device_service"
+                    && between(&body, "<wsse:Username>", "</wsse:Username>") == "admin2"
+                    && between(&body, "PasswordDigest\">", "</wsse:Password>") == digest;
+                if !accepted {
+                    return (StatusCode::UNAUTHORIZED, "stale path or credentials").into_response();
+                }
+            }
+            (StatusCode::OK, "<ok/>").into_response()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        const SECRET: &[u8] = b"network-reprobe-persisted-secret";
+        let (app, store, _dir) = build_test_router(Some(SECRET)).await;
+        let cam = nexus_config::CameraConfig {
+            id: 22,
+            name: "cam-22".into(),
+            ingest: nexus_config::CameraIngest {
+                url: "rtsp://192.168.50.50:554/stream".parse().unwrap(),
+                analysis_url: None,
+                enabled: true,
+                max_fps: 0,
+                codec: None,
+            },
+            detector: nexus_config::CameraDetector::default(),
+            behavior: nexus_config::CameraBehavior::default(),
+            onvif: nexus_config::CameraOnvif {
+                endpoint: Some(format!("http://{addr}/onvif/device_service")),
+                username: Some("admin".into()),
+                password: Some(uuid::Uuid::now_v7().to_string()),
+            },
+            talk_down: Default::default(),
+            zones: vec![],
+        };
+        store.upsert_camera(&cam).await.unwrap();
+        let mut edited = cam.clone();
+        edited.onvif = nexus_config::CameraOnvif {
+            endpoint: Some(format!("http://{addr}/onvif/v2/device_service")),
+            username: Some("admin2".into()),
+            password: Some(uuid::Uuid::now_v7().to_string()),
+        };
+        let stub = axum::Router::new()
+            .fallback(onvif_stub)
+            .with_state((store.clone(), edited));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, stub.into_make_service()).await;
+        });
+
+        let token = sign_admin_jwt(SECRET);
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/v1/admin/cameras/22/network/interface")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(
+                serde_json::json!({
+                    "interface": { "token": "eth0", "dhcp": false, "address": "192.168.50.77", "prefix_length": 24 },
+                    "new_endpoint_host": "127.0.0.1"
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "body: {body:?}");
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["reachable"], true);
+
+        // The persist kept the concurrent edit and still rewrote the host.
+        let after = store
+            .list_cameras()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.id == 22)
+            .unwrap();
+        assert_eq!(after.ingest.url.host_str(), Some("127.0.0.1"));
+        assert_eq!(
+            after.onvif.endpoint.as_deref(),
+            Some(format!("http://{addr}/onvif/v2/device_service").as_str())
+        );
+        assert_eq!(after.onvif.username.as_deref(), Some("admin2"));
+
+        let rows = store
+            .list_audit_for_resource("camera", "22", 10)
+            .await
+            .unwrap();
+        let row = rows
+            .iter()
+            .find(|e| e.action == "camera.onvif.network.interface")
+            .expect("expected a camera.onvif.network.interface audit row");
+        assert!(matches!(
+            row.outcome,
+            nexus_store::audit::AuditOutcome::Success
+        ));
+    }
+
     /// Every registered route+method pair resolves to a handler —
     /// no `405 Method Not Allowed` (wrong method on a real path) and
     /// no `404` (path never registered). Runs in dev-mode (no admin
@@ -7511,6 +7867,331 @@ mod tests {
         );
     }
 
+    /// `GET /api/v1/admin/cameras/{id}/config-snapshot`: status and body.
+    async fn get_config_snapshot(
+        app: &axum::Router,
+        id: &str,
+        bearer: Option<&str>,
+        peer: SocketAddr,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/v1/admin/cameras/{id}/config-snapshot"));
+        if let Some(token) = bearer {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let mut req = req.body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// An admitted snapshot read, parsed.
+    async fn read_config_snapshot(app: &axum::Router, id: &str, token: &str) -> serde_json::Value {
+        let (status, body) = get_config_snapshot(app, id, Some(token), loopback_peer()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    /// The snapshot's zones, decoded as the console would read them.
+    fn snapshot_zones(snap: &serde_json::Value) -> Vec<nexus_config::ZoneConfig> {
+        serde_json::from_value(snap["settings"]["zones"].clone()).unwrap()
+    }
+
+    fn snapshot_zone(id: &str, x: f32) -> nexus_config::ZoneConfig {
+        nexus_config::ZoneConfig {
+            id: id.into(),
+            name: format!("zone {id}"),
+            polygon: vec![(x, 0.1), (0.9, 0.1), (0.5, 0.9)],
+            kind: nexus_config::ZoneKind::Exclusion,
+            min_bbox_area_px_override: Some(64),
+        }
+    }
+
+    /// Every value any span or event records while installed, at every level.
+    struct CapturedLogs(Arc<std::sync::Mutex<String>>);
+
+    impl CapturedLogs {
+        fn push(&self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let mut logs = self.0.lock().unwrap();
+            logs.push_str(&format!("{}={value:?}\n", field.name()));
+        }
+    }
+
+    impl tracing::Subscriber for CapturedLogs {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            attrs.record(&mut |f: &tracing::field::Field, v: &dyn std::fmt::Debug| self.push(f, v));
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+            values
+                .record(&mut |f: &tracing::field::Field, v: &dyn std::fmt::Debug| self.push(f, v));
+        }
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            event.record(&mut |f: &tracing::field::Field, v: &dyn std::fmt::Debug| self.push(f, v));
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// SPEC-088 — the config snapshot is the camera's zones and their
+    /// revision, and nothing else the stored camera holds: no stream URL, no
+    /// ONVIF or talk-down field, no name, no credential, in the body or in
+    /// what the request logs. The legacy list still returns them all
+    /// (BUG-311 stays open); this view does not claim to fix it.
+    #[tokio::test]
+    async fn camera_config_snapshot_is_the_zones_and_never_a_credential() {
+        use nexus_pipeline::zone_application::zone_revision;
+        const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-sentinel-secret";
+        const SENTINELS: [&str; 14] = [
+            "name-sentinel-n0",
+            "main-user-s1",
+            "main-pass-s2",
+            "main-host-s3",
+            "ana-user-s4",
+            "ana-pass-s5",
+            "ana-host-s6",
+            "onvif-host-s7",
+            "onvif-user-s8",
+            "onvif-pass-s9",
+            "talk-codec-s10",
+            "talk-user-s11",
+            "talk-pass-s12",
+            "talk-host-s13",
+        ];
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let mut camera = store.list_cameras().await.unwrap()[0].clone();
+        camera.name = "name-sentinel-n0".into();
+        camera.ingest.url = "rtsp://main-user-s1:main-pass-s2@main-host-s3.test/main"
+            .parse()
+            .unwrap();
+        camera.ingest.analysis_url = Some(
+            "rtsp://ana-user-s4:ana-pass-s5@ana-host-s6.test/sub"
+                .parse()
+                .unwrap(),
+        );
+        camera.onvif.endpoint = Some("http://onvif-host-s7.test/onvif/device_service".into());
+        camera.onvif.username = Some("onvif-user-s8".into());
+        camera.onvif.password = Some("onvif-pass-s9".into());
+        camera.talk_down.speaker_present = true;
+        camera.talk_down.backchannel_codec = Some("talk-codec-s10".into());
+        camera.talk_down.backchannel_url =
+            Some("rtsp://talk-user-s11:talk-pass-s12@talk-host-s13.test/back".into());
+        camera.zones = vec![snapshot_zone("door", 0.1), snapshot_zone("drive", 0.2)];
+        store.upsert_camera(&camera).await.unwrap();
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let (status, legacy) = {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri("/api/v1/admin/cameras")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        };
+        assert_eq!(status, StatusCode::OK, "{legacy}");
+        for sentinel in SENTINELS {
+            assert!(
+                legacy.contains(sentinel),
+                "fixture: the legacy list returns the stored {sentinel} (BUG-311)"
+            );
+        }
+
+        let logs = Arc::new(std::sync::Mutex::new(String::new()));
+        let guard = tracing::subscriber::set_default(CapturedLogs(logs.clone()));
+        let (status, body) =
+            get_config_snapshot(&app, &camera.id.to_string(), Some(&token), loopback_peer()).await;
+        drop(guard);
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let logs = logs.lock().unwrap().clone();
+        assert!(
+            logs.contains("config-snapshot"),
+            "fixture: the capture saw the request: {logs}"
+        );
+        for sentinel in SENTINELS {
+            assert!(
+                !body.contains(sentinel),
+                "{sentinel} in the snapshot: {body}"
+            );
+            assert!(!logs.contains(sentinel), "{sentinel} in the logs: {logs}");
+        }
+
+        let snap: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let keys = |v: &serde_json::Value| {
+            let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(
+            keys(&snap),
+            ["camera_id", "schema_version", "settings", "zones_revision"],
+            "no parking_revision: this build reports no parking"
+        );
+        assert_eq!(
+            keys(&snap["settings"]),
+            ["zones"],
+            "no parking: unsupported"
+        );
+        assert_eq!(snap["schema_version"], 1);
+        assert_eq!(snap["camera_id"], camera.id);
+        assert_eq!(snapshot_zones(&snap), camera.zones);
+        assert_eq!(snap["zones_revision"], zone_revision(&camera.zones));
+    }
+
+    /// SPEC-088 — one snapshot's zones and revision come from one stored
+    /// object: after each of A → B → A the read answers that write, and
+    /// reads racing a writer flipping A and B never pair one write's zones
+    /// with the other's revision.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn camera_config_snapshot_pairs_zones_with_their_revision_under_writes() {
+        use nexus_pipeline::zone_application::zone_revision;
+        const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-pairing-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let mut a = store.list_cameras().await.unwrap()[0].clone();
+        a.zones = vec![snapshot_zone("a", 0.1)];
+        let mut b = a.clone();
+        b.zones = vec![snapshot_zone("b", 0.3), snapshot_zone("c", 0.4)];
+        let (rev_a, rev_b) = (zone_revision(&a.zones), zone_revision(&b.zones));
+        assert_ne!(rev_a, rev_b);
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let id = a.id.to_string();
+
+        for (camera, rev) in [(&a, &rev_a), (&b, &rev_b), (&a, &rev_a)] {
+            store.upsert_camera(camera).await.unwrap();
+            let snap = read_config_snapshot(&app, &id, &token).await;
+            assert_eq!(snapshot_zones(&snap), camera.zones);
+            assert_eq!(snap["zones_revision"], **rev);
+        }
+
+        let writer = {
+            let store = store.clone();
+            tokio::spawn(async move {
+                for i in 0..40 {
+                    store
+                        .upsert_camera(if i % 2 == 0 { &b } else { &a })
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+        for _ in 0..40 {
+            let snap = read_config_snapshot(&app, &id, &token).await;
+            let rev = snap["zones_revision"].as_str().unwrap();
+            assert_eq!(rev, zone_revision(&snapshot_zones(&snap)), "{snap}");
+            assert!(rev == rev_a || rev == rev_b, "{snap}");
+        }
+        writer.await.unwrap();
+    }
+
+    /// SPEC-088 — the snapshot sits behind the admin gate the camera list
+    /// does, answers only for the camera it names, and a refusal carries no
+    /// camera config in place of the snapshot.
+    #[tokio::test]
+    async fn camera_config_snapshot_keeps_the_admin_gate_and_its_camera() {
+        const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-gate-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let mut camera = store.list_cameras().await.unwrap()[0].clone();
+        camera.zones = vec![snapshot_zone("gate", 0.1)];
+        store.upsert_camera(&camera).await.unwrap();
+        let id = camera.id.to_string();
+        let stranger = sign_admin_jwt(b"some-other-box-secret");
+        for (bearer, peer) in [
+            (None, remote_peer()),
+            (None, loopback_peer()),
+            (Some(stranger.as_str()), loopback_peer()),
+        ] {
+            let (status, body) = get_config_snapshot(&app, &id, bearer, peer).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert!(!body.contains("gate") && !body.contains("rtsp"), "{body}");
+        }
+
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let other = (camera.id + 1000).to_string();
+        let (status, body) = get_config_snapshot(&app, &other, Some(&token), loopback_peer()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(!body.contains("gate") && !body.contains("rtsp"), "{body}");
+        assert_eq!(
+            read_config_snapshot(&app, &id, &token).await["camera_id"],
+            camera.id
+        );
+    }
+
+    /// SPEC-088 — a row this build cannot decode answers its own read with a
+    /// generic error, not as missing and not with the decode error, which can
+    /// quote the row; every other camera's snapshot still answers.
+    #[tokio::test]
+    async fn camera_config_snapshot_of_an_unreadable_row_is_an_error_not_missing() {
+        const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-unreadable-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let camera = store.list_cameras().await.unwrap()[0].clone();
+        let mut other = camera.clone();
+        other.id += 1;
+        store.upsert_camera(&other).await.unwrap();
+        sqlx::query(
+            "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') WHERE id = ?",
+        )
+        .bind(other.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+        let token = sign_admin_jwt(ADMIN_SECRET);
+        let (status, body) =
+            get_config_snapshot(&app, &other.id.to_string(), Some(&token), loopback_peer()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+        assert_eq!(body, r#"{"error":"camera config unreadable"}"#);
+        assert_eq!(
+            read_config_snapshot(&app, &camera.id.to_string(), &token).await["camera_id"],
+            camera.id
+        );
+    }
+
+    /// SPEC-088 — `camera_config_snapshot_v1` is on the heartbeat, and both
+    /// things it promises exist: the gated route and the cloud's camera
+    /// `settings.read` mapping for it.
+    #[tokio::test]
+    async fn camera_config_snapshot_capability_has_its_route_and_permission() {
+        use nexus_cloud_client::actor_token::{EnvelopeContext, VerifiedActor};
+        assert!(crate::cloud_tunnel::heartbeat_caps(None, false, false)
+            .iter()
+            .any(|c| c == "camera_config_snapshot_v1"));
+        let reader = VerifiedActor {
+            sub: "human".into(),
+            role: "viewer".into(),
+            perm: Some("settings.read".into()),
+            jti: "jti".into(),
+            org_id: "org".into(),
+            actor_org_id: None,
+        };
+        assert!(reader.allows_rpc(
+            EnvelopeContext {
+                method: "GET",
+                path: "/admin/cameras/7/config-snapshot",
+            },
+            None,
+            false
+        ));
+        const ADMIN_SECRET: &[u8] = b"camera-config-snapshot-cap-secret";
+        let (app, store, _dir) = build_test_router(Some(ADMIN_SECRET)).await;
+        store_default_camera(&store, true).await;
+        let id = store.list_cameras().await.unwrap()[0].id.to_string();
+        let snap = read_config_snapshot(&app, &id, &sign_admin_jwt(ADMIN_SECRET)).await;
+        assert_eq!(snap["schema_version"], 1);
+    }
+
     /// SPEC-069 Phase 1 — the decode/analysis telemetry is only useful
     /// if the cloud console can actually fetch it, and the console
     /// reaches a core ONLY via `admin_proxy`'s `/admin/{tail}` rewrite.
@@ -7589,6 +8270,825 @@ mod tests {
             StatusCode::OK,
             "GET /api/v1/admin/cameras/stats must serve the batch roster"
         );
+    }
+
+    /// SPEC-088 — `zones_runtime` on the camera-stats read, in the shape the
+    /// cloud console is built against: all eight keys with explicit `null`s,
+    /// the desired revision and enabled flag read from the store now, and the
+    /// batch and the single read agreeing. Every saved camera answers, an
+    /// enabled one with no generation yet included, so a pending or failed
+    /// application is not hidden; a disabled one is inactive. Each save is a
+    /// new request, so A→B→A saved with no read between still needs a new
+    /// acknowledgement. A deleted camera is forgotten.
+    #[tokio::test]
+    async fn camera_stats_report_zone_application_in_the_agreed_shape() {
+        use nexus_pipeline::zone_application::{zone_revision, ZoneApplicationError};
+        use serde_json::json;
+
+        async fn get(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, body)
+        }
+        /// The single read's `zones_runtime`, once the batch row agrees.
+        async fn zones_runtime(
+            app: &axum::Router,
+            id: nexus_types::CameraId,
+        ) -> Option<serde_json::Value> {
+            let (status, one) = get(app, &format!("/api/v1/cameras/{id}/stats")).await;
+            assert_eq!(status, StatusCode::OK, "{one}");
+            let (status, all) = get(app, "/api/v1/cameras/stats").await;
+            assert_eq!(status, StatusCode::OK, "{all}");
+            let row = all
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["camera_id"] == id))
+                .cloned()
+                .unwrap_or_else(|| panic!("camera {id} has a batch row: {all}"));
+            assert_eq!(
+                row.get("zones_runtime"),
+                one.get("zones_runtime"),
+                "the batch and the single read disagree"
+            );
+            one.get("zones_runtime").cloned()
+        }
+        /// Save `camera` through the API, as an operator does.
+        async fn put(app: &axum::Router, camera: &nexus_config::CameraConfig) {
+            let mut req = Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/v1/cameras/{}", camera.id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(camera).unwrap()))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert!(res.status().is_success(), "save: {}", res.status());
+        }
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let mut camera = store.list_cameras().await.expect("list cameras")[0].clone();
+        let id = camera.id;
+        let frame_stats = state.frame_stats.clone();
+        let registry = || frame_stats.zone_application();
+        let app = super::router(state);
+        let applied_at =
+            chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 11, 24, 16, 30, 0).unwrap();
+
+        assert_eq!(
+            get(&app, &format!("/api/v1/cameras/{}/stats", id + 1))
+                .await
+                .0,
+            StatusCode::NOT_FOUND,
+            "a camera that is not saved and has no frame has nothing to report"
+        );
+
+        let a = zone_revision(&camera.zones);
+        let unstarted = zones_runtime(&app, id)
+            .await
+            .expect("an enabled camera with no generation is reported");
+        let g0 = unstarted["generation"].as_u64().expect("a generation");
+        assert_eq!(
+            unstarted,
+            json!({
+                "schema_version": 1,
+                "desired_revision": a,
+                "applied_revision": null,
+                "generation": g0,
+                "applied_generation": null,
+                "state": "applying",
+                "applied_at": null,
+                "error_code": null,
+            })
+        );
+
+        let g1 = registry().start(id, &a);
+        assert!(g1 > g0, "a start is a newer generation");
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(json!({
+                "schema_version": 1,
+                "desired_revision": a,
+                "applied_revision": null,
+                "generation": g1,
+                "applied_generation": null,
+                "state": "applying",
+                "applied_at": null,
+                "error_code": null,
+            }))
+        );
+
+        let first = registry()
+            .current_request(id, g1)
+            .expect("g1 runs the saved zones");
+        registry().acknowledge(id, g1, first, &a, applied_at);
+        let applied_a = json!({
+            "schema_version": 1,
+            "desired_revision": a,
+            "applied_revision": a,
+            "generation": g1,
+            "applied_generation": g1,
+            "state": "applied",
+            "applied_at": "2026-11-24T16:30:00Z",
+            "error_code": null,
+        });
+        assert_eq!(zones_runtime(&app, id).await, Some(applied_a.clone()));
+
+        // A→B→A through the API's save, with no read or reconcile between.
+        let a_camera = camera.clone();
+        camera.zones = vec![nexus_config::ZoneConfig {
+            id: "z1".into(),
+            name: "Driveway".into(),
+            polygon: vec![(0.1, 0.1), (0.9, 0.1), (0.5, 0.9)],
+            kind: nexus_config::ZoneKind::Exclusion,
+            min_bbox_area_px_override: None,
+        }];
+        let b = zone_revision(&camera.zones);
+        assert!(b.starts_with("sha256:") && b.len() == 7 + 64 && b != a);
+        put(&app, &camera).await;
+        put(&app, &a_camera).await;
+        let again = registry().current_request(id, g1).expect("g1 runs A");
+        assert_ne!(again, first, "the API's saves of B and A were no requests");
+        let reapplying = json!({
+            "schema_version": 1,
+            "desired_revision": a,
+            "applied_revision": a,
+            "generation": g1,
+            "applied_generation": g1,
+            "state": "applying",
+            "applied_at": "2026-11-24T16:30:00Z",
+            "error_code": null,
+        });
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(reapplying.clone()),
+            "the A acknowledged before B was credited to the A saved after it"
+        );
+        registry().acknowledge(id, g1, first, &a, applied_at);
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(reapplying),
+            "a stale token counted"
+        );
+        registry().acknowledge(id, g1, again, &a, applied_at);
+        assert_eq!(zones_runtime(&app, id).await, Some(applied_a));
+
+        put(&app, &camera).await;
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(json!({
+                "schema_version": 1,
+                "desired_revision": b,
+                "applied_revision": a,
+                "generation": g1,
+                "applied_generation": g1,
+                "state": "applying",
+                "applied_at": "2026-11-24T16:30:00Z",
+                "error_code": null,
+            })),
+            "a read straight after a save reports the saved zones, not the old verdict"
+        );
+
+        let g2 = registry().start(id, &b);
+        let request = registry().current_request(id, g2).expect("g2 runs B");
+        registry().fail(id, g2, request, ZoneApplicationError::SupervisorExited);
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(json!({
+                "schema_version": 1,
+                "desired_revision": b,
+                "applied_revision": a,
+                "generation": g2,
+                "applied_generation": g1,
+                "state": "failed",
+                "applied_at": "2026-11-24T16:30:00Z",
+                "error_code": "supervisor_exited",
+            }))
+        );
+
+        camera.ingest.enabled = false;
+        put(&app, &camera).await;
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            Some(json!({
+                "schema_version": 1,
+                "desired_revision": b,
+                "applied_revision": a,
+                "generation": g2,
+                "applied_generation": g1,
+                "state": "inactive",
+                "applied_at": "2026-11-24T16:30:00Z",
+                "error_code": null,
+            })),
+            "a disabled camera is inactive, neither applied nor failed"
+        );
+
+        let mut req = Request::builder()
+            .method(Method::DELETE)
+            .uri(format!("/api/v1/cameras/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert!(res.status().is_success(), "delete: {}", res.status());
+        let epoch = frame_stats.begin_session(id);
+        frame_stats.observe_frame(id, epoch, chrono::Utc::now(), 512, 288);
+        assert_eq!(
+            zones_runtime(&app, id).await,
+            None,
+            "a camera that is not saved omits the object"
+        );
+        assert_eq!(
+            registry()
+                .snapshot(id, &b, true, std::time::Instant::now())
+                .applied_revision,
+            None,
+            "the delete kept the camera's history"
+        );
+    }
+
+    /// SPEC-088 — the registry sees saves in commit order. With A applied
+    /// by g1, B is committed by a save that has not told the registry yet,
+    /// and A is saved through the API meanwhile: A cannot commit before B's
+    /// save has told the registry, so A is a new request, and g1's
+    /// acknowledgement from before B cannot certify it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_save_behind_a_paused_save_is_a_new_request() {
+        use nexus_pipeline::zone_application::zone_revision;
+
+        async fn put(app: axum::Router, camera: nexus_config::CameraConfig) -> StatusCode {
+            let mut req = Request::builder()
+                .method(Method::PUT)
+                .uri(format!("/api/v1/cameras/{}", camera.id))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&camera).unwrap()))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            app.oneshot(req).await.unwrap().status()
+        }
+        async fn state_of(app: &axum::Router, id: nexus_types::CameraId) -> serde_json::Value {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(format!("/api/v1/cameras/{id}/stats"))
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["zones_runtime"]["state"]
+                .clone()
+        }
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let a_camera = store.list_cameras().await.expect("list cameras")[0].clone();
+        let id = a_camera.id;
+        let mut b_camera = a_camera.clone();
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let (a, b) = (
+            zone_revision(&a_camera.zones),
+            zone_revision(&b_camera.zones),
+        );
+        let frame_stats = state.frame_stats.clone();
+        let registry = frame_stats.zone_application();
+        let app = super::router(state);
+        registry.request(id, &a, true);
+        let g1 = registry.start(id, &a);
+        let first = registry.current_request(id, g1).expect("g1 runs A");
+        registry.acknowledge(id, g1, first, &a, chrono::Utc::now());
+        assert_eq!(state_of(&app, id).await, "applied");
+
+        // B's save: committed, and paused before it tells the registry,
+        // holding the lock. Held for reading, so a save of A has to queue for
+        // it, and once it has (a queued writer takes every free permit, so
+        // `try_read` fails) it must not have committed.
+        let paused = registry.saves().read().await;
+        store.upsert_camera(&b_camera).await.expect("commit B");
+        let save_a = tokio::spawn(put(app.clone(), a_camera.clone()));
+        while registry.saves().try_read().is_ok() && !save_a.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let a_committed_while_b_paused = save_a.is_finished();
+        let b_still_saved = store.list_cameras().await.expect("list cameras")[0]
+            .zones
+            .clone();
+        registry.request(id, &b, true);
+        drop(paused);
+        assert_eq!(save_a.await.expect("save A"), StatusCode::OK);
+
+        assert!(
+            !a_committed_while_b_paused && b_still_saved == b_camera.zones,
+            "A committed while B's save had not told the registry"
+        );
+        let again = registry.current_request(id, g1);
+        assert!(
+            again.is_some() && again != Some(first),
+            "the save of A is not the latest request, or is the one g1 acknowledged before B"
+        );
+        assert_eq!(
+            state_of(&app, id).await,
+            "applying",
+            "g1's acknowledgement from before B certified the A saved after it"
+        );
+    }
+
+    /// `PUT /api/v1/cameras/{id}` of `camera`, naming the zones revision it
+    /// expects saved when given: status and body.
+    async fn put_camera_expecting(
+        app: axum::Router,
+        camera: nexus_config::CameraConfig,
+        expected: Option<String>,
+    ) -> (StatusCode, serde_json::Value) {
+        let query = expected.map_or(String::new(), |rev| {
+            format!("?expected_zones_revision={rev}")
+        });
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/api/v1/cameras/{}{query}", camera.id))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&camera).unwrap()))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, body)
+    }
+
+    /// SPEC-088 — a camera save naming the zones revision it expects saves
+    /// only while the stored zones still have it. A stale one answers 409
+    /// `zones_revision_conflict` with the current revision and writes
+    /// nothing; the current one saves; a save naming none saves as before.
+    #[tokio::test]
+    async fn a_camera_save_expecting_a_stale_zones_revision_conflicts_and_writes_nothing() {
+        use nexus_pipeline::zone_application::zone_revision;
+        async fn stored(store: &Store) -> (String, Vec<nexus_config::ZoneConfig>) {
+            let cam = store.list_cameras().await.unwrap()[0].clone();
+            (cam.name, cam.zones)
+        }
+        let (app, store, _dir) = build_test_router(None).await;
+        store_default_camera(&store, true).await;
+        let mut saved = store.list_cameras().await.unwrap()[0].clone();
+        saved.zones = vec![snapshot_zone("a", 0.1)];
+        store.upsert_camera(&saved).await.unwrap();
+        let current = zone_revision(&saved.zones);
+
+        let mut edit = saved.clone();
+        edit.name = "renamed".into();
+        edit.zones = vec![snapshot_zone("b", 0.2)];
+        let stale = Some(zone_revision(&[]));
+        let (status, body) = put_camera_expecting(app.clone(), edit.clone(), stale).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({ "error": "zones_revision_conflict", "zones_revision": current })
+        );
+        assert_eq!(
+            stored(&store).await,
+            (saved.name.clone(), saved.zones.clone()),
+            "a refused save wrote"
+        );
+
+        let (status, body) = put_camera_expecting(app.clone(), edit.clone(), Some(current)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            stored(&store).await,
+            (edit.name.clone(), edit.zones.clone())
+        );
+
+        edit.zones.clear();
+        let (status, body) = put_camera_expecting(app, edit.clone(), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(stored(&store).await, (edit.name, edit.zones));
+    }
+
+    /// SPEC-088 — the expectation is checked inside the camera save lock: a
+    /// save another writer commits while this one waits for the lock is seen,
+    /// so the waiting save conflicts instead of overwriting it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_zones_revision_expectation_is_checked_inside_the_save_lock() {
+        use nexus_pipeline::zone_application::zone_revision;
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let mine = store.list_cameras().await.unwrap()[0].clone();
+        let mut theirs = mine.clone();
+        theirs.zones = vec![snapshot_zone("b", 0.3)];
+        let frame_stats = state.frame_stats.clone();
+        let registry = frame_stats.zone_application();
+        let app = super::router(state);
+
+        // Another writer is mid-save, holding the lock (for reading, so the
+        // save queued behind it shows: a queued writer makes `try_read` fail).
+        let other = registry.saves().read().await;
+        let expected = Some(zone_revision(&mine.zones));
+        let save = tokio::spawn(put_camera_expecting(app.clone(), mine.clone(), expected));
+        while registry.saves().try_read().is_ok() && !save.is_finished() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        store.upsert_camera(&theirs).await.unwrap();
+        drop(other);
+
+        let (status, body) = save.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["zones_revision"], zone_revision(&theirs.zones));
+        assert_eq!(
+            store.list_cameras().await.unwrap()[0].zones,
+            theirs.zones,
+            "the queued save overwrote the zones saved ahead of it"
+        );
+    }
+
+    /// SPEC-088 review 11 — a failed read of the saved zones is no answer.
+    /// While the store cannot list the cameras, every camera's stats, one with
+    /// frames and one without, carry a `read_error` receipt, never an omitted
+    /// one, which a reader takes for an engine that does not report zone
+    /// application and stops asking. Once the store reads again the receipt is
+    /// back, and a row this build cannot read still reads `read_error`.
+    #[tokio::test]
+    async fn camera_stats_report_a_failed_zone_read_as_a_read_error_until_it_recovers() {
+        use serde_json::json;
+
+        async fn get(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+            let mut req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            let res = app.clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice(&bytes).unwrap_or_default())
+        }
+        /// The single read's `zones_runtime`, and the batch row's.
+        async fn receipts(
+            app: &axum::Router,
+            id: nexus_types::CameraId,
+        ) -> (serde_json::Value, serde_json::Value) {
+            let (status, one) = get(app, &format!("/api/v1/cameras/{id}/stats")).await;
+            assert_eq!(status, StatusCode::OK, "camera {id}: {one}");
+            let (status, all) = get(app, "/api/v1/cameras/stats").await;
+            assert_eq!(status, StatusCode::OK, "{all}");
+            let row = all
+                .as_array()
+                .and_then(|rows| rows.iter().find(|r| r["camera_id"] == id))
+                .map_or(serde_json::Value::Null, |r| r["zones_runtime"].clone());
+            (one["zones_runtime"].clone(), row)
+        }
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        store_default_camera(&store, true).await;
+        let camera = store.list_cameras().await.expect("list cameras")[0].clone();
+        let (id, frameless) = (camera.id, camera.id + 1);
+        let epoch = state.frame_stats.begin_session(id);
+        state
+            .frame_stats
+            .observe_frame(id, epoch, chrono::Utc::now(), 512, 288);
+        let app = super::router(state);
+        let read_error = json!({
+            "schema_version": 1,
+            "desired_revision": null,
+            "applied_revision": null,
+            "generation": null,
+            "applied_generation": null,
+            "state": "read_error",
+            "applied_at": null,
+            "error_code": null,
+        });
+
+        sqlx::query("ALTER TABLE cameras RENAME TO cameras_away")
+            .execute(store.pool())
+            .await
+            .expect("make the saved cameras unreadable");
+        assert_eq!(
+            receipts(&app, id).await,
+            (read_error.clone(), read_error.clone()),
+            "a camera with frames hid the failed read"
+        );
+        assert_eq!(
+            receipts(&app, frameless).await.0,
+            read_error,
+            "a camera with no frame, saved or not, cannot be told apart while the read fails"
+        );
+
+        sqlx::query("ALTER TABLE cameras_away RENAME TO cameras")
+            .execute(store.pool())
+            .await
+            .expect("make the saved cameras readable again");
+        let mut unreadable = camera.clone();
+        unreadable.id = frameless;
+        store
+            .upsert_camera(&unreadable)
+            .await
+            .expect("save a camera");
+        sqlx::query(
+            "UPDATE cameras SET config_json = json_set(config_json, '$.codec', 'av1') WHERE id = ?",
+        )
+        .bind(frameless)
+        .execute(store.pool())
+        .await
+        .expect("give it a codec this build cannot read");
+        let (one, row) = receipts(&app, id).await;
+        assert_eq!(one, row, "the batch and the single read disagree");
+        assert_eq!(
+            (&one["state"], &one["desired_revision"]),
+            (
+                &json!("applying"),
+                &json!(nexus_pipeline::zone_application::zone_revision(
+                    &camera.zones
+                ))
+            ),
+            "the receipt did not recover with the store: {one}"
+        );
+        assert_eq!(
+            receipts(&app, frameless).await,
+            (read_error.clone(), read_error),
+            "a row this build cannot read hid the failed read"
+        );
+    }
+
+    /// An admin JSON request from a loopback peer; its status.
+    async fn send_admin(
+        app: axum::Router,
+        token: String,
+        method: Method,
+        uri: String,
+        body: String,
+    ) -> StatusCode {
+        let mut req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+        app.oneshot(req).await.unwrap().status()
+    }
+
+    /// SPEC-088 — every full-camera writer saves inside the registry's
+    /// boundary. An ONVIF port change reads the camera, waits on the camera,
+    /// then persists: zones B saved and acknowledged while it waited survive
+    /// it, or the store holds A while the registry reads B applied, and a
+    /// later save of B reads applied without a new acknowledgement.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_network_rewrite_waiting_on_the_camera_keeps_a_zone_save() {
+        use axum::response::IntoResponse;
+        use nexus_pipeline::zone_application::zone_revision;
+        const SECRET: &[u8] = b"network-rewrite-zone-save-secret";
+
+        // The camera answers only once released, holding the handler
+        // between its read and its write.
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let stub = {
+            let (entered, release) = (entered.clone(), release.clone());
+            axum::Router::new().fallback(move || {
+                let (entered, release) = (entered.clone(), release.clone());
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    (StatusCode::OK, "<ok/>").into_response()
+                }
+            })
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, stub.into_make_service()).await;
+        });
+
+        let (state, store, _dir, _reg, _bus) = build_test_state(Some(SECRET)).await;
+        let mut a_camera = fleet_test_camera(31, "cam-31");
+        a_camera.zones = vec![snapshot_zone("a", 0.2)];
+        a_camera.onvif = nexus_config::CameraOnvif {
+            endpoint: Some(format!("http://{addr}/onvif/device_service")),
+            username: Some("admin".into()),
+            password: Some(uuid::Uuid::now_v7().to_string()),
+        };
+        store.upsert_camera(&a_camera).await.unwrap();
+        let mut b_camera = a_camera.clone();
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let b = zone_revision(&b_camera.zones);
+        let frame_stats = state.frame_stats.clone();
+        let registry = frame_stats.zone_application();
+        let app = super::router(state);
+        let token = sign_admin_jwt(SECRET);
+
+        let rewrite = tokio::spawn(send_admin(
+            app.clone(),
+            token.clone(),
+            Method::PUT,
+            "/api/v1/admin/cameras/31/network/safe".into(),
+            serde_json::json!({
+                "action": "set_network_protocols",
+                "protocols": [{ "name": "RTSP", "enabled": true, "port": 8554 }],
+            })
+            .to_string(),
+        ));
+        entered.notified().await;
+        let saved_b = send_admin(
+            app.clone(),
+            token,
+            Method::PUT,
+            "/api/v1/cameras/31".into(),
+            serde_json::to_string(&b_camera).unwrap(),
+        )
+        .await;
+        assert_eq!(saved_b, StatusCode::OK);
+        let g1 = registry.start(31, &b);
+        let b_request = registry.current_request(31, g1).expect("g1 runs B");
+        registry.acknowledge(31, g1, b_request, &b, chrono::Utc::now());
+        release.notify_one();
+        assert_eq!(rewrite.await.unwrap(), StatusCode::OK);
+
+        let saved = store.list_cameras().await.unwrap().remove(0);
+        assert_eq!(
+            saved.ingest.url.port(),
+            Some(8554),
+            "the port rewrite landed"
+        );
+        assert_eq!(
+            saved.zones, b_camera.zones,
+            "the rewrite wrote back the zones it read before B was saved and acknowledged"
+        );
+    }
+
+    /// SPEC-088 — what every read-modify-write of a camera's whole row must
+    /// do: take the save lock before it reads the row, and commit and
+    /// request only under it. Holds the lock for reading, so `writer` has to
+    /// queue for it, and once it has (a queued writer takes every free
+    /// permit, so `try_read` fails) checks it has not committed. Zone save
+    /// `b_camera` then lands ahead of it, and the writer must write B's zones
+    /// back, not a row it read before it queued. Returns the row it left.
+    async fn write_behind_a_zone_save(
+        store: &Store,
+        registry: &nexus_pipeline::zone_application::ZoneApplicationRegistry,
+        b_camera: &nexus_config::CameraConfig,
+        writer: impl std::future::Future<Output = StatusCode> + Send + 'static,
+    ) -> nexus_config::CameraConfig {
+        let row = || async move {
+            let cameras = store.list_cameras().await.unwrap();
+            cameras.into_iter().find(|c| c.id == b_camera.id).unwrap()
+        };
+        let before = serde_json::to_value(row().await).unwrap();
+        let reading = registry.saves().read().await;
+        let writer = tokio::spawn(writer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while registry.saves().try_read().is_ok() {
+            assert!(
+                !writer.is_finished() && std::time::Instant::now() < deadline,
+                "the writer never queued for the save lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let while_queued = serde_json::to_value(row().await).unwrap();
+        store.upsert_camera(b_camera).await.unwrap();
+        registry.request(
+            b_camera.id,
+            &nexus_pipeline::zone_application::zone_revision(&b_camera.zones),
+            b_camera.ingest.enabled,
+        );
+        drop(reading);
+        assert_eq!(writer.await.unwrap(), StatusCode::OK);
+        assert_eq!(
+            while_queued, before,
+            "the writer committed before it held the save lock"
+        );
+        let after = row().await;
+        assert_eq!(
+            after.zones, b_camera.zones,
+            "the writer wrote back zones it read before it held the save lock"
+        );
+        after
+    }
+
+    /// SPEC-088 — as above for a fleet push of text prompts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fleet_push_across_a_zone_save_keeps_the_save() {
+        const SECRET: &[u8] = b"fleet-push-zone-save-secret";
+        let (state, store, _dir, _reg, _bus) = build_test_state(Some(SECRET)).await;
+        let mut b_camera = fleet_test_camera(1, "front");
+        store.upsert_camera(&b_camera).await.unwrap();
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let frame_stats = state.frame_stats.clone();
+        let app = super::router(state);
+        let push = async move {
+            fleet_apply(&app, SECRET, "text_prompts", serde_json::json!(["person"]))
+                .await
+                .status()
+        };
+        let saved =
+            write_behind_a_zone_save(&store, frame_stats.zone_application(), &b_camera, push).await;
+        assert_eq!(saved.detector.prompts, vec!["person"], "the push landed");
+    }
+
+    /// SPEC-088 — as above for a fleet push of the detector config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fleet_detector_config_across_a_zone_save_keeps_the_save() {
+        const SECRET: &[u8] = b"fleet-detector-config-zone-save-secret";
+        let (state, store, _dir, _reg, _bus) = build_test_state(Some(SECRET)).await;
+        let mut b_camera = fleet_test_camera(1, "front");
+        store.upsert_camera(&b_camera).await.unwrap();
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let frame_stats = state.frame_stats.clone();
+        let app = super::router(state);
+        let push = async move {
+            let model = serde_json::json!({ "kind": "yolo", "preset": "640" });
+            fleet_apply(&app, SECRET, "detector_config", model)
+                .await
+                .status()
+        };
+        let saved =
+            write_behind_a_zone_save(&store, frame_stats.zone_application(), &b_camera, push).await;
+        assert_eq!(
+            saved.detector.model_override.map(|m| m.kind).as_deref(),
+            Some("yolo"),
+            "the push landed"
+        );
+    }
+
+    /// SPEC-088 — as above for a reprobe apply, which probes before it takes
+    /// the lock and reads the rows it writes back only once it holds it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reprobe_apply_across_a_zone_save_keeps_the_save() {
+        let onvif = serve_onvif_media_stub().await;
+        let (mut state, store, _dir, _reg, _bus) = build_test_state(None).await;
+        state.current_inference_model = Arc::new(wide_default_model());
+        let endpoint = format!("http://{onvif}/onvif/device_service");
+        seed_onvif_camera(&store, 1, Some(&endpoint)).await;
+        let mut b_camera = store.list_cameras().await.unwrap().remove(0);
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let frame_stats = state.frame_stats.clone();
+        let app = super::router(state);
+        let apply = async move {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/admin/cameras/reprobe/apply")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"camera_ids":[1]}"#))
+                .unwrap();
+            req.extensions_mut().insert(ConnectInfo(loopback_peer()));
+            app.oneshot(req).await.unwrap().status()
+        };
+        let saved =
+            write_behind_a_zone_save(&store, frame_stats.zone_application(), &b_camera, apply)
+                .await;
+        assert!(
+            saved
+                .ingest
+                .analysis_url
+                .is_some_and(|u| u.path().ends_with("/third")),
+            "the reprobe landed"
+        );
+    }
+
+    /// SPEC-088 — as above for an ONVIF network rewrite, which reads the
+    /// camera and calls it before it takes the lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_network_rewrite_across_a_zone_save_keeps_the_save() {
+        use axum::response::IntoResponse;
+        const SECRET: &[u8] = b"network-rewrite-across-zone-save-secret";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stub =
+            axum::Router::new().fallback(|| async { (StatusCode::OK, "<ok/>").into_response() });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, stub.into_make_service()).await;
+        });
+        let (state, store, _dir, _reg, _bus) = build_test_state(Some(SECRET)).await;
+        let mut b_camera = fleet_test_camera(31, "cam-31");
+        b_camera.onvif = nexus_config::CameraOnvif {
+            endpoint: Some(format!("http://{addr}/onvif/device_service")),
+            username: Some("admin".into()),
+            password: Some(uuid::Uuid::now_v7().to_string()),
+        };
+        store.upsert_camera(&b_camera).await.unwrap();
+        b_camera.zones = vec![snapshot_zone("b", 0.3)];
+        let frame_stats = state.frame_stats.clone();
+        let rewrite = send_admin(
+            super::router(state),
+            sign_admin_jwt(SECRET),
+            Method::PUT,
+            "/api/v1/admin/cameras/31/network/safe".into(),
+            serde_json::json!({
+                "action": "set_network_protocols",
+                "protocols": [{ "name": "RTSP", "enabled": true, "port": 8554 }],
+            })
+            .to_string(),
+        );
+        let saved =
+            write_behind_a_zone_save(&store, frame_stats.zone_application(), &b_camera, rewrite)
+                .await;
+        assert_eq!(saved.ingest.url.port(), Some(8554), "the rewrite landed");
     }
 
     // Regression: the cloud UI sends `POST /api/v1/admin/cameras`
@@ -10197,15 +11697,42 @@ mod tests {
         assert_eq!(after["mode"], "tone");
     }
 
-    /// Every RTP payload the speaker received, the opening silent frame dropped.
-    fn rtp_frames(rtp: &tokio::net::UdpSocket) -> Vec<Vec<u8>> {
+    /// Every RTP payload the speaker has received since the last drain.
+    fn drain_rtp(rtp: &tokio::net::UdpSocket) -> Vec<Vec<u8>> {
         let mut buf = [0u8; 2048];
         let mut frames = Vec::new();
         while let Ok(n) = rtp.try_recv(&mut buf) {
             frames.push(buf[12..n].to_vec());
         }
+        frames
+    }
+
+    /// Every RTP payload the speaker received, the opening silent frame dropped.
+    fn rtp_frames(rtp: &tokio::net::UdpSocket) -> Vec<Vec<u8>> {
+        let mut frames = drain_rtp(rtp);
         frames.remove(0);
         frames
+    }
+
+    /// `before` is what the speaker had received (`rtp_frames`) when a mute
+    /// returned mid-chime: every frame received since is silent but one. The
+    /// handler sets the call's gain before it replies and `SipCall::send_frame`
+    /// reads it once per frame, just before sending, so only the frame the play
+    /// loop had already built can still carry the old level.
+    #[track_caller]
+    fn assert_silent_after(before: &[Vec<u8>], rtp: &tokio::net::UdpSocket) {
+        const IN_FLIGHT: usize = 1;
+        assert!(!is_silent(&before[0]), "audible before the change");
+        // The 2 s chime is 100 frames; its silent tail would prove nothing.
+        assert!(
+            before.len() + IN_FLIGHT < 100,
+            "the change landed mid-chime"
+        );
+        let after = drain_rtp(rtp);
+        assert!(
+            after.iter().skip(IN_FLIGHT).all(|f| is_silent(f)),
+            "silent after it"
+        );
     }
 
     fn is_silent(frame: &[u8]) -> bool {
@@ -10659,6 +12186,7 @@ mod tests {
             serde_json::json!({ "volume": 0, "boost": true, "auto_max_per_hour": 3 }),
         )
         .await;
+        let before = rtp_frames(&rtp);
         assert_eq!(status, StatusCode::OK, "{body}");
         let out = speaker_json(&body);
         assert_eq!(out["volume"], 0);
@@ -10677,9 +12205,7 @@ mod tests {
         assert_eq!(sip_methods(&seen), ["INVITE", "ACK", "BYE"]);
         assert!(started.elapsed() >= std::time::Duration::from_millis(1500));
         wait_idle(&app, std::time::Duration::from_secs(1)).await;
-        let frames = rtp_frames(&rtp);
-        assert!(!is_silent(&frames[0]), "audible before the change");
-        assert!(frames[20..].iter().all(|f| is_silent(f)), "silent after it");
+        assert_silent_after(&before, &rtp);
 
         let stored = store.speaker_output(speaker).await.unwrap();
         assert_eq!(
@@ -10763,6 +12289,7 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let (status, body) = volume(1, mute).await;
+        let before = rtp_frames(&rtp);
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(speaker_json(&body)["volume"], 0);
 
@@ -10771,9 +12298,7 @@ mod tests {
             .unwrap()
             .unwrap();
         wait_idle(&app, std::time::Duration::from_secs(1)).await;
-        let frames = rtp_frames(&rtp);
-        assert!(!is_silent(&frames[0]), "audible before the change");
-        assert!(frames[20..].iter().all(|f| is_silent(f)), "silent after it");
+        assert_silent_after(&before, &rtp);
 
         // Not persisted: the speaker keeps its own volume.
         assert_eq!(store.speaker_output(speaker).await.unwrap().volume, 100);

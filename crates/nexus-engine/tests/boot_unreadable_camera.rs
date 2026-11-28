@@ -218,24 +218,32 @@ input_height = 480
         .unwrap_or_else(|| panic!("a signed-in caller gets the detail: {signed_in}"));
     assert!(detail.ends_with(": 2,3"), "names cameras 2 and 3: {detail}");
 
-    // The readable camera runs: its supervisor has put frame stats up.
+    // The readable camera runs: its supervisor has processed a frame. A 200
+    // alone is no evidence, since every saved camera's stats answer with its
+    // zone application status (SPEC-088) before any supervisor starts.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(status) = engine.exited() {
             panic!("the engine exited ({status}):\n{}", engine.log_tail());
         }
-        let stats = http
+        let stats = match http
             .get(format!("{base}/cameras/1/stats"))
             .bearer_auth(&token)
             .send()
-            .await;
-        if stats.as_ref().is_ok_and(|r| r.status().is_success()) {
+            .await
+        {
+            Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
+            _ => None,
+        };
+        if stats
+            .as_ref()
+            .is_some_and(|s| s["last_frame_at"].is_string())
+        {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "camera 1 must run beside the unreadable rows (stats: {:?}):\n{}",
-            stats.map(|r| r.status()),
+            "camera 1 must run beside the unreadable rows (stats: {stats:?}):\n{}",
             engine.log_tail(),
         );
         tokio::time::sleep(Duration::from_millis(200)).await;

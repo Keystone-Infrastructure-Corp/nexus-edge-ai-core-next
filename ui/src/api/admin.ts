@@ -3,6 +3,7 @@
 
 import { api, getAccessToken } from "@/api/client";
 import type {
+  CameraConfigSnapshot,
   CreateUserRequest,
   CreateUserResponse,
   FleetManagedResponse,
@@ -62,6 +63,16 @@ export function listAudit(q: ListAuditQuery = {}) {
 // this core, so pages can badge themselves "Fleet-managed".
 export function listFleetManaged() {
   return api.get<FleetManagedResponse>("/admin/fleet/managed");
+}
+
+// --- Camera zone snapshot (SPEC-088) --------------------------------------
+
+/** The camera's saved zones and the engine's revision of them, read together. */
+export function getCameraConfigSnapshot(cameraId: number, signal?: AbortSignal) {
+  return api.get<CameraConfigSnapshot>(
+    `/admin/cameras/${encodeURIComponent(String(cameraId))}/config-snapshot`,
+    { signal },
+  );
 }
 
 // --- Server bind (M-Admin Phase 0, restart-based) -------------------------
