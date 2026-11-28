@@ -52,7 +52,7 @@ pub mod hailo_yolo;
 pub use backends::{
     BackendState, DetectorBackend, InProcessBackend, ThreadIsolatedBackend, WorkerProcessBackend,
 };
-pub use caps::{MinBBoxAreaDetector, TopKDetector};
+pub use caps::{MinBBoxAreaDetector, MinScoreDetector, TopKDetector};
 pub use detectors::{
     label_matches_any_prompt, Detector, InferenceError, MockDetector, OpenVocabDetector,
     UnavailableDetector,
@@ -178,11 +178,18 @@ pub struct InferenceLayer {
 
 /// Build the inference layer per config.
 pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
+    build_layer(cfg, &BuildContext::default())
+}
+
+fn build_layer(
+    cfg: &InferenceConfig,
+    ctx: &BuildContext,
+) -> Result<InferenceLayer, InferenceError> {
     match cfg.backend {
         InferenceBackendKind::InProcess => {
             info!(model = %cfg.model.kind, "building in-process detector");
             Ok(InferenceLayer {
-                detector: build_detector(cfg)?,
+                detector: build_detector_with_context(cfg, ctx)?,
                 pool: None,
             })
         }
@@ -198,7 +205,7 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
             for slot in 0..n {
                 let backend: Arc<dyn DetectorBackend> = match cfg.pool_worker_kind {
                     PoolWorkerKind::Thread => {
-                        let det = build_detector(cfg)?;
+                        let det = build_detector_with_context(cfg, ctx)?;
                         Arc::new(ThreadIsolatedBackend::start(slot as i32, det, cfg)?)
                     }
                     PoolWorkerKind::Process => {
@@ -210,7 +217,7 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
                 backends.push(backend);
             }
             let fallback = if cfg.fail_soft {
-                let det = build_detector(&fail_soft_cfg(cfg))?;
+                let det = build_detector_with_context(&fail_soft_cfg(cfg), ctx)?;
                 Some(Arc::new(InProcessBackend::new(-1, det)) as Arc<dyn DetectorBackend>)
             } else {
                 None
@@ -222,10 +229,6 @@ pub fn build(cfg: &InferenceConfig) -> Result<InferenceLayer, InferenceError> {
             })
         }
     }
-}
-
-fn build_detector(cfg: &InferenceConfig) -> Result<Arc<dyn Detector>, InferenceError> {
-    build_detector_with_context(cfg, &BuildContext::default())
 }
 
 /// Config for the pool's fail-soft fallback.
@@ -250,6 +253,9 @@ fn fail_soft_cfg(cfg: &InferenceConfig) -> InferenceConfig {
     cfg
 }
 
+/// See [`BuildContext::score_floor`].
+pub type ScoreFloor = Arc<dyn Fn(&nexus_config::ModelConfig) -> f32 + Send + Sync>;
+
 /// Context plumbed through detector construction for kinds that need
 /// extra deps the bare `InferenceConfig` doesn't carry (e.g. yoloe
 /// visual-prompt embeddings backed by SQLite).
@@ -257,6 +263,9 @@ fn fail_soft_cfg(cfg: &InferenceConfig) -> InferenceConfig {
 pub struct BuildContext {
     pub visual_prompt_store: Option<Arc<dyn VisualPromptStore>>,
     pub visual_embedding_dim: Option<usize>,
+    /// Threshold to BUILD an ensemble member's detector at, when lower
+    /// than the member's own: the router's shared floor for that model.
+    pub score_floor: Option<ScoreFloor>,
 }
 
 /// Same as [`build`] but accepts a [`BuildContext`] so yoloe-visual and
@@ -278,8 +287,16 @@ pub fn build_with_context(
             // not yet implemented — fall back to the plain `build` path.
             // The router will warn if a camera asked for yoloe_visual on
             // a pool backend; for now the default in-process path is the
-            // expected production shape.
-            build(cfg)
+            // expected production shape. The shared score floor still
+            // applies: thread workers and the fail-soft fallback build in
+            // this process. (A process worker builds one layer alone.)
+            build_layer(
+                cfg,
+                &BuildContext {
+                    score_floor: ctx.score_floor.clone(),
+                    ..Default::default()
+                },
+            )
         }
     }
 }
@@ -312,6 +329,22 @@ fn build_detector_with_context(
         inner
     };
     Ok(inner)
+}
+
+/// Threshold to build an ensemble member's detector at: the lowest of its
+/// own, its siblings' on the same model (they share one cached detector on
+/// Hailo, in a process worker too), and the router's shared floor.
+fn member_build_threshold(
+    members: &[nexus_config::ModelConfig],
+    member: &nexus_config::ModelConfig,
+    ctx: &BuildContext,
+) -> f32 {
+    members
+        .iter()
+        .filter(|m| router::same_floor(m, member))
+        .map(|m| m.score_threshold)
+        .chain(ctx.score_floor.as_ref().map(|floor| floor(member)))
+        .fold(member.score_threshold, f32::min)
 }
 
 fn build_detector_kind(
@@ -465,9 +498,18 @@ fn build_detector_kind(
                     );
                     continue;
                 }
-                let derived = router::derive_inference_cfg(cfg, member_cfg);
+                let mut derived = router::derive_inference_cfg(cfg, member_cfg);
+                // Built at the shared floor, so a standalone layer that
+                // reuses this detector (Hailo caches per HEF) is not capped
+                // at the member's threshold, whichever is built first.
+                derived.model.score_threshold =
+                    member_build_threshold(&cfg.model.members, member_cfg, _ctx);
                 match build_detector_with_context(&derived, _ctx) {
-                    Ok(det) => members.push(det),
+                    // Re-apply the member's own threshold on top.
+                    Ok(det) => members.push(Arc::new(caps::MinScoreDetector::new(
+                        det,
+                        member_cfg.score_threshold,
+                    ))),
                     Err(e) => warn!(
                         member_kind = %member_cfg.kind,
                         "ensemble member build failed; skipped: {e}"

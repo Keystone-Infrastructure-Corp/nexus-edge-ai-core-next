@@ -72,7 +72,6 @@ chmod +x "$TMP/bin/gh"
 export PATH="$TMP/bin:$PATH" GH_STUB_LOG="$TMP/gh.log" REPO=o/r PR=5 ISSUE=9
 SAME='"pull_request":{"head":{"repo":{"full_name":"o/r"}}}'
 FORK='"pull_request":{"head":{"repo":{"full_name":"x/r"}}}'
-SMALL='{"name":"factory:small"}'
 SPEC='{"name":"spec:SPEC-086"}'
 BADSPEC='{"name":"spec:SPEC-1; x"}'
 
@@ -98,7 +97,8 @@ if [ -f "$C" ]; then
   rule "$C" run "member opens issue with @claude" issues "\"action\":\"opened\",\"issue\":{\"title\":\"x\",\"body\":\"@claude add\",$m}"
   rule "$C" skip "outsider opens issue with @claude" issues '"action":"opened","issue":{"title":"x","body":"@claude add","author_association":"NONE"}'
   rule "$C" run "factory:medium label" issues '"action":"labeled","label":{"name":"factory:medium"}'
-  rule "$C" skip "factory:small label" issues '"action":"labeled","label":{"name":"factory:small"}'
+  rule "$C" run "factory:small label" issues '"action":"labeled","label":{"name":"factory:small"}'
+  rule "$C" skip "factory:large label" issues '"action":"labeled","label":{"name":"factory:large"}'
   rule "$C" run "factory:fix-ci, same-repo PR" pull_request "\"action\":\"labeled\",\"label\":{\"name\":\"factory:fix-ci\"},$SAME"
   rule "$C" skip "factory:fix-ci, fork PR" pull_request "\"action\":\"labeled\",\"label\":{\"name\":\"factory:fix-ci\"},$FORK"
 
@@ -115,16 +115,16 @@ if [ -f "$C" ]; then
     done
   fi
 
-  # factory:medium builds only a valid spec; factory:fix-ci loops on the PR branch.
+  # factory:small and factory:medium build only a valid spec; factory:fix-ci loops on the PR branch.
   if script "$C" "Write the build prompt" GITHUB_OUTPUT; then
     for c in "valid|[$SPEC]|0|Run implement-loop for SPEC-086" "none|[]|1|" "malformed|[$BADSPEC]|1|"; do
       IFS='|' read -r name labels want text <<<"$c"
       : >"$TMP/out"; rc=0
       GITHUB_EVENT_NAME=issues GH_LABELS="$labels" GITHUB_OUTPUT="$TMP/out" bash -e "$TMP/step.sh" >/dev/null 2>&1 || rc=$?
       if [ "$((rc != 0))" = "$want" ] && { [ -z "$text" ] || grep -qF "$text" "$TMP/out"; }; then
-        ok "medium prompt: $name spec label -> exit $rc"
+        ok "build prompt: $name spec label -> exit $rc"
       else
-        bad "medium prompt: $name spec label -> exit $rc, want failure=$want"
+        bad "build prompt: $name spec label -> exit $rc, want failure=$want"
       fi
     done
     : >"$TMP/out"
@@ -149,15 +149,27 @@ if [ -f "$C" ]; then
   else
     bad "claude_args lacks a single quoted --append-system-prompt rule with the loop guard and review scope"
   fi
+
+  # Builds take the model and effort for their size; mentions keep Claude Code's default.
+  pick="$(grep -o "github.event.label.name == 'factory:small'.*--model.*|| ''" <<<"$args" || true)"
+  printf '%s\n' 'const [e, c] = process.argv.slice(2); console.log(new Function("github", `return (${e});`)(JSON.parse(c)));' >"$TMP/value.mjs"
+  for c in "small|issues|labeled|factory:small|--model sonnet --effort medium" \
+           "medium|issues|labeled|factory:medium|--model opus --effort high" \
+           "fix-ci|pull_request|labeled|factory:fix-ci|--model opus --effort high" \
+           "mention|issue_comment|created||"; do
+    IFS='|' read -r name ev act label want <<<"$c"
+    got="$(node "$TMP/value.mjs" "$pick" "{\"event_name\":\"$ev\",\"event\":{\"action\":\"$act\",\"label\":{\"name\":\"$label\"}}}" 2>&1)" || got="error: $got"
+    if [ -n "$pick" ] && [ "$got" = "$want" ]; then ok "claude_args model: $name -> '${got}'"; else bad "claude_args model: $name -> '${got}', want '$want'"; fi
+  done
 else
   echo "skip claude.yml (not adopted)"
 fi
 
 R="$WF/factory-route.yml"
 if [ -f "$R" ]; then
-  rule "$R" run "unassigned factory:small" issues '"action":"labeled","label":{"name":"factory:small"},"issue":{"assignees":[]}'
+  rule "$R" skip "factory:small (claude.yml)" issues '"action":"labeled","label":{"name":"factory:small"},"issue":{"assignees":[]}'
   rule "$R" run "unassigned factory:large" issues '"action":"labeled","label":{"name":"factory:large"},"issue":{"assignees":[]}'
-  rule "$R" skip "assigned factory:small" issues '"action":"labeled","label":{"name":"factory:small"},"issue":{"assignees":[{"login":"a"}]}'
+  rule "$R" skip "assigned factory:large" issues '"action":"labeled","label":{"name":"factory:large"},"issue":{"assignees":[{"login":"a"}]}'
   rule "$R" skip "factory:medium (claude.yml)" issues '"action":"labeled","label":{"name":"factory:medium"},"issue":{"assignees":[]}'
 
   # spec <labels>: run "Read the spec label" and print the SPEC it exported.
@@ -168,24 +180,6 @@ if [ -f "$R" ]; then
   }
   if script "$R" "Read the spec label" GITHUB_ENV; then
     cp "$TMP/step.sh" "$TMP/spec.sh"
-    # factory:small assigns Copilot only with a valid spec label and a token.
-    if script "$R" "Assign the Copilot cloud agent" assignees; then
-      for c in "none|[$SMALL]|x|no" "malformed|[$SMALL,$BADSPEC]|x|no" "valid|[$SMALL,$SPEC]|x|yes" "no token|[$SMALL,$SPEC]||no"; do
-        IFS='|' read -r name labels token assign <<<"$c"
-        s="$(spec "$labels")"; : >"$GH_STUB_LOG"; rc=0
-        SPEC="$s" COPILOT_ASSIGN_TOKEN="$token" bash -e "$TMP/step.sh" >/dev/null 2>&1 || rc=$?
-        got=no; grep -q assignees "$GH_STUB_LOG" && got=yes
-        commented=no; grep -q 'issue comment' "$GH_STUB_LOG" && commented=yes
-        told=no; grep -qF "custom_instructions]=Build $s with the implement-loop skill" "$GH_STUB_LOG" && told=yes
-        hint=yes; [ "$name" = "no token" ] && ! grep -q 'implement-loop' "$GH_STUB_LOG" && hint=no
-        if [ "$rc" -eq 0 ] && [ "$got" = "$assign" ] && { [ "$assign" = no ] || [ "$told" = yes ]; } &&
-           { [ "$assign" = yes ] || [ "$commented" = yes ]; } && [ "$hint" = yes ]; then
-          ok "small route: $name -> assign=$got"
-        else
-          bad "small route: $name -> assign=$got commented=$commented exit $rc, want assign=$assign"
-        fi
-      done
-    fi
     # factory:large never builds: it hands the spec to the owner, or says none exists.
     if script "$R" "Hand large builds to the owner" needs:owner; then
       for c in "valid|[$SPEC]|/implement-loop SPEC-086" "none|[]|nothing to build yet"; do

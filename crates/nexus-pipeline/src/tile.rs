@@ -266,6 +266,123 @@ pub fn map_tile_dets_to_frame(tile_dets: &[Detection], roi: TileRoi) -> Vec<Dete
         .collect()
 }
 
+/// IoU above which two same-label boxes from different passes are one object.
+const MERGE_IOU: f32 = 0.5;
+
+/// Merge stage-2 (tile) detections, already in parent-frame coordinates,
+/// into stage-1 so an object both passes saw (or two adjacent tiles saw)
+/// reaches the tracker once, then apply the global `top_k`. Stage-1 is
+/// kept whole: its boxes never suppress each other here, and a stage-2
+/// box that overlaps a same-label stage-1 box is the one dropped, after
+/// lending that box its confidence if higher.
+// shortcut: plain IoU, so a tile-edge fragment of a box stage-1 saw whole
+// can survive (IoU < 0.5); upgrade to overlapping tiles if that shows up.
+pub fn merge_stage2(
+    mut stage1: Vec<Detection>,
+    stage2: Vec<Detection>,
+    top_k: Option<usize>,
+) -> Vec<Detection> {
+    // Stage-1 duplicates go first: one must not suppress a neighbour in
+    // the NMS below and then be dropped itself. The stage-1 box keeps its
+    // geometry but takes the tile's confidence when that is higher, so a
+    // weak first-pass box confirmed by a strong crop can still start a
+    // track under `new_track_confidence`.
+    let mut stage2 = stage2;
+    stage2.retain(|d| {
+        let dup = stage1.iter_mut().find(|s| {
+            s.label == d.label && nexus_inference::nms::iou(&s.bbox, &d.bbox) > MERGE_IOU
+        });
+        match dup {
+            Some(s) => {
+                s.confidence = s.confidence.max(d.confidence);
+                false
+            }
+            None => true,
+        }
+    });
+    let stage2 = nexus_inference::nms::nms_per_label(stage2, MERGE_IOU, None);
+    let mut merged = stage1;
+    merged.extend(stage2);
+    if let Some(k) = top_k {
+        nexus_inference::caps::apply_top_k(&mut merged, k);
+    }
+    merged
+}
+
+/// Round-robin over configured grid cells that get a stage-2 pass even
+/// when stage-1 found nothing in them, which is the only way a distant
+/// object stage-1 cannot resolve is ever found. Budgeted by time, not
+/// frames: the analysis rate is whatever the shared detector leaves.
+pub struct DiscoveryScheduler {
+    cells: Vec<u32>,
+    revisit: std::time::Duration,
+    last: Vec<Option<std::time::Instant>>,
+}
+
+impl DiscoveryScheduler {
+    /// Cells outside `grid` and repeats are dropped here, so they cannot
+    /// take a budget slot.
+    pub fn new(cells: &[u32], grid: TileGridConfig, revisit: std::time::Duration) -> Self {
+        let (rows, cols) = grid.dims();
+        let mut cells: Vec<u32> = cells.iter().copied().filter(|c| *c < rows * cols).collect();
+        cells.sort_unstable();
+        cells.dedup();
+        Self {
+            last: vec![None; cells.len()],
+            cells,
+            revisit,
+        }
+    }
+
+    /// Up to `budget` cells last visited `revisit` or longer ago, stalest
+    /// first, marked visited at `now`. A cell therefore waits at most
+    /// `revisit` plus `ceil(cells / budget)` analysed frames.
+    pub fn due(&mut self, now: std::time::Instant, budget: usize) -> Vec<u32> {
+        let mut due: Vec<usize> = (0..self.cells.len())
+            .filter(|&i| {
+                self.last[i].is_none_or(|t| now.saturating_duration_since(t) >= self.revisit)
+            })
+            .collect();
+        // `None` (never visited) sorts first.
+        due.sort_by_key(|&i| self.last[i]);
+        due.truncate(budget);
+        for &i in &due {
+            self.last[i] = Some(now);
+        }
+        due.into_iter().map(|i| self.cells[i]).collect()
+    }
+}
+
+/// The tiles to run this frame: due discovery cells first, so a crowd
+/// elsewhere cannot starve them, then density picks over `stage1` (pass
+/// it empty when the trigger has not fired), `max_tiles` in total.
+pub fn plan_tiles(
+    stage1: &[Detection],
+    parent_w: u32,
+    parent_h: u32,
+    grid: TileGridConfig,
+    max_tiles: u32,
+    discovery: Option<&mut DiscoveryScheduler>,
+    now: std::time::Instant,
+) -> Vec<TileRoi> {
+    if parent_w == 0 || parent_h == 0 {
+        return Vec::new();
+    }
+    let cells = grid_cells(parent_w, parent_h, grid);
+    let mut tiles: Vec<TileRoi> = discovery
+        .map(|d| d.due(now, max_tiles as usize))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|i| cells.get(i as usize).copied())
+        .collect();
+    for t in pick_tiles(stage1, parent_w, parent_h, grid, max_tiles) {
+        if tiles.len() < max_tiles as usize && !tiles.contains(&t) {
+            tiles.push(t);
+        }
+    }
+    tiles
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +810,199 @@ mod tests {
         // Expected centre = tile origin + crop-centre = (480+240, 270+135) = (720, 405).
         assert!((cx - 720.0).abs() < 0.001);
         assert!((cy - 405.0).abs() < 0.001);
+    }
+
+    fn labelled(label: &str, x1: f32, conf: f32) -> Detection {
+        Detection {
+            label: label.into(),
+            confidence: conf,
+            bbox: BBox {
+                x1,
+                y1: 100.0,
+                x2: x1 + 20.0,
+                y2: 140.0,
+            },
+            attributes: Default::default(),
+        }
+    }
+
+    /// The same object seen by stage-1 and by a tile (mapped back to the
+    /// parent frame) reaches the tracker once; a different label at the
+    /// same place, and the same label elsewhere, are kept.
+    #[test]
+    fn merge_drops_cross_pass_duplicates_in_parent_coordinates() {
+        let roi = TileRoi {
+            x: 512,
+            y: 0,
+            w: 512,
+            h: 288,
+        };
+        let stage1 = vec![labelled("person", 600.0, 0.6)];
+        // Crop-space boxes: 89 + 512 = 601, one pixel off stage-1's.
+        let stage2 = map_tile_dets_to_frame(
+            &[
+                labelled("person", 89.0, 0.8),
+                labelled("vehicle.car", 89.0, 0.7),
+                labelled("person", 300.0, 0.4),
+            ],
+            roi,
+        );
+        let merged = merge_stage2(stage1, stage2, None);
+        let mut got: Vec<(String, f32, f32)> = merged
+            .iter()
+            .map(|d| (d.label.clone(), d.bbox.x1, d.confidence))
+            .collect();
+        got.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        assert_eq!(
+            got,
+            vec![
+                // Stage-1's box, at the tile's higher confidence.
+                ("person".to_string(), 600.0, 0.8),
+                ("vehicle.car".to_string(), 601.0, 0.7),
+                ("person".to_string(), 812.0, 0.4),
+            ]
+        );
+        // The cap applies after suppression, to what is left.
+        let capped = merge_stage2(
+            vec![labelled("person", 600.0, 0.6)],
+            map_tile_dets_to_frame(&[labelled("person", 89.0, 0.8)], roi),
+            Some(1),
+        );
+        assert_eq!(capped.len(), 1);
+        assert_eq!((capped[0].bbox.x1, capped[0].confidence), (600.0, 0.8));
+    }
+
+    /// A weak stage-1 box confirmed by a strong tile box keeps its place
+    /// and takes the tile's confidence; a weaker tile box changes nothing.
+    #[test]
+    fn merge_raises_a_stage1_box_to_its_tile_duplicates_confidence() {
+        let merged = merge_stage2(
+            vec![labelled("person", 600.0, 0.2)],
+            vec![labelled("person", 601.0, 0.8)],
+            None,
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].bbox.x1, merged[0].confidence), (600.0, 0.8));
+        let merged = merge_stage2(
+            vec![labelled("person", 600.0, 0.6)],
+            vec![labelled("person", 601.0, 0.3)],
+            None,
+        );
+        assert_eq!(merged[0].confidence, 0.6);
+    }
+
+    /// Two overlapping same-label stage-1 boxes (one person behind
+    /// another) both survive a merge, as they did before any tile ran.
+    #[test]
+    fn merge_never_suppresses_stage1_against_itself() {
+        let stage1 = vec![
+            labelled("person", 600.0, 0.6),
+            labelled("person", 603.0, 0.5),
+        ];
+        assert_eq!(merge_stage2(stage1, Vec::new(), None).len(), 2);
+    }
+
+    /// A stage-2 box that duplicates stage-1 must not first suppress its
+    /// stage-2 neighbour: 605 overlaps both 600 and 610, but 610 does not
+    /// overlap 600 (IoU 0.33) and is a second object.
+    #[test]
+    fn merge_keeps_a_tile_box_whose_only_suppressor_was_a_stage1_duplicate() {
+        let merged = merge_stage2(
+            vec![labelled("person", 600.0, 0.6)],
+            vec![
+                labelled("person", 605.0, 0.9),
+                labelled("person", 610.0, 0.8),
+            ],
+            None,
+        );
+        let xs: Vec<f32> = merged.iter().map(|d| d.bbox.x1).collect();
+        assert_eq!(xs, vec![600.0, 610.0]);
+    }
+
+    /// With no stage-1 detections at all, configured discovery cells are
+    /// still planned, which `pick_tiles` alone never does.
+    #[test]
+    fn discovery_tiles_run_when_stage1_is_empty() {
+        let now = std::time::Instant::now();
+        let mut d = DiscoveryScheduler::new(
+            &[2, 99, 2],
+            TileGridConfig::G3x3,
+            std::time::Duration::from_secs(5),
+        );
+        let tiles = plan_tiles(&[], 1536, 864, TileGridConfig::G3x3, 3, Some(&mut d), now);
+        // Cell 2 = top-right of the 3×3 grid; 99 and the repeat are dropped.
+        assert_eq!(
+            tiles,
+            vec![TileRoi {
+                x: 1024,
+                y: 0,
+                w: 512,
+                h: 288
+            }]
+        );
+        assert!(plan_tiles(&[], 1536, 864, TileGridConfig::G3x3, 3, None, now).is_empty());
+    }
+
+    /// At 1.5 analysed fps with one tile per frame, every one of nine
+    /// cells is revisited within `revisit` plus one full round.
+    #[test]
+    fn discovery_revisit_interval_is_bounded() {
+        let cells: Vec<u32> = (0..9).collect();
+        let revisit = std::time::Duration::from_secs(8);
+        let frame = std::time::Duration::from_millis(667);
+        let mut d = DiscoveryScheduler::new(&cells, TileGridConfig::G3x3, revisit);
+        let start = std::time::Instant::now();
+        let mut last = [start; 9];
+        let mut worst = std::time::Duration::ZERO;
+        for n in 0..200u32 {
+            let now = start + frame * n;
+            for c in d.due(now, 1) {
+                worst = worst.max(now - last[c as usize]);
+                last[c as usize] = now;
+            }
+        }
+        assert!(worst <= revisit + frame * 9, "worst revisit {worst:?}");
+        assert!(worst >= revisit, "cells were re-run before they were due");
+    }
+
+    /// Discovery goes first, so stage-1 density cannot starve it, and the
+    /// two together never exceed the per-frame budget.
+    #[test]
+    fn discovery_takes_priority_within_the_tile_budget() {
+        let now = std::time::Instant::now();
+        let mut d = DiscoveryScheduler::new(
+            &[8],
+            TileGridConfig::G3x3,
+            std::time::Duration::from_secs(5),
+        );
+        let crowd = vec![det_at(10.0, 10.0), det_at(600.0, 10.0)];
+        let tiles = plan_tiles(
+            &crowd,
+            1536,
+            864,
+            TileGridConfig::G3x3,
+            2,
+            Some(&mut d),
+            now,
+        );
+        assert_eq!(tiles.len(), 2);
+        assert_eq!(
+            (tiles[0].x, tiles[0].y),
+            (1024, 576),
+            "discovery cell first"
+        );
+        // Not due again one frame later: density gets the whole budget back.
+        let next = now + std::time::Duration::from_millis(500);
+        let tiles = plan_tiles(
+            &crowd,
+            1536,
+            864,
+            TileGridConfig::G3x3,
+            2,
+            Some(&mut d),
+            next,
+        );
+        assert!(tiles.iter().all(|t| (t.x, t.y) != (1024, 576)));
+        assert_eq!(tiles.len(), 2);
     }
 }

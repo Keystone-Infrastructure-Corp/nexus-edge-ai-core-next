@@ -447,6 +447,16 @@ async fn run_camera(
             None,
         );
         let mut detector_downscaled = false;
+        let mut tile_discovery = (!cfg.behavior.tile_discovery_cells.is_empty()).then(|| {
+            crate::tile::DiscoveryScheduler::new(
+                &cfg.behavior.tile_discovery_cells,
+                cfg.behavior
+                    .tile_grid
+                    .map(Into::into)
+                    .unwrap_or(crate::tile::TileGridConfig::G2x2),
+                Duration::from_secs(cfg.behavior.tile_discovery_revisit_secs.unwrap_or(5).into()),
+            )
+        });
         // M_PERF_CROWD Phase E2 — adaptive *supervisor frame*
         // downscale under crowd (sibling of E3's detector input
         // downscale). Tracked independently so operators can tune
@@ -869,24 +879,31 @@ async fn run_camera(
                 // On crop or inference error we fall through to
                 // stage-1-only (fail-soft) — the cascade is a compute-
                 // optimality knob, not a correctness one. The merged
-                // detection set is NOT re-deduped here; the tracker's
-                // association layer handles overlapping boxes from
-                // adjacent tiles as it would for any duplicate
-                // detection. See docs/edge-core/M_TILE_REINFER.md.
-                let detections = if !skip_detector
-                    && cfg.behavior.tile_enabled == Some(true)
-                    && cfg.behavior.tile_trigger.is_some_and(|t| {
+                // set is de-duplicated by `tile::merge_stage2`.
+                // See docs/edge-core/M_TILE_REINFER.md.
+                //
+                // Discovery cells (`behavior.tile_discovery_cells`) are
+                // planned first and need no stage-1 detection or trigger.
+                let detections = if !skip_detector && cfg.behavior.tile_enabled == Some(true) {
+                    let density = cfg.behavior.tile_trigger.is_some_and(|t| {
                         let trigger = t as usize;
                         trigger > 0 && detections.len() >= trigger
-                    }) {
+                    });
                     let grid: crate::tile::TileGridConfig = cfg
                         .behavior
                         .tile_grid
                         .map(Into::into)
                         .unwrap_or(crate::tile::TileGridConfig::G2x2);
                     let max_tiles = cfg.behavior.tile_max_per_frame.unwrap_or(3);
-                    let tiles =
-                        crate::tile::pick_tiles(&detections, frame.width, frame.height, grid, max_tiles);
+                    let tiles = crate::tile::plan_tiles(
+                        if density { &detections } else { &[] },
+                        frame.width,
+                        frame.height,
+                        grid,
+                        max_tiles,
+                        tile_discovery.as_mut(),
+                        frame.captured_mono,
+                    );
                     if tiles.is_empty() {
                         detections
                     } else {
@@ -940,8 +957,10 @@ async fn run_camera(
                                     tile_ms = tile_elapsed_ms,
                                     "tile cascade merged stage-2 detections"
                                 );
-                                let mut merged = detections;
-                                merged.extend(stage2);
+                                // Suppress what both passes (or two
+                                // adjacent tiles) saw, THEN cap: the
+                                // tracker turns a duplicate box into a
+                                // duplicate track.
                                 // M_TILE_REINFER (G1) — Phase B2.1: enforce
                                 // the operator's `top_k` GLOBALLY across the
                                 // merged stage-1 + stage-2 vector. The stage-1
@@ -952,10 +971,7 @@ async fn run_camera(
                                 // many boxes per cascade frame, silently
                                 // exceeding the configured cap. Idempotent
                                 // when `merged.len() ≤ k` (skips the sort).
-                                if let Some(k) = effective_top_k {
-                                    nexus_inference::caps::apply_top_k(&mut merged, k);
-                                }
-                                merged
+                                crate::tile::merge_stage2(detections, stage2, effective_top_k)
                             }
                             Err(e) => {
                                 // Fail-soft to stage-1 only. The
